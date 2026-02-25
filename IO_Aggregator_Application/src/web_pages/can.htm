@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CAN Configuration</title>
+    <link rel="stylesheet" href="style.css">
+    <script type="text/javascript">
+        var ajaxList = [];
+
+        function newAJAXCommand(url, callback, repeat, data) {
+    var newAjax = new Object();
+    var theTimer = new Date();
+    newAjax.url = url;
+    newAjax.repeat = repeat;
+    newAjax.ajaxReq = null;
+
+    if (window.XMLHttpRequest) {
+        newAjax.ajaxReq = new XMLHttpRequest();
+        newAjax.ajaxReq.onreadystatechange = function () {
+            if (newAjax.ajaxReq.readyState === 4 && newAjax.ajaxReq.status === 200) {
+                if (callback) {
+                    callback(newAjax.ajaxReq.responseXML || newAjax.ajaxReq.responseText);
+                }
+            }
+        };
+        newAjax.ajaxReq.open((data == null) ? "GET" : "POST", newAjax.url, true);
+        newAjax.ajaxReq.send(data);
+    } else if (window.ActiveXObject) {
+        newAjax.ajaxReq = new ActiveXObject("Microsoft.XMLHTTP");
+        if (newAjax.ajaxReq) {
+            newAjax.ajaxReq.onreadystatechange = function () {
+                if (newAjax.ajaxReq.readyState === 4 && newAjax.ajaxReq.status === 200) {
+                    if (callback) {
+                        callback(newAjax.ajaxReq.responseXML || newAjax.ajaxReq.responseText);
+                    }
+                }
+            };
+            newAjax.ajaxReq.open((data == null) ? "GET" : "POST", newAjax.url, true);
+            newAjax.ajaxReq.send(data);
+        }
+    }
+
+    newAjax.lastCalled = theTimer.getTime();
+    ajaxList.push(newAjax);
+}
+
+        function getXMLValue(xmlData, tagName) {
+    const tag = xmlData.getElementsByTagName(tagName)[0];
+    return tag ? tag.textContent || tag.innerText : "";
+}
+
+        function submitCANConfig() {
+            var canConfigTable = document.getElementById("canConfigTable").getElementsByTagName("tbody")[0];
+            var rows = canConfigTable.rows;
+            var canData = [];
+			
+			// Check if the mapping table is empty
+			if (rows.length === 0) {
+				alert("Error: There is no configuration to submit.");
+				return;  // Stop the submission if no configurations are present
+			}
+            for (var i = 0; i < rows.length; i++) {
+                var can = rows[i].cells[0].innerHTML;
+                var canSpeed = rows[i].cells[1].innerHTML;
+                canData.push({ can, canSpeed });
+            }
+
+            var url = 'canconfig.cgi';
+            newAJAXCommand(url, null, false, JSON.stringify({ canConfig: canData }));
+            alert('CAN configuration submitted to server!');
+        }
+
+		function addCANConfig() {
+			var canSelect = document.getElementById('can');
+			var can = canSelect.value;
+			var canSpeed = document.getElementById('canSpeed').value;
+			    // Check if a valid CAN option is selected
+			if (can === "") {
+				alert("Please select a valid CAN option.");
+				return;
+			}
+			// Check for duplicates
+			var canConfigTable = document.getElementById("canConfigTable").getElementsByTagName("tbody")[0];
+			for (var i = 0; i < canConfigTable.rows.length; i++) {
+				if (canConfigTable.rows[i].cells[0].innerHTML === can) {
+					alert("This CAN configuration already exists.");
+					return;
+				}
+			}
+
+			var table = document.getElementById('canConfigTable').getElementsByTagName('tbody')[0];
+			var newRow = table.insertRow();
+			newRow.innerHTML = `<td>${can}</td><td>${canSpeed}</td><td><button onclick="removeRow(this)">Remove</button></td>`;
+			updateCANOptions();
+
+			// Reset the dropdown to "Select CAN"
+			canSelect.selectedIndex = 0; // Reset to the first option ("Select CAN")
+		}
+
+
+        function removeRow(button) {
+            var row = button.parentNode.parentNode;
+            row.parentNode.removeChild(row);
+            updateCANOptions();
+        }
+
+        function updateCANOptions() {
+            var canSelect = document.getElementById('can');
+            var options = canSelect.getElementsByTagName('option');
+
+            // Enable all options first
+            for (var i = 0; i < options.length; i++) {
+                options[i].style.display = 'block';
+            }
+
+            // Disable options already in the table
+            var canConfigTable = document.getElementById("canConfigTable").getElementsByTagName("tbody")[0];
+            for (var i = 0; i < canConfigTable.rows.length; i++) {
+                var canInTable = canConfigTable.rows[i].cells[0].innerHTML;
+                for (var j = 0; j < options.length; j++) {
+                    if (options[j].value === canInTable) {
+                        options[j].style.display = 'none';
+                    }
+                }
+            }
+        }
+
+
+
+        window.onload = function () {
+    updateCANOptions();
+
+    // Fetch and process the XML file
+    newAJAXCommand('canstatus.xml', function (response) {
+        // Parse the <can> data
+        const canData = JSON.parse(getXMLValue(response, 'can'));
+        const tbody = document.querySelector("#canConfigTable tbody");
+
+        // Render the CAN data into the table
+        canData.forEach(row => {
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+                <td>${row.can}</td>
+                <td>${row.canSpeed}</td>
+                <td><button onclick="removeRow(this)">Remove</button></td>
+            `;
+            tbody.appendChild(tr);
+        });
+
+        // Update the CAN options to reflect the current table state
+        updateCANOptions();
+    }, false);
+};
+
+    </script>
+</head>
+<body>
+    <!-- Header with Navigation Bar -->
+    <div class="header">
+        <img src="bacancy.png" alt="Bacancy" style="position:absolute; left:20px;">
+        <span class="title">IO Aggregator Configuration</span>
+        <img src="sunmobility.png" alt="SunMobility" style="position:absolute; right:20px;">
+        <div class="spacer" style="height:5px;"></div>
+        <nav>
+            <ul>
+                <li><a href="index.htm">Mapping Config</a></li>
+                <li><a href="rs485.htm">RS485 Config</a></li>
+                <li><a href="can.htm">CAN Config</a></li>
+            </ul>
+        </nav>
+    </div>
+
+    <!-- CAN Configuration Section -->
+    <div class="container">
+        <div class="section">
+            <h2>CAN Configuration</h2>
+            <form>
+                <label for="can">CAN:</label>
+                <select id="can" name="can">
+					<option value="" disabled selected>Select CAN</option>
+                    <option value="CAN1">CAN1</option>
+                    <option value="CAN2">CAN2</option>
+                    <option value="CAN3">CAN3</option>
+                    <option value="CAN4">CAN4</option>
+                    <option value="CAN5">CAN5</option>
+                    <option value="CAN6">CAN6</option>
+                </select>
+                <br><br>
+
+                <label for="canSpeed">CAN Speed:</label>
+                <select id="canSpeed" name="canSpeed">
+                    <option value="10000">10000</option>
+                    <option value="20000">20000</option>
+                    <option value="100000">100000</option>
+                    <option value="250000">250000</option>
+                    <option value="500000">500000</option>
+                    <option value="1000000">1000000</option>
+                </select>
+                <br><br>
+
+                <button type="button" onclick="addCANConfig()">Add CAN Config</button>
+            </form>
+        </div>
+
+        <div class="section">
+            <h2>CAN Configuration Table</h2>
+            <table id="canConfigTable">
+                <thead>
+                    <tr>
+                        <th>CAN</th>
+                        <th>CAN Speed</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <!-- Default rows can be added here -->
+                    <!-- <tr>
+                        <td>CAN1</td>
+                        <td>500000</td>
+                        <td><button onclick="removeRow(this)">Remove</button></td>
+                    </tr>
+                    <tr>
+                        <td>CAN2</td>
+                        <td>500000</td>
+                        <td><button onclick="removeRow(this)">Remove</button></td>
+                    </tr> -->
+                </tbody>
+            </table>
+            <br>
+            <button type="button" onclick="submitCANConfig()">Submit CAN Config</button>
+        </div>
+    </div>
+
+    <!-- Footer -->
+    <div id="footer">Copyright &copy; 2025 Bacancy Systems LLP. All Rights Reserved.</div>
+</body>
+</html>
