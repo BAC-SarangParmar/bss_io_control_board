@@ -1,0 +1,170 @@
+configVersion: 1.0.0
+componentName: can4
+coreVersion: 5.8.4
+device: PIC32CZ4010CA80208
+library: []
+dependency:
+- dependencyPackage: class com.microchip.mcc.harmony.HarmonyModule
+  name: can4
+  type: module
+  version: ''
+- dependencyPackage: ''
+  name: CMSIS_5
+  type: package
+  version: 5.9.0
+- dependencyPackage: ''
+  name: FreeRTOS-Kernel
+  type: package
+  version: V11.2.0
+- dependencyPackage: ''
+  name: core
+  type: package
+  version: v3.15.1
+- dependencyPackage: ''
+  name: crypto
+  type: package
+  version: v3.8.2
+- dependencyPackage: ''
+  name: csp
+  type: package
+  version: v3.22.1
+- dependencyPackage: ''
+  name: filex
+  type: package
+  version: v6.4.0_rel
+- dependencyPackage: ''
+  name: littlefs
+  type: package
+  version: v2.10.2
+- dependencyPackage: ''
+  name: net
+  type: package
+  version: v3.13.0
+- dependencyPackage: ''
+  name: wolfssl
+  type: package
+  version: v5.4.0
+customDataClassName: com.microchip.utils_mh3.utils.persistence.CustomModuleData
+data:
+  attachments: {}
+  elementPosition:
+    attributes:
+      id: __ROOTVIEW
+    children:
+    - children:
+      - attributes:
+          id: can4
+          x: '190'
+          y: '540'
+        type: ElementPosition
+      type: ElementPositions
+    type: ComponentGraph
+  symbols:
+    CALCULATED_NOMINAL_BITRATE:
+      attributes:
+        id: CALCULATED_NOMINAL_BITRATE
+      children:
+      - children:
+        - attributes:
+            id: can4
+            value: '500'
+          type: Dynamic
+        type: Values
+      type: Integer
+    CALCULATED_NOMINAL_ERRORRATE:
+      attributes:
+        id: CALCULATED_NOMINAL_ERRORRATE
+      children:
+      - children:
+        - attributes:
+            id: can4
+            value: '0.000'
+          type: Dynamic
+        type: Values
+      type: String
+    CAN4_EXT_FILTER1_EFID2:
+      attributes:
+        id: CAN4_EXT_FILTER1_EFID2
+      children:
+      - children:
+        - attributes:
+            value: '536870911'
+          type: User
+        type: Values
+      type: Hex
+    FILTERS_EXT:
+      attributes:
+        id: FILTERS_EXT
+      children:
+      - children:
+        - attributes:
+            value: '1'
+          type: User
+        type: Values
+      type: Integer
+    NBTP_NBRP:
+      attributes:
+        id: NBTP_NBRP
+      children:
+      - children:
+        - attributes:
+            value: '14'
+          type: User
+        type: Values
+      type: Integer
+    NBTP_NSJW:
+      attributes:
+        id: NBTP_NSJW
+      children:
+      - children:
+        - attributes:
+            id: can4
+            value: '5'
+          type: Dynamic
+        type: Values
+      type: Integer
+    NBTP_NTSEG1:
+      attributes:
+        id: NBTP_NTSEG1
+      children:
+      - children:
+        - attributes:
+            id: can4
+            value: '14'
+          type: Dynamic
+        type: Values
+      type: Integer
+    NBTP_NTSEG2:
+      attributes:
+        id: NBTP_NTSEG2
+      children:
+      - children:
+        - attributes:
+            id: can4
+            value: '5'
+          type: Dynamic
+        type: Values
+      type: Integer
+    NBTP_TOTAL_TIME_QUANTA:
+      attributes:
+        id: NBTP_TOTAL_TIME_QUANTA
+      children:
+      - children:
+        - attributes:
+            id: can4
+            value: '20'
+          type: Dynamic
+        type: Values
+      type: Integer
+    NOMINAL_TIME_QUANTA_PERIOD:
+      attributes:
+        id: NOMINAL_TIME_QUANTA_PERIOD
+      children:
+      - children:
+        - attributes:
+            id: can4
+            value: '100.000'
+          type: Dynamic
+        type: Values
+      type: String
+  userData: {}

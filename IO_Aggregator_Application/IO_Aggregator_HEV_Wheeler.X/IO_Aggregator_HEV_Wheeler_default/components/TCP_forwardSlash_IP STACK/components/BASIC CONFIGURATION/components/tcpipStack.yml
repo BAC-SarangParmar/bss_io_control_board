@@ -1,0 +1,215 @@
+configVersion: 1.0.0
+componentName: tcpipStack
+coreVersion: 5.8.4
+device: PIC32CZ4010CA80208
+library: []
+dependency:
+- dependencyPackage: class com.microchip.mcc.harmony.HarmonyModule
+  name: tcpipStack
+  type: module
+  version: ''
+- dependencyPackage: ''
+  name: CMSIS_5
+  type: package
+  version: 5.9.0
+- dependencyPackage: ''
+  name: FreeRTOS-Kernel
+  type: package
+  version: V11.2.0
+- dependencyPackage: ''
+  name: core
+  type: package
+  version: v3.15.1
+- dependencyPackage: ''
+  name: crypto
+  type: package
+  version: v3.8.2
+- dependencyPackage: ''
+  name: csp
+  type: package
+  version: v3.22.1
+- dependencyPackage: ''
+  name: filex
+  type: package
+  version: v6.4.0_rel
+- dependencyPackage: ''
+  name: littlefs
+  type: package
+  version: v2.10.2
+- dependencyPackage: ''
+  name: net
+  type: package
+  version: v3.13.0
+- dependencyPackage: ''
+  name: wolfssl
+  type: package
+  version: v5.4.0
+customDataClassName: com.microchip.utils_mh3.utils.persistence.CustomModuleData
+data:
+  attachments: {}
+  elementPosition:
+    attributes:
+      id: BASIC CONFIGURATION
+    children:
+    - children:
+      - attributes:
+          id: tcpipStack
+          x: '20'
+          y: '20'
+        type: ElementPosition
+      type: ElementPositions
+    type: ComponentGraph
+  symbols:
+    TCPIP_RTOS_TASK_PRIORITY:
+      attributes:
+        id: TCPIP_RTOS_TASK_PRIORITY
+      children:
+      - children:
+        - attributes:
+            value: '3'
+          type: User
+        type: Values
+      type: Integer
+    TCPIP_STACK_DRAM_SIZE:
+      attributes:
+        id: TCPIP_STACK_DRAM_SIZE
+      children:
+      - children:
+        - attributes:
+            value: '128000'
+          type: User
+        type: Values
+      type: Integer
+    TCPIP_STACK_HEAP_SIZE_RECOMMEND:
+      attributes:
+        id: TCPIP_STACK_HEAP_SIZE_RECOMMEND
+      children:
+      - children:
+        - attributes:
+            id: tcpipStack
+            value: '59'
+          type: Dynamic
+        type: Values
+      type: Integer
+    TCPIP_STACK_INTERRUPT_EN_IDX0:
+      attributes:
+        id: TCPIP_STACK_INTERRUPT_EN_IDX0
+      children:
+      - children:
+        - attributes:
+            id: tcpipStack
+            value: 'true'
+          type: Dynamic
+        type: Values
+      type: Boolean
+    TCPIP_STACK_INTMAC_INTERFACE_NUM:
+      attributes:
+        id: TCPIP_STACK_INTMAC_INTERFACE_NUM
+      children:
+      - children:
+        - attributes:
+            id: tcpipStack
+            value: '1'
+          type: Dynamic
+        type: Values
+      type: Integer
+    TCPIP_STACK_INT_MAC_IDX0:
+      attributes:
+        id: TCPIP_STACK_INT_MAC_IDX0
+      children:
+      - children:
+        - attributes:
+            id: tcpipStack
+            value: 'true'
+          type: Dynamic
+        type: Values
+      type: Boolean
+    TCPIP_STACK_MAC_CLOCK:
+      attributes:
+        id: TCPIP_STACK_MAC_CLOCK
+      children:
+      - children:
+        - attributes:
+            id: tcpipStack
+            value: '150000000'
+          type: Dynamic
+        type: Values
+      type: Integer
+    TCPIP_STACK_MII_MODE_IDX0:
+      attributes:
+        id: TCPIP_STACK_MII_MODE_IDX0
+      children:
+      - children:
+        - attributes:
+            id: tcpipStack
+            value: RMII
+          type: Dynamic
+        type: Values
+      type: String
+    TCPIP_STACK_NET_INTERFACE_NAME_IDX0:
+      attributes:
+        id: TCPIP_STACK_NET_INTERFACE_NAME_IDX0
+      children:
+      - children:
+        - attributes:
+            id: tcpipStack
+            value: ETH
+          type: Dynamic
+        type: Values
+      type: String
+    TCPIP_STACK_NET_INTERFACE_NUM:
+      attributes:
+        id: TCPIP_STACK_NET_INTERFACE_NUM
+      children:
+      - children:
+        - attributes:
+            id: tcpipStack
+            value: '1'
+          type: Dynamic
+        type: Values
+      type: Integer
+    TCPIP_STACK_NOCACHE_MEM_ADDRESS:
+      attributes:
+        id: TCPIP_STACK_NOCACHE_MEM_ADDRESS
+      children:
+      - children:
+        - attributes:
+            id: tcpipStack
+            value: '538046464'
+          type: Dynamic
+        type: Values
+      type: Hex
+    TCPIP_STACK_NOCACHE_SIZE:
+      attributes:
+        id: TCPIP_STACK_NOCACHE_SIZE
+      children:
+      - children:
+        - attributes:
+            id: tcpipStack
+            value: 4KB
+          type: Dynamic
+        type: Values
+      type: String
+    TCPIP_STACK_NO_CACHE_CONFIG:
+      attributes:
+        id: TCPIP_STACK_NO_CACHE_CONFIG
+      children:
+      - children:
+        - attributes:
+            id: tcpipStack
+            value: 'true'
+          type: Dynamic
+        type: Values
+      type: Boolean
+    TCPIP_STACK_SYS_RANDOM_H2_ADAPTER:
+      attributes:
+        id: TCPIP_STACK_SYS_RANDOM_H2_ADAPTER
+      children:
+      - children:
+        - attributes:
+            id: tcpipStack
+            value: 'true'
+          type: Dynamic
+        type: Values
+      type: Boolean
+  userData: {}

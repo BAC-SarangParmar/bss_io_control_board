@@ -3,9 +3,13 @@
     <editor-bookmarks xmlns="http://www.netbeans.org/ns/editor-bookmarks/2" lastBookmarkId="0"/>
     <open-files xmlns="http://www.netbeans.org/ns/projectui-open-files/2">
         <group>
-            <file>file:/D:/IO_Aggreagator/git_backup/sun-ioAggregator-sw/IO_Aggregator_Application/src/IOHandler.c</file>
-            <file>file:/D:/IO_Aggreagator/git_backup/sun-ioAggregator-sw/IO_Aggregator_Application/src/main.c</file>
-            <file>file:/D:/IO_Aggreagator/git_backup/sun-ioAggregator-sw/IO_Aggregator_Application/src/config/default/tasks.c</file>
+            <file>file:/D:/Projects/battery_swapping_system/Workspace/IO_Aggregator_App/IO_Aggregator_Application/src/ChargingHandler.h</file>
+            <file>file:/D:/Projects/battery_swapping_system/Workspace/IO_Aggregator_App/IO_Aggregator_Application/src/sessionDBHandler.c</file>
+            <file>file:/D:/Projects/battery_swapping_system/Workspace/IO_Aggregator_App/IO_Aggregator_Application/src/TelemetryHandler.h</file>
+            <file>file:/D:/Projects/battery_swapping_system/Workspace/IO_Aggregator_App/IO_Aggregator_Application/src/Common.c</file>
+            <file>file:/D:/Projects/battery_swapping_system/Workspace/IO_Aggregator_App/IO_Aggregator_Application/src/TelemetryHandler.c</file>
+            <file>file:/D:/Projects/battery_swapping_system/Workspace/IO_Aggregator_App/IO_Aggregator_Application/src/ChargingHandler.c</file>
+            <file>file:/D:/Projects/battery_swapping_system/Workspace/IO_Aggregator_App/IO_Aggregator_Application/src/sessionDBHandler.h</file>
         </group>
     </open-files>
 </project-private>

@@ -132,6 +132,27 @@ typedef struct {
         uint8_t stopBits;
     } rs485Config[2];
 } flash_data_t;
+typedef struct
+{
+    uint32_t uniqueId;
+    uint16_t msgType;
+    uint8_t  compartmentId;
+    uint8_t  dockId;
+    uint8_t  commandId;
+    uint8_t  payloadLen;
+    uint8_t* payload;
+} TCP_RequestFrame_t;
+
+typedef enum
+{
+    CMD_GPIO_OPERATION      = 0x01,
+    CMD_ANALOG_READ         = 0x02,
+    CMD_CHARGING_COMMAND    = 0x03,
+    CMD_EFUSE_COMMAND       = 0x04,
+    CMD_BOOT_MODE_COMMAND   = 0x05,
+    CMD_SOFT_RESET_COMMAND  = 0x06
+
+} CommandID_t;
 
 // Extern declaration
 extern flash_data_t writeData;
@@ -167,11 +188,6 @@ bool SERCOM7_I2C_Read(uint16_t address, uint8_t* rdData, uint32_t rdLength);
 void vIOHandler(void);
 
 /**
- * @brief Checks for changes in digital input values.
- */
-void IsDigitalInputChanged(void);
-
-/**
  * @brief Reads the analog values from all configured ADC channels.
  */
 void ReadAllAnalogInputPins(void);
@@ -192,11 +208,6 @@ void IOExpander1_Data(void);
  * @param expanderData Pointer to buffer storing expander input states.
  */
 void checkIOExpanderInput(uint8_t *expanderData);
-
-/**
- * @brief Activates safety-related pins.
- */
-void Active_Safety_Pins(void);
 
 /**
  * @brief  Reads an 8-bit register value from the TCA9539 I/O Expander.
