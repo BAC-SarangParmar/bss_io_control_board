@@ -18,6 +18,7 @@
 #include "tcpip_manager_control.h"
 #include "library/tcpip/tcpip_helpers.h"
 #include <math.h>
+#include "sessionDBHandler.h"
 /* ************************************************************************** */
 /* ************************************************************************** */
 /* Section: Macro Definitions                                                 */
@@ -33,6 +34,8 @@
 #define FLASH_ADDRESS               0x0C0F0000U /**< Start address in flash for storing config */
 
 #define ADC_TIMEOUT                 (10000U)    /**< Timeout for ADC operations in microseconds */
+
+#define TCP_MIN_FRAME_SIZE       12U          /**< Minimum valid TCP frame size (header only) */
 //---------------- ADC and Circuit Parameters ----------------
 #if PT100_Sensor
 static const float VREF_L          = 4.9500F;
@@ -63,8 +66,8 @@ volatile bool Two_Wheeler_IO_Aggregator1 = false;             /**< Flag for boar
 volatile bool Board_Selection = false;                        /**< General board configuration selector */
 
 // Command types
-const char msgSubTypeDigitalRead  = 0x01;
-const char msgSubTypeDigitalWrite = 0x02;
+const char msgSubTypeDigitalRead  = 0x00;
+const char msgSubTypeDigitalWrite = 0x01;
 const char msgSubTypeAnalogRead   = 0x03;
 
 // Error types
@@ -116,28 +119,27 @@ char IOreceiveBuffer[128] = {0};
 uint8_t i2cTxBuf[2];
 uint8_t i2cRxBuf[2];
 bool i2cTransferDone = false;
-uint32_t lastTick = 0;
 
-// Create a buffer to hold the previous status of all pins
-uint8_t prevDIQueueBuffer[NUM_DIGITAL_PINS];
-
-void IsDigitalInputChanged();
 void ReadAllAnalogInputPins();
 bool IOExpander1_Configure_Ports(void);
 bool IOExpander2_Configure_Ports(void);
-void Active_Safety_Pins();
-void Default_Pin_Status();
+void ChargingControl(uint8_t u8DockNo, uint8_t action);
+uint32_t Analog_Input_Get(uint8_t channel);
+void HandleGPIOCommand(void);
+void HandleAnalogRead(void);
+void HandleChargingCommand(uint8_t u8DockNo);
+void HandleBootloaderCommand(void);
+void SendResponsePayload(uint8_t *payload, uint8_t len);
 volatile  uint16_t currentTempAIQueueBuffer[NUM_TEMPERATURE_ANALOG_PINS];
 volatile  uint16_t currentAIQueueBuffer[NUM_ANALOG_PINS];
-uint16_t prevTempAIQueueBuffer[NUM_TEMPERATURE_ANALOG_PINS];
-uint16_t prevAIQueueBuffer[NUM_ANALOG_PINS];
 char messageAnalog[MESSAGE_BUFFER_SIZE];
-uint32_t total_length;
+uint32_t total_length = 0U;
 volatile  uint8_t currentDIQueueBuffer[NUM_DIGITAL_PINS];
 uint16_t CalculateCRC(uint8_t *data, uint16_t length);
 static void SetStaticIPAddress(const char* ipStr);
-volatile bool custom_message = false;
+volatile bool bIOOperation = false;
 uint32_t *ramStart = (uint32_t *)BTL_TRIGGER_RAM_START;
+TCP_RequestFrame_t Reqframe_St;
 /*  A brief description of a section can be given directly below the section
     banner.
  */
@@ -297,7 +299,7 @@ void readOutputsFromFlash(void)
     if (!flashInvalid)
     {
         memcpy(&writeData, pDataVerify, sizeof(flash_data_t));
-        SYS_CONSOLE_PRINT("Restored Outputs - Digital: %08X, Relay: %04X\n", 
+        SYS_CONSOLE_PRINT("Restored Outputs - Digital: %08X, Relay: %04X\r\n", 
                           writeData.digitalOutputs, writeData.relayOutputs);
         SYS_CONSOLE_MESSAGE("Configuration loaded from flash.\r\n");
 #if HEV_IO_Aggregator
@@ -315,7 +317,7 @@ void readOutputsFromFlash(void)
                 case 7: dataWidth = USART_DATA_7_BIT; break;
                 case 8: dataWidth = USART_DATA_8_BIT; break;
                 default:
-                    SYS_CONSOLE_PRINT("? Invalid Data Bits (%d) for RS485_%d\n", dataBits, uartIndex + 1);
+                    SYS_CONSOLE_PRINT("? Invalid Data Bits (%d) for RS485_%d\r\n", dataBits, uartIndex + 1);
                     continue;
             }
 
@@ -325,7 +327,7 @@ void readOutputsFromFlash(void)
                 case 1: parity = USART_PARITY_ODD; break;
                 case 2: parity = USART_PARITY_EVEN; break;
                 default:
-                    SYS_CONSOLE_PRINT("? Invalid Parity (%d) for RS485_%d\n", parityEncoded, uartIndex + 1);
+                    SYS_CONSOLE_PRINT("? Invalid Parity (%d) for RS485_%d\r\n", parityEncoded, uartIndex + 1);
                     continue;
             }
 
@@ -341,26 +343,26 @@ void readOutputsFromFlash(void)
             if (uartIndex == 0) {
                 SERCOM8_USART_ReadAbort();
                 if (!SERCOM8_USART_SerialSetup(&setup, 0)) {
-                    SYS_CONSOLE_PRINT("? RS485_1 setup from flash failed: Baud=%d Data=%d Parity=%d Stop=%d\n",
+                    SYS_CONSOLE_PRINT("? RS485_1 setup from flash failed: Baud=%d Data=%d Parity=%d Stop=%d\r\n",
                                       baud, dataBits, parityEncoded, stopBits);
                 } else {
-                    SYS_CONSOLE_PRINT("RS485_1 setup from flash done: Baud=%d Data=%d Parity=%d Stop=%d\n",
+                    SYS_CONSOLE_PRINT("RS485_1 setup from flash done: Baud=%d Data=%d Parity=%d Stop=%d\r\n",
                                       baud, dataBits, parityEncoded, stopBits);
                     uint8_t dummy;
                     bool result = SERCOM8_USART_Read(&dummy, 1);
-                    SYS_CONSOLE_PRINT("RS485_1 RX resume: %s\n", result ? "OK" : "FAILED");
+                    SYS_CONSOLE_PRINT("RS485_1 RX resume: %s\r\n", result ? "OK" : "FAILED");
                 }
             } else if (uartIndex == 1) {
                 SERCOM9_USART_ReadAbort();
                 if (!SERCOM9_USART_SerialSetup(&setup, 0)) {
-                    SYS_CONSOLE_PRINT("? RS485_2 setup from flash failed: Baud=%d Data=%d Parity=%d Stop=%d\n",
+                    SYS_CONSOLE_PRINT("? RS485_2 setup from flash failed: Baud=%d Data=%d Parity=%d Stop=%d\r\n",
                                       baud, dataBits, parityEncoded, stopBits);
                 } else {
-                    SYS_CONSOLE_PRINT("RS485_2 setup from flash done: Baud=%d Data=%d Parity=%d Stop=%d\n",
+                    SYS_CONSOLE_PRINT("RS485_2 setup from flash done: Baud=%d Data=%d Parity=%d Stop=%d\r\n",
                                       baud, dataBits, parityEncoded, stopBits);
                     uint8_t dummy;
                     bool result = SERCOM9_USART_Read(&dummy, 1);
-                    SYS_CONSOLE_PRINT("RS485_2 RX resume: %s\n", result ? "OK" : "FAILED");
+                    SYS_CONSOLE_PRINT("RS485_2 RX resume: %s\r\n", result ? "OK" : "FAILED");
                 }
             }
         }
@@ -681,26 +683,9 @@ static inline float TempCalcNTC(float in_volt)
 void ReadAllAnalogInputPins(void)
 {
     uint16_t adc_avg; /* Local variable for averaged ADC values */
-
-    /* Reset globals at start of function */
-    total_length = 0U;
     char *pWrite = messageAnalog; /* Safe buffer pointer */
 
     volatile uint32_t all_adc_data[ALL_ANALOG_PINS]; /* Store raw ADC values */
-    bool dataChanged = false;   /* Flag to indicate if data has changed */
-
-    uint8_t changedCount = 0U;
-    uint8_t changedIndexes[NUM_TEMPERATURE_ANALOG_PINS]; /* Stores indexes of changed inputs */
-
-    /* ---- Static sensor/channel mapping tables ---- */
-    static const char* const sensor_names[ALL_ANALOG_PINS] = {
-        "Analog Input1", "Analog Input2", "Analog Input3", "Analog Input4",
-        "Analog Input5", "Analog Input6", "Analog Input7", "Analog Input8",
-        "Analog Input9", "Analog Input10", "Analog Input11", "Analog Input12",
-        "Analog Input13", "Analog Input14", "Analog Input15", "Analog Input16",
-        "Analog Input17", "Analog Input18", "Analog Input19", "Analog Input20"
-    };
-
     static const ADC_CORE_NUM adc_cores[ALL_ANALOG_PINS] = {
         ADC_CORE_NUM2, ADC_CORE_NUM2, ADC_CORE_NUM0, ADC_CORE_NUM0,
         ADC_CORE_NUM0, ADC_CORE_NUM1, ADC_CORE_NUM0, ADC_CORE_NUM1,
@@ -752,141 +737,17 @@ void ReadAllAnalogInputPins(void)
             temperature = (float)adc_avg; /* Default raw fallback */
         #endif
 
-            /* Convert temperature to 0.01 °C fixed-point format */
+            /* Convert temperature to 0.01 ï¿½C fixed-point format */
             uint16_t tempValue = (uint16_t)(temperature * 100.0F);
             if (tempValue > 65535U) { tempValue = 65535U; } /* Clamp to max */
-
             currentTempAIQueueBuffer[i] = tempValue;
-
-            int32_t diff = (int32_t)tempValue - (int32_t)prevTempAIQueueBuffer[i];
-
-            /* Detect change: either first read (0xFFFF) or >= 1.00 °C change */
-            if ((prevTempAIQueueBuffer[i] == 0xFFFFU) || (abs(diff) >= 100))
-            {
-                dataChanged = true;
-                changedIndexes[changedCount++] = i;
-            }
-
-            prevTempAIQueueBuffer[i] = tempValue;
-
-            /* Log entry formatting */
-            len = snprintf(pWrite, (size_t)(MESSAGE_BUFFER_SIZE - total_length),
-                           "Core %d, Channel %d, Raw: %lu (%s): %.2f V, Temp: %.2f C\r\n",
-                           (int)adc_cores[i], (int)adc_channels[i],
-                           (unsigned long)all_adc_data[i],
-                           sensor_names[i], adc_voltage, temperature);
         }
         else /* Non-temperature analog inputs */
         {
             /* Scale to 0.01 V units */
             uint16_t value16 = (uint16_t)(adc_voltage * 100.0F);
             if (value16 > 65535U) { value16 = 65535U; } /* Clamp */
-
             currentAIQueueBuffer[i - 16U] = value16;
-
-            uint16_t prev = prevAIQueueBuffer[i - 16U];
-            int32_t diff = (int32_t)value16 - (int32_t)prev;
-
-            /* Detect change: first read or ?0.01 V difference */
-            if ((prev == 0xFFFFU) || (abs(diff) >= 1))
-            {
-                dataChanged = true;
-                changedIndexes[changedCount++] = i;
-            }
-
-            prevAIQueueBuffer[i - 16U] = value16;
-
-            len = snprintf(pWrite, (size_t)(MESSAGE_BUFFER_SIZE - total_length),
-                           "Core %d, Channel %d, Raw: %lu (%s): %.2f V\r\n",
-                           (int)adc_cores[i],
-                           (int)adc_channels[i],
-                           (unsigned long)all_adc_data[i],
-                           sensor_names[i],
-                           adc_voltage);
-        }
-
-        /* Update message buffer safely */
-        if ((len > 0) && ((total_length + (uint32_t)len) < MESSAGE_BUFFER_SIZE))
-        {
-            total_length += (uint32_t)len;
-            pWrite += len;
-        }
-        else
-        {
-            break; /* Prevent buffer overflow */
-        }
-    }
-
-    /* Optional UART logging if needed */
-    if (dataChanged && (total_length > 0U))
-    {
-        /* (void)SERCOM0_USART_Write((uint8_t*)messageAnalog, total_length); */
-    }
-
-    /* ---- TCP Frame Send for changed inputs ---- */
-    if (changedCount > 0U)
-    {
-        uint8_t processed = 0U;
-        while (processed < changedCount)
-        {
-            /* Limit batch to 16 updates per frame */
-            uint8_t batchCount = (changedCount - processed > 16U) ? 16U : (changedCount - processed);
-
-            /* Construct message header */
-            uint8_t header[4U];
-            header[0U] = 0x00U;  /* Status: no errors */
-            header[1U] = 0x02U;  /* Response type: analog data */
-            header[2U] = msgSubTypeAnalogRead; /* Subtype */
-            header[3U] = batchCount;
-
-            /* Payload buffer: 6 bytes per channel */
-            uint8_t payload[batchCount * 6U];
-
-            for (uint8_t i = 0U; i < batchCount; i++)
-            {
-                uint8_t index = changedIndexes[processed + i];
-                uint16_t port = GetPortFromSerialNumber((uint8_t)(index + 91U));
-
-                uint16_t value;
-                if (index < 16U)
-                {
-                    value = currentTempAIQueueBuffer[index];
-                }
-                else
-                {
-                    value = currentAIQueueBuffer[index - 16U];
-                }
-
-                /* Pack payload: Port (2B), Reserved (2B), Value (2B) */
-                payload[(i * 6U) + 0U] = (uint8_t)((port >> 8U) & 0xFFU);
-                payload[(i * 6U) + 1U] = (uint8_t)(port & 0xFFU);
-                payload[(i * 6U) + 2U] = 0x00U;
-                payload[(i * 6U) + 3U] = 0x00U;
-                payload[(i * 6U) + 4U] = (uint8_t)((value >> 8U) & 0xFFU);
-                payload[(i * 6U) + 5U] = (uint8_t)(value & 0xFFU);
-            }
-
-            /* Compute CRC over header+payload */
-            uint16_t messageSize = (uint16_t)(sizeof(header) + (batchCount * 6U) + 2U);
-            uint8_t message[messageSize];
-
-            (void) memcpy(message, header, sizeof(header));
-            (void) memcpy(&message[sizeof(header)], payload, (batchCount * 6U));
-
-            uint16_t crc = CalculateCRC(message, (uint16_t)(sizeof(header) + (batchCount * 6U)));
-            message[sizeof(header) + (batchCount * 6U)]     = (uint8_t)((crc >> 8U) & 0xFFU);
-            message[sizeof(header) + (batchCount * 6U) + 1] = (uint8_t)(crc & 0xFFU);
-
-            if (sIOServerSocket != INVALID_SOCKET)
-            {
-                SYS_CONSOLE_PRINT("Sending Analog Input Change Data with CRC to IO Socket\r\n");
-
-                /* Send frame */
-                (void) TCPIP_TCP_ArrayPut(sIOServerSocket, message, messageSize);
-            }
-
-            /* Update processed index */
-            processed = (uint8_t)(processed + batchCount);
         }
     }
 }
@@ -964,6 +825,642 @@ static void SetStaticIPAddress(const char* ipStr)
         SYS_CONSOLE_PRINT("Error: Failed to set static IP\r\n");
     }
 }
+
+
+/**
+ * @brief Reads digital input values and updates the input buffer.
+ *
+ * This function reads the status of 40 direct digital inputs and 8 expander inputs.
+ * It also sets IP addresses based on board selection conditions.
+ *
+ * MISRA C Compliance:
+ * - Ensures proper type handling to avoid implicit promotions.
+ * - Uses explicit comparisons instead of boolean negation.
+ * - Reduces redundant function calls with a loop-based approach.
+ * - Avoids magic numbers by defining named constants.
+ * - Ensures proper null-checking and input validation.
+ */
+void readDigitalInputs() {
+    uint8_t expanderData0 = TCA9539_ReadRegister(INPUT_PORT_REG);
+    uint8_t expanderData1 = TCA9539_ReadRegister(INPUT_PORT_REG_2);
+    
+    // Set the digital input data (first 40 from direct digital pins, last 8 from expander)
+    currentDIQueueBuffer[0] = (Digital_Input_1_Get()) ? 1 : 0;
+    currentDIQueueBuffer[1] = (Digital_Input_2_Get()) ? 1 : 0;
+    currentDIQueueBuffer[2] = (Digital_Input_3_Get()) ? 1 : 0;
+    currentDIQueueBuffer[3] = (Digital_Input_4_Get()) ? 1 : 0;
+    currentDIQueueBuffer[4] = (Digital_Input_5_Get()) ? 1 : 0;
+    currentDIQueueBuffer[5] = (Digital_Input_6_Get()) ? 1 : 0;
+    currentDIQueueBuffer[6] = (Digital_Input_7_Get()) ? 1 : 0;
+    currentDIQueueBuffer[7] = (Digital_Input_8_Get()) ? 1 : 0;
+    currentDIQueueBuffer[8] = (Digital_Input_9_Get()) ? 1 : 0;
+    currentDIQueueBuffer[9] = (Digital_Input_10_Get()) ? 1 : 0;
+    currentDIQueueBuffer[10] = (Digital_Input_11_Get()) ? 1 : 0;
+    currentDIQueueBuffer[11] = (Digital_Input_12_Get()) ? 1 : 0;
+    currentDIQueueBuffer[12] = (Digital_Input_13_Get()) ? 1 : 0;
+    currentDIQueueBuffer[13] = (Digital_Input_14_Get()) ? 1 : 0;
+    currentDIQueueBuffer[14] = (Digital_Input_15_Get()) ? 1 : 0;
+    currentDIQueueBuffer[15] = (Digital_Input_16_Get()) ? 1 : 0;
+    currentDIQueueBuffer[16] = (Digital_Input_17_Get()) ? 1 : 0;
+    currentDIQueueBuffer[17] = (Digital_Input_18_Get()) ? 1 : 0;
+    currentDIQueueBuffer[18] = (Digital_Input_19_Get()) ? 1 : 0;
+    currentDIQueueBuffer[19] = (Digital_Input_20_Get()) ? 1 : 0;
+    currentDIQueueBuffer[20] = (Digital_Input_21_Get()) ? 1 : 0;
+    currentDIQueueBuffer[21] = (Digital_Input_22_Get()) ? 1 : 0;
+    currentDIQueueBuffer[22] = (Digital_Input_23_Get()) ? 1 : 0;
+    currentDIQueueBuffer[23] = (Digital_Input_24_Get()) ? 1 : 0;
+    currentDIQueueBuffer[24] = (Digital_Input_25_Get()) ? 1 : 0;
+    currentDIQueueBuffer[25] = (Digital_Input_26_Get()) ? 1 : 0;
+    currentDIQueueBuffer[26] = (Digital_Input_27_Get()) ? 1 : 0;
+    currentDIQueueBuffer[27] = (Digital_Input_28_Get()) ? 1 : 0;
+    currentDIQueueBuffer[28] = (Digital_Input_29_Get()) ? 1 : 0;
+    currentDIQueueBuffer[29] = (Digital_Input_30_Get()) ? 1 : 0;
+    currentDIQueueBuffer[30] = (Digital_Input_31_Get()) ? 1 : 0;
+    currentDIQueueBuffer[31] = (Digital_Input_32_Get()) ? 1 : 0;
+    currentDIQueueBuffer[32] = (Digital_Input_33_Get()) ? 1 : 0;
+    currentDIQueueBuffer[33] = (Digital_Input_34_Get()) ? 1 : 0;
+    currentDIQueueBuffer[34] = (Digital_Input_35_Get()) ? 1 : 0;
+    currentDIQueueBuffer[35] = (Digital_Input_36_Get()) ? 1 : 0;
+    currentDIQueueBuffer[36] = (Digital_Input_37_Get()) ? 1 : 0;
+    currentDIQueueBuffer[37] = (Digital_Input_38_Get()) ? 1 : 0;
+    currentDIQueueBuffer[38] = (Digital_Input_39_Get()) ? 1 : 0;
+    currentDIQueueBuffer[39] = (Digital_Input_40_Get()) ? 1 : 0;
+    currentDIQueueBuffer[40] = (Digital_Input_41_Get()) ? 1 : 0;
+    currentDIQueueBuffer[41] = (Digital_Input_42_Get()) ? 1 : 0;
+    currentDIQueueBuffer[42] = (Digital_Input_43_Get()) ? 1 : 0;
+    currentDIQueueBuffer[43] = (Digital_Input_44_Get()) ? 1 : 0;
+    currentDIQueueBuffer[44] = (Digital_Input_45_Get()) ? 1 : 0;
+    currentDIQueueBuffer[45] = (Digital_Input_46_Get()) ? 1 : 0;
+    currentDIQueueBuffer[46] = (Digital_Input_47_Get()) ? 1 : 0;
+    currentDIQueueBuffer[47] = (Digital_Input_48_Get()) ? 1 : 0;
+    currentDIQueueBuffer[48] = (Digital_Input_49_Get()) ? 1 : 0;   
+
+    // Set the digital input data from the expander (inputs 50 to 60)
+    /* Read DI 50 to 60 - from IO Expander */
+    /* Port 0 => DI 50 to DI 57 => Buffer index 49 to 56 */
+    for (uint8_t i = 0U; i < 8U; ++i)
+    {
+        currentDIQueueBuffer[49U + i] = ((expanderData0 & (1U << i)) != 0U) ? 1U : 0U;
+    }
+
+    /* Port 1 => DI 58 to DI 60 => Buffer index 57 to 59 */
+    for (uint8_t i = 0U; i < 3U; ++i)
+    {
+        currentDIQueueBuffer[57U + i] = ((expanderData1 & (1U << i)) != 0U) ? 1U : 0U;
+    }
+
+    if (Board_Selection == false)
+    {
+        Board_Selection = true;
+        /* Set Static IP */
+        SetStaticIPAddress("192.168.1.231");
+    } 
+}
+
+
+/**
+ * @brief Calculates the CRC-16 checksum using the polynomial 0x8005.
+ *
+ * This function computes a 16-bit **CRC (Cyclic Redundancy Check)** for the given data buffer.
+ * It implements a **bitwise** algorithm with a standard **0x8005 polynomial** (CRC-16).
+ *
+ * ## CRC Calculation Details:
+ * - **Initial CRC Value**: `0xFFFF`
+ * - **Polynomial Used**: `0x8005`
+ * - **Bitwise Processing**: Each byte is XORed into the CRC register and then shifted bit-by-bit.
+ *
+ * @param data Pointer to the data buffer.
+ * @param length Number of bytes in the data buffer.
+ * @return Computed 16-bit CRC value.
+ */
+uint16_t CalculateCRC(uint8_t *data, uint16_t length)
+{
+    uint16_t crc = 0xFFFF;
+    uint16_t polynomial = 0x1021;
+
+    for(uint16_t i = 0; i < length; i++)
+    {
+        crc ^= ((uint16_t)data[i] << 8);
+
+        for(uint8_t j = 0; j < 8; j++)
+        {
+            if(crc & 0x8000)
+                crc = ((crc << 1) ^ polynomial) & 0xFFFF;
+            else
+                crc = (crc << 1) & 0xFFFF;
+        }
+    }
+
+    return crc;
+}
+/**
+ * @brief Parses an incoming packet and validates its structure.
+ *
+ * This function extracts information from an incoming **IO packet**, including:
+ * - **Message type**
+ * - **Message subtype**
+ * - **Number of tuples**
+ * - **Port number and value**
+ * - **CRC validation**
+ *
+ * It performs **error handling** for:
+ * - Invalid buffer
+ * - Invalid message type/subtype
+ * - Incorrect tuple count
+ * - Invalid port numbers or values
+ * - Packet size mismatches
+ *
+ * @param u8IOBuffer Pointer to the received packet buffer.
+ * @param inbPacketSz Size of the incoming packet.
+ */
+void ParseAndProcessInbPacket(uint8_t *buf, uint16_t len)
+{
+    if(buf == NULL)
+    {
+        SYS_CONSOLE_PRINT("[TCP] ERROR: NULL buffer\r\n");
+        return;
+    }
+
+    SYS_CONSOLE_PRINT("\r\n[TCP] RX Frame (%u bytes): ", len);
+    for(uint16_t i=0;i<len;i++)
+        SYS_CONSOLE_PRINT("%02X ",buf[i]);
+    SYS_CONSOLE_PRINT("\r\n");
+
+    /* Minimum frame validation */
+    if(len < TCP_MIN_FRAME_SIZE)
+    {
+        SYS_CONSOLE_PRINT("[TCP] ERROR: Frame too short\r\n");
+        return;
+    }
+
+    /* Parse header */
+    Reqframe_St.uniqueId =
+            ((uint32_t)buf[0] << 24) |
+            ((uint32_t)buf[1] << 16) |
+            ((uint32_t)buf[2] << 8) |
+            buf[3];
+
+    Reqframe_St.msgType = ((uint16_t)buf[4] << 8) | buf[5];
+    Reqframe_St.compartmentId = buf[6];
+    Reqframe_St.dockId = buf[7];
+    Reqframe_St.commandId = buf[8];
+    Reqframe_St.payloadLen = buf[9];
+
+    Reqframe_St.payload = &buf[10];
+
+    uint16_t expectedLen = 10 + Reqframe_St.payloadLen + 2;
+
+    if(len != expectedLen)
+    {
+        SYS_CONSOLE_PRINT("[TCP] ERROR: Length mismatch\r\n");
+        return;
+    }
+
+    /* CRC validation */
+    uint16_t rxCrc = ((uint16_t)buf[len-2] << 8) | buf[len-1];
+    uint16_t calcCrc = CalculateCRC(buf, len-2);
+
+    if(rxCrc != calcCrc)
+    {
+        SYS_CONSOLE_PRINT("[TCP] ERROR: CRC mismatch\r\n");
+        return;
+    }
+
+    SYS_CONSOLE_PRINT("[TCP] Frame Valid\r\n");
+
+    /* Message type validation */
+
+    if(Reqframe_St.msgType != MSG_TYPE_REQUEST)
+    {
+        SYS_CONSOLE_PRINT("[TCP] ERROR: Not a request frame\r\n");
+        return;
+    }
+
+    /* Command dispatcher */
+
+    switch(Reqframe_St.commandId)
+    {
+        case CMD_GPIO_OPERATION:
+            HandleGPIOCommand();
+            break;
+
+        case CMD_ANALOG_READ:
+            HandleAnalogRead();
+            break;
+
+        case CMD_CHARGING_COMMAND:
+            uint8_t u8DockNo = Reqframe_St.dockId;
+            HandleChargingCommand(u8DockNo);
+            break;
+
+        case CMD_BOOT_MODE_COMMAND:
+            HandleBootloaderCommand();
+            return;
+
+        case CMD_SOFT_RESET_COMMAND:
+            // HandleSoftResetCommand();
+            return;
+
+        default:
+            SYS_CONSOLE_PRINT("[TCP] ERROR: Unknown Command\r\n");
+            outbErrorCode = errorInvalidMsg;
+            PrepareDispatchOutbPacket();
+            break;
+    }
+
+    ResetInbOutbData();
+}
+
+void HandleGPIOCommand(void)
+{
+    uint8_t payload[4];
+    inbMsgSubType = Reqframe_St.payload[0];
+    if ((inbMsgSubType == msgSubTypeDigitalWrite && Reqframe_St.payloadLen != 4) ||
+        (inbMsgSubType == msgSubTypeDigitalRead && Reqframe_St.payloadLen != 3))
+    {
+        SYS_CONSOLE_PRINT("[GPIO] ERROR: Payload size mismatch\r\n");
+        outbErrorCode = errorInvalidMsg;
+
+        payload[0] = inbMsgSubType;
+        payload[1] = (inbPortNo >> 8) & 0xFF;
+        payload[2] = inbPortNo & 0xFF;
+        payload[3] = outbErrorCode;
+
+        SendResponsePayload(payload, 4);
+        return;
+    }
+
+    inbMsgSubType = Reqframe_St.payload[0];
+    inbPortNo = ((uint16_t)Reqframe_St.payload[1] << 8) | Reqframe_St.payload[2];
+    if (inbMsgSubType == msgSubTypeDigitalWrite || inbMsgSubType == msgSubTypeDigitalRead)
+    {
+        inbPortVal = (inbMsgSubType == msgSubTypeDigitalWrite) ? Reqframe_St.payload[3] : 0;
+    }
+    else
+    {
+        SYS_CONSOLE_PRINT("[GPIO] ERROR: Invalid Message Subtype\r\n");
+        outbErrorCode = errorInvalidMsg;
+    } 
+    /* Validate port */
+    if (inbPortNo < 1 || inbPortNo > 110)
+    {
+        SYS_CONSOLE_PRINT("[GPIO] ERROR: Invalid Port\r\n");
+        outbErrorCode = errorInvalidPort;
+    }
+    /* Validate value */
+    if ((inbPortVal != 0) && (inbPortVal != 1))
+    {
+        SYS_CONSOLE_PRINT("[GPIO] ERROR: Invalid Value\r\n");
+        outbErrorCode = errorInvalidValue;
+    }
+    if (outbErrorCode == errorNoError)
+    {
+        ProcessInbPacket();
+        StoreRelay_DigitalOutputsFrame();
+    }
+
+    /* Build response payload */
+
+    payload[0] = inbMsgSubType;
+    payload[1] = (inbPortNo >> 8) & 0xFF;
+    payload[2] = inbPortNo & 0xFF;
+    payload[3] = outbErrorCode;
+
+    if (inbMsgSubType == msgSubTypeDigitalWrite)
+    {
+        payload[4] = (inbPortVal != 0) ? 1 : 0;
+    }
+    else
+    {
+        payload[4] = (outbPortVal != 0) ? 1 : 0;
+    }
+    SendResponsePayload(payload, 5);
+}
+
+void HandleAnalogRead(void)
+{
+    if(Reqframe_St.payloadLen < 1)
+    {
+        outbErrorCode = errorInvalidMsg;
+        PrepareDispatchOutbPacket();
+        return;
+    }
+
+    uint8_t channel = Reqframe_St.payload[0];
+
+    SYS_CONSOLE_PRINT("[ANALOG] Read Channel %d\r\n",channel);
+
+    uint32_t adcValue = Analog_Input_Get(channel);
+
+    uint8_t payload[5] = {0};
+
+    payload[0] = channel;
+
+    payload[1] = (adcValue >> 24) & 0xFF;
+    payload[2] = (adcValue >> 16) & 0xFF;
+    payload[3] = (adcValue >> 8) & 0xFF;
+    payload[4] = adcValue & 0xFF;
+
+    SendResponsePayload(payload,5);
+}
+
+void HandleChargingCommand(uint8_t u8DockNo)
+{
+    if(Reqframe_St.payloadLen < 1)
+    {
+        outbErrorCode = errorInvalidMsg;
+        PrepareDispatchOutbPacket();
+        return;
+    }
+
+    uint8_t action = Reqframe_St.payload[0];
+
+    SYS_CONSOLE_PRINT("[CHARGING] Action: %s\r\n",
+                      action ? "START" : "STOP");
+    ChargingControl(u8DockNo,action);
+    uint8_t status = 01; // Assume success for now
+
+    uint8_t payload[1];
+    payload[0] = status;
+
+    SendResponsePayload(payload,1);
+}
+
+void HandleBootloaderCommand(void)
+{
+    SYS_CONSOLE_PRINT("[SYSTEM] Bootloader Trigger\r\n");
+
+    ramStart[0] = BTL_TRIGGER_PATTERN;
+    ramStart[1] = BTL_TRIGGER_PATTERN;
+    ramStart[2] = BTL_TRIGGER_PATTERN;
+    ramStart[3] = BTL_TRIGGER_PATTERN;
+
+    DCACHE_CLEAN_BY_ADDR(ramStart, 16);
+
+    SYS_RESET_SoftwareReset();
+}
+
+void SendResponsePayload(uint8_t *payload, uint8_t len)
+{
+    uint16_t index = 0;
+
+    outbPacketBuf[index++] = (Reqframe_St.uniqueId >> 24);
+    outbPacketBuf[index++] = (Reqframe_St.uniqueId >> 16);
+    outbPacketBuf[index++] = (Reqframe_St.uniqueId >> 8);
+    outbPacketBuf[index++] = Reqframe_St.uniqueId;
+
+    outbPacketBuf[index++] = 0x00;
+    outbPacketBuf[index++] = 0x02;
+
+    outbPacketBuf[index++] = Reqframe_St.compartmentId;
+    outbPacketBuf[index++] = Reqframe_St.dockId;
+    outbPacketBuf[index++] = Reqframe_St.commandId;
+
+    outbPacketBuf[index++] = len;
+
+    memcpy(&outbPacketBuf[index], payload, len);
+    index += len;
+
+    uint16_t crc = CalculateCRC(outbPacketBuf,index);
+
+    outbPacketBuf[index++] = (crc >> 8);
+    outbPacketBuf[index++] = crc;
+
+    TCPIP_TCP_ArrayPut(sIOServerSocket,outbPacketBuf,index);
+}
+
+/**
+ * @brief Prepares and dispatches an outbound packet over TCP.
+ *
+ * This function constructs an outbound packet (`outbPacketBuf`) with 
+ * appropriate fields such as error code, message subtype, port number, 
+ * and port value. The packet is then transmitted over a TCP socket.
+ *
+ * Steps:
+ * 1. Populate `outbPacketBuf` with relevant data.
+ * 2. Compute `outbPacketSz` based on the number of tuples.
+ * 3. Print the packet contents for debugging.
+ * 4. Send the packet using `TCPIP_TCP_ArrayPut`.
+ *
+ * @note Ensure `outbPacketBuf` has enough allocated memory to avoid overflow.
+ */
+
+void PrepareDispatchOutbPacket()
+{
+    uint16_t index = 0;
+
+    /* Unique ID (same as request) */
+    outbPacketBuf[index++] = (Reqframe_St.uniqueId >> 24) & 0xFF;
+    outbPacketBuf[index++] = (Reqframe_St.uniqueId >> 16) & 0xFF;
+    outbPacketBuf[index++] = (Reqframe_St.uniqueId >> 8) & 0xFF;
+    outbPacketBuf[index++] = Reqframe_St.uniqueId & 0xFF;
+
+    /* Message Type = Response (0x0002) */
+    outbPacketBuf[index++] = 0x00;
+    outbPacketBuf[index++] = 0x02;
+
+    /* Compartment ID */
+    outbPacketBuf[index++] = Reqframe_St.compartmentId;
+
+    /* Dock ID */
+    outbPacketBuf[index++] = Reqframe_St.dockId;
+
+    /* Command ID */
+    outbPacketBuf[index++] = Reqframe_St.commandId;
+
+    if (outbErrorCode != errorNoError) {
+        /* Payload Length */
+        outbPacketBuf[index++] = Reqframe_St.payloadLen;
+        outbPacketBuf[index++] = Reqframe_St.payload[0];
+        outbPacketBuf[index++] = Reqframe_St.payload[1];
+        outbPacketBuf[index++] = Reqframe_St.payload[2];
+        outbPacketBuf[index++] = outbErrorCode; // Add error code in payload for error response
+    } else {
+        /* Payload Length */
+        outbPacketBuf[index++] = Reqframe_St.payloadLen + 1; // If success then add 1 byte for port value;
+        outbPacketBuf[index++] = Reqframe_St.payload[0];
+        outbPacketBuf[index++] = Reqframe_St.payload[1];
+        outbPacketBuf[index++] = Reqframe_St.payload[2];
+        outbPacketBuf[index++] = errorNoError; // Add error code in payload for error response
+        if (inbMsgSubType == msgSubTypeDigitalWrite) {
+            outbPacketBuf[index++] = (inbPortVal != 0) ? 0x01 : 0x00;
+        } else {
+            outbPacketBuf[index++] = (outbPortVal != 0) ? 0x01 : 0x00;
+        }
+    }
+    /* Calculate CRC */
+    uint16_t crc = CalculateCRC(outbPacketBuf, index);
+
+    outbPacketBuf[index++] = (crc >> 8) & 0xFF;
+    outbPacketBuf[index++] = crc & 0xFF;
+
+    outbPacketSz = index;
+
+    /* Debug print */
+    SYS_CONSOLE_PRINT("[TCP] Response Frame: ");
+    for(uint16_t i = 0; i < outbPacketSz; i++)
+    {
+        SYS_CONSOLE_PRINT("%02X ", outbPacketBuf[i]);
+    }
+    SYS_CONSOLE_PRINT("\r\n");
+
+    /* Send TCP */
+    TCPIP_TCP_ArrayPut(sIOServerSocket, (const uint8_t*)outbPacketBuf, outbPacketSz);
+}
+/**
+ * @brief   Resets inbound and outbound data structures.
+ * 
+ * This function clears and resets various inbound (`inb*`) and outbound (`outb*`) 
+ * data variables to their default states. It ensures that:
+ * - Message subtype, port numbers, and values are set to zero or -1 as needed.
+ * - The packet buffers (`inbPacketBuf` and `outbPacketBuf`) are fully cleared (set to 0x00).
+ * - Packet sizes are reset to zero.
+ * - The error code for outbound messages is reset to `errorNoError`.
+ * 
+ * This function is typically used before processing new messages to ensure
+ * no residual data from previous transmissions affects the new operation.
+ */
+void ResetInbOutbData()
+{
+    inbMsgSubType = 0x00;
+    inbNumTuples = 0; // Allow only max of 1 for now
+    inbPortNo = -1;
+    inbPortVal = -1;
+    inbCrc = -1;
+    
+    for (int i = 0; i < 256; i++)
+    {
+        inbPacketBuf[i] = 0x00;
+    }
+    inbPacketSz = 0;
+
+    // Outgoing Command
+    outbRemotePort = 0;
+    outbErrorCode = errorNoError;
+    outbMsgSubType = 0x00;
+    outbNumTuples = 0; // Allow only max of 1 for now
+    outbPortNo = -1;
+    outbPortVal = -1;
+    outbCrc = -1;
+
+    Reqframe_St.uniqueId = 0;
+    Reqframe_St.msgType = 0;
+    Reqframe_St.compartmentId = 0;
+    Reqframe_St.dockId = 0;
+    Reqframe_St.commandId = 0;
+    Reqframe_St.payloadLen = 0;
+    Reqframe_St.payload = NULL;
+
+    for (int i = 0; i < 256; i++)
+    {
+        outbPacketBuf[i] = 0x00;
+    }
+    
+    outbPacketSz = 0;
+}
+/**
+ * @brief   IO Handler Server Task.
+ * 
+ * This FreeRTOS task is responsible for:
+ * - Configuring IO expanders.
+ * - Initializing and managing server communication (TCP for HEV, UDP for Two-Wheeler).
+ * - Reading stored output states from Flash.
+ * - Handling digital and analog input readings.
+ * - Processing incoming commands and responding accordingly.
+ * - Ensuring reconnection if the TCP/UDP server socket is disconnected.
+ * 
+ * The task continuously runs in a loop, performing these operations periodically.
+ * 
+ * @param pvParameters Unused task parameter.
+ */
+
+void vIOHandlerServerTask(void *pvParameters)
+{
+    // Configure IO expanders
+    vConfigureIOexpanders();
+
+    // Read stored output states from Flash memory
+    SYS_CONSOLE_PRINT("Reading stored output states from Flash\r\n");
+    readOutputsFromFlash();
+
+    // Print function entry for debugging
+    SYS_CONSOLE_PRINT("In Function: %s\r\n", __FUNCTION__);
+
+    // Open server socket based on the aggregator type
+    sIOServerSocket = TCPIP_TCP_ServerOpen(IP_ADDRESS_TYPE_IPV4, IO_SERVER_PORT_HEV, 0);
+
+    if (sIOServerSocket == INVALID_SOCKET)
+    {
+        SYS_CONSOLE_PRINT("Error opening IO server socket\r\n");
+        vTaskDelete(NULL);
+        return;
+    }
+    while (true)
+    {
+        // Read digital and analog inputs
+        readDigitalInputs();
+        ReadAllAnalogInputPins();
+        uint8_t u8IOBuffer[256] = {0};
+        if (TCPIP_TCP_IsConnected(sIOServerSocket))
+        {
+            int16_t bytesRead = TCPIP_TCP_ArrayGet(sIOServerSocket, u8IOBuffer, sizeof(u8IOBuffer));
+
+            if (bytesRead > 0)
+            {
+                SYS_CONSOLE_PRINT("Got Data on IO Server Handler (TCP)\r\n");
+                // Read and process incoming commands if any
+                ParseAndProcessInbPacket(u8IOBuffer, bytesRead);
+            }
+
+            if (!TCPIP_TCP_IsConnected(sIOServerSocket) || TCPIP_TCP_WasDisconnected(sIOServerSocket))
+            {
+                SYS_CONSOLE_PRINT("\r\nTCP Connection Closed\r\n");
+                TCPIP_TCP_Close(sIOServerSocket);
+                sIOServerSocket = INVALID_SOCKET;
+            }
+        }
+        // Ensure reconnection logic is handled correctly
+        if (sIOServerSocket == INVALID_SOCKET)
+        {
+            SYS_CONSOLE_PRINT("TCP server socket disconnected, attempting to reconnect...\r\n");
+
+            // Attempt to open the socket again
+            sIOServerSocket = TCPIP_TCP_ServerOpen(IP_ADDRESS_TYPE_IPV4, IO_SERVER_PORT_HEV, 0);
+
+            if (sIOServerSocket == INVALID_SOCKET)
+            {
+                SYS_CONSOLE_PRINT("Failed to reopen IO socket, retrying...\r\n");
+            }
+            else
+            {
+                SYS_CONSOLE_PRINT("Reconnected successfully IO Socket!\r\n");
+            }
+
+            vTaskDelay(RECONNECT_DELAY_MS);
+        }
+        vTaskDelay(10); // Add a small delay to avoid consuming too much CPU time
+    }
+}
+/**
+ * @brief   Initializes and starts IO handler tasks.
+ * 
+ * This function creates two FreeRTOS tasks:
+ * - vIOHandlerServerTask: Manages IO server communication and processing.
+ * - vToggleLEDTask: Handles periodic LED toggling.
+ * 
+ * The tasks are created with predefined stack sizes and priorities.
+ */
+void vIOHandler()
+{
+    // Create IO Handler Server Task for managing IO communication
+    xTaskCreate(vIOHandlerServerTask, 
+                "vIOHandlerServerTask", 
+                IO_SERVER_HANDLER_HEAP_DEPTH, 
+                NULL, 
+                IO_SERVER_HANDLER_TASK_PRIORITY, 
+                NULL);    
+}
+
 
 /**
  * @brief  Get the digital input value from IO Expander for input 50.
@@ -1075,914 +1572,13 @@ uint8_t Digital_Input_60_Get(void)
     return currentDIQueueBuffer[59];
 }
 
-
 /**
- * @brief Reads digital input values and updates the input buffer.
- *
- * This function reads the status of 40 direct digital inputs and 8 expander inputs.
- * It also sets IP addresses based on board selection conditions.
- *
- * MISRA C Compliance:
- * - Ensures proper type handling to avoid implicit promotions.
- * - Uses explicit comparisons instead of boolean negation.
- * - Reduces redundant function calls with a loop-based approach.
- * - Avoids magic numbers by defining named constants.
- * - Ensures proper null-checking and input validation.
+ * @brief  Get the Analog value for Chennel 1.
+ * @return Analog Value.
  */
-void readDigitalInputs() {
-    uint8_t expanderData0 = TCA9539_ReadRegister(INPUT_PORT_REG);
-    uint8_t expanderData1 = TCA9539_ReadRegister(INPUT_PORT_REG_2);
-    
-    //DEBUG
-//        uint32_t now = SYS_TIME_CounterGet();   // current tick count
-//    if (now - lastTick >= SYS_TIME_MSToCount(100))   // 1 sec elapsed
-//    {
-//        lastTick = now;
-//        SYS_CONSOLE_PRINT("expanderData0: 0x%02X, expanderData1: 0x%02X\r\n", expanderData0, expanderData1);
-//
-//        /* Print individual pin states */
-//        for (uint8_t i = 0; i < 8; i++)
-//        {
-//            SYS_CONSOLE_PRINT("P0_%d: %s\r\n", i, (expanderData0 & (1 << i)) ? "high" : "low");
-//        }
-//        for (uint8_t i = 0; i < 3; i++)
-//        {
-//            SYS_CONSOLE_PRINT("P1_%d: %s\r\n", i, (expanderData1 & (1 << i)) ? "high" : "low");
-//        }
-//    }
-    
-    // Set the digital input data (first 40 from direct digital pins, last 8 from expander)
-    currentDIQueueBuffer[0] = (Digital_Input_1_Get()) ? 1 : 0;
-    currentDIQueueBuffer[1] = (Digital_Input_2_Get()) ? 1 : 0;
-    currentDIQueueBuffer[2] = (Digital_Input_3_Get()) ? 1 : 0;
-    currentDIQueueBuffer[3] = (Digital_Input_4_Get()) ? 1 : 0;
-    currentDIQueueBuffer[4] = (Digital_Input_5_Get()) ? 1 : 0;
-    currentDIQueueBuffer[5] = (Digital_Input_6_Get()) ? 1 : 0;
-    currentDIQueueBuffer[6] = (Digital_Input_7_Get()) ? 1 : 0;
-    currentDIQueueBuffer[7] = (Digital_Input_8_Get()) ? 1 : 0;
-    currentDIQueueBuffer[8] = (Digital_Input_9_Get()) ? 1 : 0;
-    currentDIQueueBuffer[9] = (Digital_Input_10_Get()) ? 1 : 0;
-    currentDIQueueBuffer[10] = (Digital_Input_11_Get()) ? 1 : 0;
-    currentDIQueueBuffer[11] = (Digital_Input_12_Get()) ? 1 : 0;
-    currentDIQueueBuffer[12] = (Digital_Input_13_Get()) ? 1 : 0;
-    currentDIQueueBuffer[13] = (Digital_Input_14_Get()) ? 1 : 0;
-    currentDIQueueBuffer[14] = (Digital_Input_15_Get()) ? 1 : 0;
-    currentDIQueueBuffer[15] = (Digital_Input_16_Get()) ? 1 : 0;
-    currentDIQueueBuffer[16] = (Digital_Input_17_Get()) ? 1 : 0;
-    currentDIQueueBuffer[17] = (Digital_Input_18_Get()) ? 1 : 0;
-    currentDIQueueBuffer[18] = (Digital_Input_19_Get()) ? 1 : 0;
-    currentDIQueueBuffer[19] = (Digital_Input_20_Get()) ? 1 : 0;
-    currentDIQueueBuffer[20] = (Digital_Input_21_Get()) ? 1 : 0;
-    currentDIQueueBuffer[21] = (Digital_Input_22_Get()) ? 1 : 0;
-    currentDIQueueBuffer[22] = (Digital_Input_23_Get()) ? 1 : 0;
-    currentDIQueueBuffer[23] = (Digital_Input_24_Get()) ? 1 : 0;
-    currentDIQueueBuffer[24] = (Digital_Input_25_Get()) ? 1 : 0;
-    currentDIQueueBuffer[25] = (Digital_Input_26_Get()) ? 1 : 0;
-    currentDIQueueBuffer[26] = (Digital_Input_27_Get()) ? 1 : 0;
-    currentDIQueueBuffer[27] = (Digital_Input_28_Get()) ? 1 : 0;
-    currentDIQueueBuffer[28] = (Digital_Input_29_Get()) ? 1 : 0;
-    currentDIQueueBuffer[29] = (Digital_Input_30_Get()) ? 1 : 0;
-    currentDIQueueBuffer[30] = (Digital_Input_31_Get()) ? 1 : 0;
-    currentDIQueueBuffer[31] = (Digital_Input_32_Get()) ? 1 : 0;
-    currentDIQueueBuffer[32] = (Digital_Input_33_Get()) ? 1 : 0;
-    currentDIQueueBuffer[33] = (Digital_Input_34_Get()) ? 1 : 0;
-    currentDIQueueBuffer[34] = (Digital_Input_35_Get()) ? 1 : 0;
-    currentDIQueueBuffer[35] = (Digital_Input_36_Get()) ? 1 : 0;
-    currentDIQueueBuffer[36] = (Digital_Input_37_Get()) ? 1 : 0;
-    currentDIQueueBuffer[37] = (Digital_Input_38_Get()) ? 1 : 0;
-    currentDIQueueBuffer[38] = (Digital_Input_39_Get()) ? 1 : 0;
-    currentDIQueueBuffer[39] = (Digital_Input_40_Get()) ? 1 : 0;
-    currentDIQueueBuffer[40] = (Digital_Input_41_Get()) ? 1 : 0;
-    currentDIQueueBuffer[41] = (Digital_Input_42_Get()) ? 1 : 0;
-    currentDIQueueBuffer[42] = (Digital_Input_43_Get()) ? 1 : 0;
-    currentDIQueueBuffer[43] = (Digital_Input_44_Get()) ? 1 : 0;
-    currentDIQueueBuffer[44] = (Digital_Input_45_Get()) ? 1 : 0;
-    currentDIQueueBuffer[45] = (Digital_Input_46_Get()) ? 1 : 0;
-    currentDIQueueBuffer[46] = (Digital_Input_47_Get()) ? 1 : 0;
-    currentDIQueueBuffer[47] = (Digital_Input_48_Get()) ? 1 : 0;
-    currentDIQueueBuffer[48] = (Digital_Input_49_Get()) ? 1 : 0;   
-
-    // Set the digital input data from the expander (inputs 50 to 60)
-    /* Read DI 50 to 60 - from IO Expander */
-    /* Port 0 => DI 50 to DI 57 => Buffer index 49 to 56 */
-    for (uint8_t i = 0U; i < 8U; ++i)
-    {
-        currentDIQueueBuffer[49U + i] = ((expanderData0 & (1U << i)) != 0U) ? 1U : 0U;
-    }
-
-    /* Port 1 => DI 58 to DI 60 => Buffer index 57 to 59 */
-    for (uint8_t i = 0U; i < 3U; ++i)
-    {
-        currentDIQueueBuffer[57U + i] = ((expanderData1 & (1U << i)) != 0U) ? 1U : 0U;
-    }
- 
-#if HEV_IO_Aggregator
-    if (Board_Selection == false)
-    {
-        Board_Selection = true;
-        /* Set Static IP */
-        SetStaticIPAddress("192.168.1.231");
-    }
-#endif
-
-#if Two_Wheeler_IO_Aggregator
-    if (Board_Selection == false)
-    {
-        Board_Selection = true;
-
-        if (Digital_Input_1_Get() == true)
-        {
-            Two_Wheeler_IO_Aggregator1 = true; /* If 1, set aggregator1 flag true */
-            SYS_CONSOLE_PRINT("IO Aggregator1 Two Wheeler Application \r\n");
-            SetStaticIPAddress("192.168.1.177");
-        }
-        else
-        {
-            Two_Wheeler_IO_Aggregator1 = false; /* If 0, set aggregator1 flag false */
-            SYS_CONSOLE_PRINT("IO Aggregator2 Two Wheeler Application \r\n");
-            SetStaticIPAddress("192.168.1.178");
-        }
-
-        Default_Pin_Status();
-    }
-#endif    
-}
-
-/**
- * @brief Updates and transmits the BDU frame.
- *
- * This function reads limit switch and ground sense data from the digital input buffer,
- * constructs a 4-word frame, converts it to Big-Endian format, and transmits the message
- * via TCP or UDP based on the platform configuration.
- *
- * MISRA C Compliance:
- * - Ensures proper type handling to avoid implicit promotions.
- * - Uses explicit type conversions to prevent unintended behavior.
- * - Includes necessary checks before transmitting data.
- * - Uses explicit function casting to avoid warnings.
- */
-void updateBDUFrame(void) 
+uint32_t Analog_Input_Get(uint8_t channel)
 {
-    uint8_t limitSwitchData = 0U;
-    uint8_t groundSenseData = 0U;
-    uint8_t i = 0U;
-    
-    /* Extract Limit Switch data (DI32 to DI39) */
-    for (i = 0U; i < 8U; i++) 
-    {
-        limitSwitchData |= (uint8_t)((currentDIQueueBuffer[32U + i] & 0x01U) << i);
-    }
-
-    /* Extract Ground Sense data (DI40 to DI48) */
-    for (i = 0U; i < 8U; i++) 
-    {
-        groundSenseData |= (uint8_t)((currentDIQueueBuffer[40U + i] & 0x01U) << i);
-    }
-
-    /* Frame structure */
-    uint16_t frame[4] = { 0x0D11U, 0x0000U, 0x0000U, 0x0000U };
-    frame[3] = (uint16_t)(((uint16_t)limitSwitchData << 8U) | (uint16_t)groundSenseData);
-
-    /* Prepare message in Big-Endian format */
-    uint8_t message[8];
-    message[0] = (uint8_t)((frame[0] >> 8U) & 0xFFU);
-    message[1] = (uint8_t)(frame[0] & 0xFFU);
-    message[2] = (uint8_t)((frame[1] >> 8U) & 0xFFU);
-    message[3] = (uint8_t)(frame[1] & 0xFFU);
-    message[4] = (uint8_t)((frame[2] >> 8U) & 0xFFU);
-    message[5] = (uint8_t)(frame[2] & 0xFFU);
-    message[6] = (uint8_t)((frame[3] >> 8U) & 0xFFU);
-    message[7] = (uint8_t)(frame[3] & 0xFFU);
-
-    /* Send Data */
-    #if HEV_IO_Aggregator
-        TCPIP_TCP_ArrayPut(sIOServerSocket, message, sizeof(message));
-    #elif Two_Wheeler_IO_Aggregator
-        if (TCPIP_UDP_PutIsReady(sIOServerSocket) >= (int32_t)sizeof(message)) 
-        {
-            (void)TCPIP_UDP_ArrayPut(sIOServerSocket, message, sizeof(message));
-            (void)TCPIP_UDP_Flush(sIOServerSocket);
-            (void)TCPIP_UDP_Discard(sIOServerSocket);
-
-            (void)SYS_CONSOLE_PRINT("Sent BDU Data via UDP\n");
-        } 
-        else 
-        {
-            (void)SYS_CONSOLE_PRINT("UDP Socket not ready\n");
-        }
-    #endif
-}
-
-/**
- * @brief Updates and transmits the Relay Output frame.
- *
- * This function reads the states of relay outputs, constructs a 4-word frame, converts it to Big-Endian format,
- * and transmits the message via TCP or UDP based on the platform configuration.
- *
- * MISRA C Compliance:
- * - Ensures explicit type handling and avoids implicit integer promotions.
- * - Uses explicit type conversions for bitwise operations.
- * - Prevents buffer overflows and ensures safe data transmission.
- */
-void updateRelayOutputFrame() {    
-    uint16_t frame[4];  // Buffer to hold the result
-    // Frame format: 0C11 0000 yyyy xxxx
-    uint16_t relayStatus = 0; // For Relay Output 1 to 15
-
-    // Retrieve the Relay output states and pack them into the appropriate places in the frame
-    // Packing for Relay Output 1 to Relay Output 6 (xxxx)
-    relayStatus |= (efuse1_in_Get() << 0); 
-    relayStatus |= (efuse2_in_Get() << 1); 
-    relayStatus |= (efuse3_in_Get() << 2); 
-    relayStatus |= (efuse4_in_Get() << 3);
-    relayStatus |= (Relay_Output_1_Get() << 4);
-    relayStatus |= (Relay_Output_2_Get() << 5);
-    
-    // Pack the frame: 0C11 0000 yyyy xxxx
-    frame[0] = 0x0C11;   // Fixed header 0C11
-    frame[1] = 0x0000;   // Reserved part (0000 0000)
-    frame[2] = 0x0000;  // Relay Output 16 to 20 
-    frame[3] = relayStatus;  // Relay Output 1 to 15 
-    SYS_CONSOLE_PRINT("%04X %04X %04X %04X\n", frame[0], frame[1], frame[2], frame[3]);
-    
-    if (!TCPIP_UDP_IsConnected(sIOServerSocket))
-    {
-        SYS_CONSOLE_MESSAGE("Server Connection was closed\r\n");
-        return;
-    } 
-    SYS_CONSOLE_PRINT("Sending Relay Output Data to IO Socket\r\n");
-
-    // Prepare message in correct byte order (Big-Endian format)
-    uint8_t message[8];
-    message[0] = (frame[0] >> 8) & 0xFF;
-    message[1] = frame[0] & 0xFF;
-    message[2] = (frame[1] >> 8) & 0xFF;
-    message[3] = frame[1] & 0xFF;
-    message[4] = (frame[2] >> 8) & 0xFF;
-    message[5] = frame[2] & 0xFF;
-    message[6] = (frame[3] >> 8) & 0xFF;
-    message[7] = frame[3] & 0xFF;
-
-    /* Send data based on platform configuration */
-    #if HEV_IO_Aggregator
-        (void)TCPIP_TCP_ArrayPut(sIOServerSocket, message, (uint16_t)sizeof(message));
-    #elif Two_Wheeler_IO_Aggregator
-        if (TCPIP_UDP_PutIsReady(sIOServerSocket) >= (int32_t)sizeof(message)) 
-        {
-            (void)TCPIP_UDP_ArrayPut(sIOServerSocket, message, (uint16_t)sizeof(message));
-            (void)TCPIP_UDP_Flush(sIOServerSocket);  /* Ensure data is sent */
-            (void)TCPIP_UDP_Discard(sIOServerSocket);
-
-            (void)SYS_CONSOLE_PRINT("Sent Relay Output Data via UDP\n");
-        } 
-        else 
-        {
-            (void)SYS_CONSOLE_PRINT("UDP Socket not ready\n");
-        }
-    #endif     
-}
-
-/**
- * @brief Sends the version number frame via UDP.
- *
- * This function prepares a small frame (3 bytes) containing version data and sends it 
- * over a UDP socket if the buffer is ready.
- *
- * Enhancements:
- * - Ensures safe socket operations.
- * - Adds proper debugging logs.
- * - Improves MISRA C compliance by explicit type casting.
- */
-void updateFirmwareVersionNumberFrame() {
-    uint8_t message[3];
-
-    /* Extract Major, Minor, and Patch versions from SYS_FW_VERSION */
-    message[0] = (SYS_FW_VERSION >> 16) & 0xFF;  // Major version
-    message[1] = (SYS_FW_VERSION >> 8) & 0xFF;   // Minor version
-    message[2] = (SYS_FW_VERSION) & 0xFF;        // Patch version
-#if HEV_IO_Aggregator  
-    /* Ensure the socket is ready to send data */
-    if (TCPIP_TCP_IsConnected(sIOServerSocket))
-    {
-        TCPIP_TCP_ArrayPut(sIOServerSocket, message, (uint16_t)sizeof(message));
-        TCPIP_TCP_Flush(sIOServerSocket);
-        (void)SYS_CONSOLE_PRINT("Sent Version Number Data via TCP: %d.%d.%d\n",
-                                message[0], message[1], message[2]);        
-    }
-    else 
-    {
-        (void)SYS_CONSOLE_PRINT("TCP Socket not ready\n");
-    }
-#endif  
-#if Two_Wheeler_IO_Aggregator  
-    /* Ensure the socket is ready to send data */
-    if (TCPIP_UDP_PutIsReady(sIOServerSocket) >= (int32_t)sizeof(message)) 
-    {
-        (void)TCPIP_UDP_ArrayPut(sIOServerSocket, message, (uint16_t)sizeof(message));
-        (void)TCPIP_UDP_Flush(sIOServerSocket);  /* Ensure data is sent */
-        (void)TCPIP_UDP_Discard(sIOServerSocket);
-
-        (void)SYS_CONSOLE_PRINT("Sent Version Number Data via UDP: %d.%d.%d\n",
-                                message[0], message[1], message[2]);
-    } 
-    else 
-    {
-        (void)SYS_CONSOLE_PRINT("UDP Socket not ready\n");
-    }
-#endif    
-}
-
-/**
- * @brief Sends the Hardware version number frame via UDP.
- *
- * This function prepares a small frame (3 bytes) containing version data and sends it 
- * over a UDP socket if the buffer is ready.
- *
- * Enhancements:
- * - Ensures safe socket operations.
- * - Adds proper debugging logs.
- * - Improves MISRA C compliance by explicit type casting.
- */
-void updateHardwareVersionNumberFrame() {
-    uint8_t message[3];
-
-    /* Extract Major, Minor, and Patch versions from SYS_FW_VERSION */
-    message[0] = (SYS_HW_VERSION >> 16) & 0xFF;  // Major version
-    message[1] = (SYS_HW_VERSION >> 8) & 0xFF;   // Minor version
-    message[2] = (SYS_HW_VERSION) & 0xFF;        // Patch version
-
-#if HEV_IO_Aggregator  
-    /* Ensure the socket is ready to send data */
-    if (TCPIP_TCP_IsConnected(sIOServerSocket))
-    {
-        TCPIP_TCP_ArrayPut(sIOServerSocket, message, (uint16_t)sizeof(message));
-        TCPIP_TCP_Flush(sIOServerSocket);
-        (void)SYS_CONSOLE_PRINT("Sent Version Number Data via TCP: %d.%d.%d\n",
-                                message[0], message[1], message[2]);        
-    }
-    else 
-    {
-        (void)SYS_CONSOLE_PRINT("TCP Socket not ready\n");
-    }
-#endif
-#if Two_Wheeler_IO_Aggregator      
-    /* Ensure the socket is ready to send data */
-    if (TCPIP_UDP_PutIsReady(sIOServerSocket) >= (int32_t)sizeof(message)) 
-    {
-        (void)TCPIP_UDP_ArrayPut(sIOServerSocket, message, (uint16_t)sizeof(message));
-        (void)TCPIP_UDP_Flush(sIOServerSocket);  /* Ensure data is sent */
-        (void)TCPIP_UDP_Discard(sIOServerSocket);
-
-        (void)SYS_CONSOLE_PRINT("Sent Version Number Data via UDP: %d.%d.%d\n",
-                                message[0], message[1], message[2]);
-    } 
-    else 
-    {
-        (void)SYS_CONSOLE_PRINT("UDP Socket not ready\n");
-    }
-#endif    
-}
-/**
- * @brief Sends the digital output states via UDP.
- *
- * This function reads 20 digital output states, packs them into a structured frame,
- * and sends the data over a UDP socket in Big-Endian format.
- *
- * Enhancements:
- * - Ensures proper bit-packing without misalignment.
- * - Uses loops for better maintainability.
- * - Adheres to MISRA C compliance.
- */
-void updateDigitalOutputsFrame() {   
-    uint16_t frame[4];  // Buffer to hold the result
-    // Frame format: 0E11 0000 yyyy xxxx
-    // We need to pack the digital output states from Digital_Output_1_Get() to Digital_Output_20_Get()
-
-    uint16_t doStatus_1 = 0; // For Digital Output 1 to 15
-    uint16_t doStatus_2 = 0; // For Digital Output 16 to 20
-
-    // Retrieve the digital output states and pack them into the appropriate places in the frame
-    // Packing for Digital Output 1 to Digital Output 15 (xxxx)
-    doStatus_1 |= (Digital_Output_1_Get() << 0);  // Digital Output 1
-    doStatus_1 |= (Digital_Output_2_Get() << 1);  // Digital Output 2
-    doStatus_1 |= (Digital_Output_3_Get() << 2);  // Digital Output 3
-    doStatus_1 |= (Digital_Output_4_Get() << 3);  // Digital Output 4
-    doStatus_1 |= (Digital_Output_5_Get() << 4);  // Digital Output 5
-    doStatus_1 |= (Digital_Output_6_Get() << 5);  // Digital Output 6
-    doStatus_1 |= (Digital_Output_7_Get() << 6);  // Digital Output 7
-    doStatus_1 |= (Digital_Output_8_Get() << 7);  // Digital Output 8
-    doStatus_1 |= (Digital_Output_9_Get() << 8);  // Digital Output 9
-    doStatus_1 |= (Digital_Output_10_Get() << 9); // Digital Output 10
-    doStatus_1 |= (Digital_Output_11_Get() << 10); // Digital Output 11
-    doStatus_1 |= (Digital_Output_12_Get() << 11); // Digital Output 12
-    doStatus_1 |= (Digital_Output_13_Get() << 12); // Digital Output 13
-    doStatus_1 |= (Digital_Output_14_Get() << 13); // Digital Output 14
-    doStatus_1 |= (Digital_Output_15_Get() << 14); // Digital Output 15
-    doStatus_1 |= (Digital_Output_16_Get() << 15); // Digital Output 16
-    
-    // Packing for Digital Output 16 to Digital Output 24 (yyyy)
-//    doStatus_2 |= (Digital_Output_16_Get() << 0); // Digital Output 16
-    doStatus_2 |= (Digital_Output_17_Get() << 0); // Digital Output 17
-    doStatus_2 |= (Digital_Output_18_Get() << 1); // Digital Output 18
-    doStatus_2 |= (Digital_Output_19_Get() << 2); // Digital Output 19
-    doStatus_2 |= (Digital_Output_20_Get() << 3); // Digital Output 20
-    doStatus_2 |= (Digital_Output_21_Get() << 4); // Digital Output 21
-    doStatus_2 |= (Digital_Output_22_Get() << 5); // Digital Output 22
-    doStatus_2 |= (Digital_Output_23_Get() << 6); // Digital Output 23
-    doStatus_2 |= (Digital_Output_24_Get() << 7); // Digital Output 24
-    
-//    uint32_t reconstructedStatus = ((uint32_t)doStatus_2 << 16) | doStatus_1;
-//    SYS_CONSOLE_PRINT("Reconstructed: %08X, Original: %08X\n", reconstructedStatus, doStatus);
-
-    // Pack the frame: 0E11 0000 yyyy xxxx
-    frame[0] = 0x0E11;   // Fixed header 0E11
-    frame[1] = 0x0000;   // Reserved part (0000 0000)
-    frame[2] = doStatus_2;  // Digital Output 17 to 24 
-    frame[3] = doStatus_1;  // Digital Output 1 to 16 
-    SYS_CONSOLE_PRINT("%04X %04X %04X %04X\n", frame[0], frame[1], frame[2], frame[3]);
-    
-    if (!TCPIP_UDP_IsConnected(sIOServerSocket))
-    {
-        SYS_CONSOLE_MESSAGE("Server Connection was closed\r\n");
-        return;
-    } 
-    SYS_CONSOLE_PRINT("Sending Digital Output Data to IO Socket\r\n");
-
-    // Prepare message in correct byte order (Big-Endian format)
-    uint8_t message[8];
-    message[0] = (frame[0] >> 8) & 0xFF;
-    message[1] = frame[0] & 0xFF;
-    message[2] = (frame[1] >> 8) & 0xFF;
-    message[3] = frame[1] & 0xFF;
-    message[4] = (frame[2] >> 8) & 0xFF;
-    message[5] = frame[2] & 0xFF;
-    message[6] = (frame[3] >> 8) & 0xFF;
-    message[7] = frame[3] & 0xFF;
-
-    // Call the TCPIP_TCP_ArrayPut function to send the data
-    #if HEV_IO_Aggregator
-        TCPIP_TCP_ArrayPut(sIOServerSocket, message, sizeof(message));
-    #elif Two_Wheeler_IO_Aggregator
-        if (TCPIP_UDP_PutIsReady(sIOServerSocket) >= sizeof(message)) {
-            TCPIP_UDP_ArrayPut(sIOServerSocket, message, sizeof(message));
-            TCPIP_UDP_Flush(sIOServerSocket);  // Ensure data is sent
-            TCPIP_UDP_Discard(sIOServerSocket);
-
-            SYS_CONSOLE_PRINT("Sent Digital Output Data via UDP\n");
-        } else {
-            SYS_CONSOLE_PRINT("UDP Socket not ready\n");
-        }
-    #endif     
-}
-
-/**
- * @brief Sends the analog input states via UDP.
- *
- * This function reads 15 analog input states, packs them into a structured frame,
- * and sends the data over a UDP socket in Big-Endian format.
- */
-void updateAnalogInputsFrame()
-{
-    uint16_t frame[4];  // Buffer to hold the result
-    // Convert the buffer into a 16-bit binary string
-    unsigned int analogStatus = 0;
-//    for (int i = 0; i < 15; i++) {
-//        analogStatus |= (currentAIQueueBuffer[i] << (15 - i));  // Shift the status into the correct bit
-//    }
-
-    frame[0] = 0x0B11;   // Fixed header 0B11
-    frame[1] = 0x0000;   // Reserved part (0000 0000)
-    frame[2] = 0x0000;  // Reserved part (0000 0000) 
-    frame[3] = analogStatus;  // Analog 1 to 15 
-    SYS_CONSOLE_PRINT("%04X %04X %04X %04X\n", frame[0], frame[1], frame[2], frame[3]);
-    
-    if (!TCPIP_UDP_IsConnected(sIOServerSocket))
-    {
-        SYS_CONSOLE_MESSAGE("Server Connection was closed\r\n");
-        return;
-    } 
-    
-    SYS_CONSOLE_PRINT("Sending Analog Input Data to IO Socket\r\n");
-    // Prepare message in correct byte order (Big-Endian format)
-    uint8_t message[8];
-    message[0] = (frame[0] >> 8) & 0xFF;
-    message[1] = frame[0] & 0xFF;
-    message[2] = (frame[1] >> 8) & 0xFF;
-    message[3] = frame[1] & 0xFF;
-    message[4] = (frame[2] >> 8) & 0xFF;
-    message[5] = frame[2] & 0xFF;
-    message[6] = (frame[3] >> 8) & 0xFF;
-    message[7] = frame[3] & 0xFF;
-
-    /* Send data over TCP or UDP */
-    #if HEV_IO_Aggregator
-        TCPIP_TCP_ArrayPut(sIOServerSocket, message, sizeof(message));
-    #elif Two_Wheeler_IO_Aggregator
-        if (TCPIP_UDP_PutIsReady(sIOServerSocket) >= (int32_t)sizeof(message))
-        {
-            (void)TCPIP_UDP_ArrayPut(sIOServerSocket, message, sizeof(message));
-            (void)TCPIP_UDP_Flush(sIOServerSocket);  /* Ensure data is sent */
-            (void)TCPIP_UDP_Discard(sIOServerSocket);
-
-            (void)SYS_CONSOLE_PRINT("Sent Analog Input Data via UDP\n");
-        }
-        else
-        {
-            (void)SYS_CONSOLE_PRINT("UDP Socket not ready\n");
-        }
-    #endif     
-}
-
-/**
- * @brief Sends the digital input states via UDP.
- *
- * This function reads 60 digital input states, packs them into a structured frame,
- * and sends the data over a UDP socket in Big-Endian format.
- */
-void updateDigitalInputsFrame() {    
-    uint16_t frame[4];  // Buffer to hold the result
-    // Create the frame in the structure 0A11 Digital_Input1 Digital_Input2 Digital_Input3
-    // Digital_Input1: Inputs 0 to 15
-    // Digital_Input2: Inputs 16 to 31
-    // Digital_Input3: Inputs 32 to 47
-
-    uint16_t Digital_Input1 = 0, Digital_Input2 = 0, Digital_Input3 = 0;
-
-    // Process the first 16 digital inputs (Inputs 0 to 15)
-    for (int i = 0; i < 16; i++) {
-        Digital_Input1 |= (currentDIQueueBuffer[i] << (15 - i));  // Shift and OR to build the 16-bit value
-    }
-
-    // Process the next 16 digital inputs (Inputs 16 to 31)
-    for (int i = 16; i < 32; i++) {
-        Digital_Input2 |= (currentDIQueueBuffer[i] << (31 - i));  // Shift and OR to build the 16-bit value
-    }
-
-    // Process the last 16 digital inputs (Inputs 32 to 47)
-    for (int i = 32; i < 48; i++) {
-        Digital_Input3 |= (currentDIQueueBuffer[i] << (47 - i));  // Shift and OR to build the 16-bit value
-    }
-
-    // Pack the frame: 0A11 XXXX YYYY ZZZZ
-    frame[0] = 0x0A11;    // Fixed header 0A11
-    frame[1] = Digital_Input1;      // 16 bits for the first part (XXXX)
-    frame[2] = Digital_Input2;      // 16 bits for the second part (YYYY)
-    frame[3] = Digital_Input3;      // 16 bits for the third part (ZZZZ)
-    SYS_CONSOLE_PRINT("%04X %04X %04X %04X\n", frame[0], frame[1], frame[2], frame[3]);
-    
-    /* Ensure socket is connected before sending */
-    if (!TCPIP_UDP_IsConnected(sIOServerSocket))
-    {
-        SYS_CONSOLE_MESSAGE("Server Connection was closed\r\n");
-        return;
-    }
-
-    SYS_CONSOLE_PRINT("Sending Digital Input Data to IO Socket\r\n");
-
-    // Prepare message in correct byte order (Big-Endian format)
-    uint8_t message[8];
-    message[0] = (frame[0] >> 8) & 0xFF;
-    message[1] = frame[0] & 0xFF;
-    message[2] = (frame[1] >> 8) & 0xFF;
-    message[3] = frame[1] & 0xFF;
-    message[4] = (frame[2] >> 8) & 0xFF;
-    message[5] = frame[2] & 0xFF;
-    message[6] = (frame[3] >> 8) & 0xFF;
-    message[7] = frame[3] & 0xFF;
-
-    /* Send data over TCP or UDP */
-    #if HEV_IO_Aggregator
-        TCPIP_TCP_ArrayPut(sIOServerSocket, message, sizeof(message));
-    #elif Two_Wheeler_IO_Aggregator
-        if (TCPIP_UDP_PutIsReady(sIOServerSocket) >= (int32_t)sizeof(message))
-        {
-            (void)TCPIP_UDP_ArrayPut(sIOServerSocket, message, sizeof(message));
-            (void)TCPIP_UDP_Flush(sIOServerSocket);
-            (void)TCPIP_UDP_Discard(sIOServerSocket);
-
-            (void)SYS_CONSOLE_PRINT("Sent Digital Input Data via UDP\n");
-        }
-        else
-        {
-            (void)SYS_CONSOLE_PRINT("UDP Socket not ready\n");
-        }
-    #endif  
-}
-
-/**
- * @brief Detects changes in digital input states and sends updated values via TCP.
- *
- * This function compares the current digital input buffer (`currentDIQueueBuffer`)
- * with the previous state (`prevDIQueueBuffer`) to determine which inputs have changed.
- * If changes are detected, it sends the updated values in packets with a 
- * predefined structure, including a CRC for data integrity.
- *
- * The data is transmitted in **batches of 16 changes** (due to payload limitations).
- * Each batch consists of a **header, payload (each input change as a tuple), and CRC**.
- *
- * ## Message Structure:
- * - **Header (4 bytes)**:
- *   - Byte 0: Error Code (0x00 for no errors)
- *   - Byte 1: Message Type (0x02 for response)
- *   - Byte 2: Message Subtype (`msgSubTypeDigitalRead`)
- *   - Byte 3: Number of tuples in this batch
- * 
- * - **Payload (Each tuple is 6 bytes, max 16 tuples per batch)**:
- *   - Byte 0-1: Digital Input Port (Big-Endian)
- *   - Byte 2-3: Reserved (0x00 0x00)
- *   - Byte 4: Digital Input Value (1 or 0)
- *   - Byte 5: Reserved (0x00)
- *
- * - **CRC (2 bytes, at the end of the message)**:
- *   - Ensures data integrity for the entire message (excluding the CRC itself).
- *
- * @note If no digital inputs have changed, the function exits without sending data.
- * @note The function ensures data transmission by calling `TCPIP_TCP_Flush()` after sending.
- */
-void IsDigitalInputChanged(void)
-{
-    uint8_t changedCount = 0;
-    uint8_t changedIndexes[NUM_DIGITAL_PINS];
-
-    /* Identify changed digital inputs */
-    for (uint8_t i = 0; i < NUM_DIGITAL_PINS; i++)
-    {
-        if (currentDIQueueBuffer[i] != prevDIQueueBuffer[i])
-        {
-            changedIndexes[changedCount++] = i;
-        }
-    }
-
-    /* Exit if no changes */
-    if (changedCount == 0U)
-    {
-        return;
-    }
-
-    uint8_t processed = 0;
-
-    while (processed < changedCount)
-    {
-        uint8_t batchCount = (changedCount - processed > MAX_BATCH_SIZE) ? MAX_BATCH_SIZE : (changedCount - processed);
-
-        /* Prepare the message header */
-        uint8_t header[HEADER_SIZE] = { 0x00, 0x02, msgSubTypeDigitalRead, batchCount };
-
-        /* Use static arrays to avoid stack overflow */
-        static uint8_t payload[MAX_BATCH_SIZE * TUPLE_SIZE];
-        static uint8_t message[MESSAGE_MAX_SIZE];
-
-        /* Prepare the payload */
-        for (uint8_t i = 0; i < batchCount; i++)
-        {
-            uint8_t index = changedIndexes[processed + i];
-            uint16_t port = GetPortFromSerialNumber(index + 1U); /* Convert serial number to port */
-
-            payload[i * TUPLE_SIZE] = (port >> 8U) & 0xFFU;   /* Port high byte */
-            payload[i * TUPLE_SIZE + 1U] = port & 0xFFU;     /* Port low byte */
-            payload[i * TUPLE_SIZE + 2U] = 0x00U;           /* Reserved */
-            payload[i * TUPLE_SIZE + 3U] = 0x00U;           /* Reserved */
-            payload[i * TUPLE_SIZE + 4U] = currentDIQueueBuffer[index]; /* Digital value */
-            payload[i * TUPLE_SIZE + 5U] = 0x00U;           /* Reserved */
-        }
-
-        /* Calculate message size dynamically */
-        uint16_t messageSize = HEADER_SIZE + (batchCount * TUPLE_SIZE) + CRC_SIZE;
-
-        /* Copy header & payload into final message */
-        memcpy(message, header, HEADER_SIZE);
-        memcpy(message + HEADER_SIZE, payload, batchCount * TUPLE_SIZE);
-
-        /* Calculate CRC */
-        uint16_t crc = CalculateCRC(message, messageSize - CRC_SIZE);
-        message[messageSize - 2U] = (crc >> 8U) & 0xFFU;
-        message[messageSize - 1U] = crc & 0xFFU;
-
-        /* Send message */
-        if (sIOServerSocket != INVALID_SOCKET)
-        {
-            SYS_CONSOLE_PRINT("Sending Digital Input Change Data with CRC to IO Socket\r\n");
-            TCPIP_TCP_ArrayPut(sIOServerSocket, message, messageSize);
-            TCPIP_TCP_Flush(sIOServerSocket); /* Ensure immediate transmission */
-        }
-
-        /* Move to the next batch */
-        processed += batchCount;
-    }
-
-    /* Update previous state buffer */
-//    memcpy(prevDIQueueBuffer, currentDIQueueBuffer, sizeof(prevDIQueueBuffer));
-    for (size_t i = 0; i < sizeof(prevDIQueueBuffer); i++) {
-        prevDIQueueBuffer[i] = currentDIQueueBuffer[i]; 
-    }    
-}
-
-/**
- * @brief Calculates the CRC-16 checksum using the polynomial 0x8005.
- *
- * This function computes a 16-bit **CRC (Cyclic Redundancy Check)** for the given data buffer.
- * It implements a **bitwise** algorithm with a standard **0x8005 polynomial** (CRC-16).
- *
- * ## CRC Calculation Details:
- * - **Initial CRC Value**: `0xFFFF`
- * - **Polynomial Used**: `0x8005`
- * - **Bitwise Processing**: Each byte is XORed into the CRC register and then shifted bit-by-bit.
- *
- * @param data Pointer to the data buffer.
- * @param length Number of bytes in the data buffer.
- * @return Computed 16-bit CRC value.
- */
-uint16_t CalculateCRC(uint8_t *data, uint16_t length) {
-    uint16_t crc = 0xFFFF;      // Initial CRC value (all bits set to 1)
-    uint16_t polynomial = 0x8005;  // CRC-16 polynomial
-
-    for (uint16_t i = 0; i < length; i++) {
-        crc ^= (data[i] << 8);  // Load byte into the CRC register (shifted left by 8 bits)
-
-        for (uint8_t j = 0; j < 8; j++) {
-            if (crc & 0x8000) {  // Check if the MSB is set
-                crc = (crc << 1) ^ polynomial;  // Shift left and XOR with the polynomial
-            } else {
-                crc <<= 1;  // Otherwise, just shift left
-            }
-        }
-    }
-
-    return crc;  // Return the calculated CRC
-}
-
-/**
- * @brief Parses an incoming packet and validates its structure.
- *
- * This function extracts information from an incoming **IO packet**, including:
- * - **Message type**
- * - **Message subtype**
- * - **Number of tuples**
- * - **Port number and value**
- * - **CRC validation**
- *
- * It performs **error handling** for:
- * - Invalid buffer
- * - Invalid message type/subtype
- * - Incorrect tuple count
- * - Invalid port numbers or values
- * - Packet size mismatches
- *
- * @param u8IOBuffer Pointer to the received packet buffer.
- * @param inbPacketSz Size of the incoming packet.
- */
-void ParseInbPacket(uint8_t u8IOBuffer[], uint32_t inbPacketSz) {
-    // Initialize variables
-    inbMsgSubType = 0x00;
-    inbNumTuples = 0;
-    inbPortNo = -1;
-    inbPortVal = -1;
-    inbCrc = -1;
-
-    SYS_CONSOLE_PRINT("Parsing incoming packet...\n");
-
-    // Check if input buffer is NULL
-    if (u8IOBuffer == NULL) {
-        SYS_CONSOLE_PRINT("Error: Input buffer is NULL\n");
-        return;
-    }   
-    if (u8IOBuffer[0] == 0x02) {
-        custom_message = true;
-        SYS_CONSOLE_MESSAGE("\n\r####### Bootloader Triggered #######\n\r");
-
-        SYS_CONSOLE_MESSAGE("\n\r####### Program new firmware from Bootloader #######\n\r");
-
-        ramStart[0] = BTL_TRIGGER_PATTERN;
-        ramStart[1] = BTL_TRIGGER_PATTERN;
-        ramStart[2] = BTL_TRIGGER_PATTERN;
-        ramStart[3] = BTL_TRIGGER_PATTERN;
-
-        DCACHE_CLEAN_BY_ADDR(ramStart, 16);
-
-        SYS_RESET_SoftwareReset(); 
-        return;        
-    }
-    if (u8IOBuffer[0] == 0x03) {
-        custom_message = true;
-        SYS_CONSOLE_PRINT("Soft Reset\n");
-        NVIC_SystemReset();
-        return;        
-    } 
-    if (u8IOBuffer[0] == 0x04) {//Serial number
-        if (inbPacketSz >= 3) { // Ensure we have enough data
-            serialnum = ((uint16_t)u8IOBuffer[1] << 8) | u8IOBuffer[2];
-            custom_message = true;
-            SYS_CONSOLE_PRINT("Received Serial Number: 0x%04X (%u)\n", serialnum, serialnum);
-            saveOutputsToFlash(doStatus, relayStatus,serialnum);
-        } else {
-            SYS_CONSOLE_PRINT("Error: Incomplete serial number data\n");
-        }
-        return;
-    }
-    else if (u8IOBuffer[0] == 0x10)    /* --- ?Give me SN & FW? ----------- */
-    {
-        custom_message = true;
-        /* Assemble reply: 2-byte serial number + 3-byte FW version */
-        uint8_t txBuf[5U];
-
-        txBuf[0] = (uint8_t)(serialnum >> 8U);  /* MSB first */
-        txBuf[1] = (uint8_t)(serialnum & 0xFFU);
-
-        txBuf[2] = (uint8_t)((SYS_FW_VERSION >> 16U) & 0xFFU); /* Major */
-        txBuf[3] = (uint8_t)((SYS_FW_VERSION >>  8U) & 0xFFU); /* Minor */
-        txBuf[4] = (uint8_t)( SYS_FW_VERSION         & 0xFFU); /* Patch */
-        /* Ensure the socket is ready to send data */
-        if (TCPIP_TCP_IsConnected(sIOServerSocket))
-        {
-            TCPIP_TCP_ArrayPut(sIOServerSocket, txBuf, (uint16_t)sizeof(txBuf));
-            TCPIP_TCP_Flush(sIOServerSocket);
-            (void)SYS_CONSOLE_PRINT("Sent SN+FW via TCP: SN=0x%04X, FW=%u.%u.%u\n",
-                                serialnum,
-                                txBuf[2], txBuf[3], txBuf[4]);     
-        }
-        else 
-        {
-            (void)SYS_CONSOLE_PRINT("TCP Socket not ready\n");
-        }
-        return;        
-    }    
-    // Extract and validate error code
-    uint8_t errorCode = u8IOBuffer[0];
-    if (errorCode != 0) {
-        SYS_CONSOLE_PRINT("Error code: %u\n", errorCode);
-    }    
-    // Extract and validate message type
-    uint8_t messageType = u8IOBuffer[1];
-    if (messageType == MSG_TYPE_REQUEST) {
-        SYS_CONSOLE_PRINT("Request Message\n");
-    } else if (messageType == MSG_TYPE_RESPONSE) {
-        SYS_CONSOLE_PRINT("Response Message\n");
-    } else {
-        SYS_CONSOLE_PRINT("Error: Unknown Message Type\n");
-        outbErrorCode = errorInvalidMsg;
-        return;
-    }
-
-    // Extract and validate message subtype
-    inbMsgSubType = u8IOBuffer[2];
-    outbMsgSubType = inbMsgSubType;
-    SYS_CONSOLE_PRINT("Message Subtype: 0x%02X\n", inbMsgSubType);
-
-    if ((inbMsgSubType != msgSubTypeDigitalRead) && (inbMsgSubType != msgSubTypeDigitalWrite)) {
-        SYS_CONSOLE_PRINT("Invalid Message Subtype\n");
-        outbErrorCode = errorInvalidMsg;
-        return;
-    }
-
-    // Extract and validate the number of tuples
-    inbNumTuples = u8IOBuffer[3];
-    outbNumTuples = inbNumTuples;
-    SYS_CONSOLE_PRINT("Number of Tuples: %u\n", inbNumTuples);
-
-    if (inbNumTuples != 1) {
-        SYS_CONSOLE_PRINT("Error: Invalid number of tuples\n");
-        outbErrorCode = errorInvalidTuples;
-        return;
-    }
-
-    // Validate the packet size
-    if (inbPacketSz != (4 + (inbNumTuples * 6) + 2)) {
-        SYS_CONSOLE_PRINT("Error: Invalid packet size\n");
-        outbErrorCode = errorInvalidMsg;
-        return;
-    }
-
-    // Extract and validate the port number
-    inbPortNo = (u8IOBuffer[4] << 8) | u8IOBuffer[5];
-    outbPortNo = inbPortNo;
-    SYS_CONSOLE_PRINT("Port Number: %d\n", inbPortNo);
-
-    // Check if the port number falls within valid ranges
-    if (!(inbPortNo >= 1 && inbPortNo <= 110)) {
-        SYS_CONSOLE_PRINT("Error: Invalid Port Number\n");
-        outbErrorCode = errorInvalidPort;
-        return;
-    }
-
-    // Extract and validate the port value
-    inbPortVal = (u8IOBuffer[6] << 24) | (u8IOBuffer[7] << 16) | (u8IOBuffer[8] << 8) | u8IOBuffer[9];
-    SYS_CONSOLE_PRINT("Port Value: %d\n", inbPortVal);
-
-    if ((inbPortVal != 0) && (inbPortVal != 1)) {
-        SYS_CONSOLE_PRINT("Error: Invalid Port Value\n");
-        outbErrorCode = errorInvalidValue;
-        return;
-    }
-
-    // Extract and validate CRC
-    inbCrc = (u8IOBuffer[10] << 8) | u8IOBuffer[11];
-    SYS_CONSOLE_PRINT("CRC: 0x%04X\n", inbCrc);
-
-    // TODO: Implement CRC validation logic if required
-
-    // Parsing completed successfully
-    outbErrorCode = errorNoError;
-    SYS_CONSOLE_PRINT("Packet parsing completed successfully\n");
+    return currentTempAIQueueBuffer[channel - 1];
 }
 
 /**
@@ -2002,9 +1598,9 @@ void ProcessInbPacket()
     if (outbErrorCode != errorNoError) {
         return;
     }
-    
     if (inbMsgSubType == msgSubTypeDigitalRead) 
     {
+        SYS_CONSOLE_PRINT("[GPIO] Processing Digital Read for Port %d\r\n", inbPortNo);
         switch (inbPortNo) {
             // **Digital Input Read Handling (DI1 - DI60)**
             case 1:  outbPortVal = Digital_Input_1_Get();  break;
@@ -2100,13 +1696,17 @@ void ProcessInbPacket()
             case 87:  outbPortVal = efuse3_in_Get();  break;
             case 88:  outbPortVal = efuse4_in_Get();  break;
             case 89:  outbPortVal = Relay_Output_1_Get();  break;
-            case 90:  outbPortVal = Relay_Output_2_Get();  break;            
+            case 90:  outbPortVal = Relay_Output_2_Get();  break;
+            default:
+                outbErrorCode = errorInvalidPort;
+                return;
         }
     }
     else if (inbMsgSubType == msgSubTypeDigitalWrite)
     {
         if (inbPortNo >= 61 && inbPortNo <= 90)  
         {
+            SYS_CONSOLE_PRINT("[GPIO] Writing to Port : %d, Value: %d\r\n", inbPortNo, inbPortVal);
             switch (inbPortNo) {
                 //Digital Output
                 case 61:  inbPortVal ? Digital_Output_1_Set()  : Digital_Output_1_Clear();  break;
@@ -2150,594 +1750,20 @@ void ProcessInbPacket()
     return;
 }
 
-/**
- * @brief Prepares and dispatches an outbound packet over TCP.
- *
- * This function constructs an outbound packet (`outbPacketBuf`) with 
- * appropriate fields such as error code, message subtype, port number, 
- * and port value. The packet is then transmitted over a TCP socket.
- *
- * Steps:
- * 1. Populate `outbPacketBuf` with relevant data.
- * 2. Compute `outbPacketSz` based on the number of tuples.
- * 3. Print the packet contents for debugging.
- * 4. Send the packet using `TCPIP_TCP_ArrayPut`.
- *
- * @note Ensure `outbPacketBuf` has enough allocated memory to avoid overflow.
- */
-void PrepareDispatchOutbPacket()
+void ChargingControl(uint8_t u8DockNo, uint8_t action)
 {
-    outbPacketBuf[0] = outbErrorCode;
-    outbPacketBuf[1] = 0x02;
-    outbPacketBuf[2] = outbMsgSubType;
-    outbPacketBuf[3] = outbNumTuples;
-    outbPacketBuf[4] = (outbPortNo >> 8) & 0xFF;
-    outbPacketBuf[5] = outbPortNo & 0xFF;
-    outbPacketBuf[6] = 0x00;
-    outbPacketBuf[7] = 0x00;
-    outbPacketBuf[8] = 0x00;
-    if (inbMsgSubType == msgSubTypeDigitalWrite){
-        outbPacketBuf[9] = (inbPortVal != 0) ? 0x01 : 0x00;
-    }
-    else{
-        outbPacketBuf[9] = (outbPortVal != 0) ? 0x01 : 0x00;
-    }
-    outbPacketBuf[10] = 0x00;
-    outbPacketBuf[11] = 0x00;
-
-    outbPacketSz = 4 + (outbNumTuples * 6) + 2;
-
-    // Calculate CRC over the packet excluding the last two bytes
-    uint16_t crc = CalculateCRC((uint8_t *)outbPacketBuf, outbPacketSz - 2);  // Exclude CRC bytes
-
-    // Update the last two bytes with the CRC value
-    outbPacketBuf[outbPacketSz - 2] = (crc >> 8) & 0xFF;  // MSB
-    outbPacketBuf[outbPacketSz - 1] = crc & 0xFF;         // LSB
-    
-    // Print outbPacketBuf contents as hex for debugging
-    SYS_CONSOLE_PRINT("outbPacketBuf: ");
-    for (uint32_t i = 0; i < outbPacketSz; i++)
-    {
-        SYS_CONSOLE_PRINT("%02X ", outbPacketBuf[i]);
-    }
-    SYS_CONSOLE_PRINT("\n");
-
-    // Transmit the packet over TCP
-    TCPIP_TCP_ArrayPut(sIOServerSocket, (const uint8_t*)outbPacketBuf, outbPacketSz);
-}
-
-/**
- * @brief Parses received data and executes corresponding actions.
- *
- * This function processes the received `u8IOBuffer` and performs actions 
- * based on predefined command types. It supports handling commands for:
- * - Digital input request
- * - Analog input request
- * - Relay output request
- * - BDU pin request
- * - Digital output request
- * - Version number retrieval
- * 
- * Additionally, it handles specific commands:
- * - `0xCC` (Relay_Write Command): Controls 15 relay outputs.
- * - `0xAA` (Digital Write Command): Controls 20 digital outputs.
- *
- * After processing, it sends an acknowledgment via UDP for `0xCC` and `0xAA` commands.
- *
- * @param[in] u8IOBuffer Received data buffer containing the command and parameters.
- */
-void Parse_Wheeler_Received_Data(uint8_t u8IOBuffer[]) {
-    if (u8IOBuffer[1] == 0xA1) {
-        SYS_CONSOLE_PRINT("Digital Input Request Command Received\n");
-        updateDigitalInputsFrame();
-    }
-    if (u8IOBuffer[1] == 0xB1) {
-        SYS_CONSOLE_PRINT("Analog Input Request Command Received\n");
-        updateAnalogInputsFrame();
-    }
-    if (u8IOBuffer[1] == 0xC1) {
-        SYS_CONSOLE_PRINT("Relay Output Request Command Received\n");
-        updateRelayOutputFrame();
-    }
-    if (u8IOBuffer[1] == 0xD1) {
-        SYS_CONSOLE_PRINT("BDU pin Request Command Received\n");
-        updateBDUFrame();
-    }    
-    if (u8IOBuffer[1] == 0xE1) {
-        SYS_CONSOLE_PRINT("Digital Output Request Command Received\n");
-        updateDigitalOutputsFrame();
-    }    
-    // Check if the first byte is the fixed header 0xCC (Relay Command)
-    if (u8IOBuffer[0] == 0xCC) {
-        SYS_CONSOLE_PRINT("Relay_Write Command Received\n");
-
-      // Extract relay control data (the next 4 bytes: "CC00 0000 0000 XXXX")
-      uint16_t relayStatus = (u8IOBuffer[6] << 8) | u8IOBuffer[7]; // XXXX from u8IOBuffer
-        
-        // Iterate through each relay (assuming 15 relays based on the example)
-        for (int i = 0; i < RELAY_COUNT; i++) {
-            // Check if the corresponding bit is 1 or 0
-            if (relayStatus & (1 << i)) {
-                // Relay is ON
-                switch (i) {
-                    case 0: efuse1_in_Set(); break;
-                    case 1: efuse2_in_Set(); break;
-                    case 2: efuse3_in_Set(); break;
-                    case 3: efuse4_in_Set(); break;
-                    case 4: Relay_Output_1_Set(); break;
-                    case 5: Relay_Output_2_Set(); break;                    
-                    default: break;
-                }
-            } else {
-                // Relay is OFF
-                switch (i) {
-                    case 0: efuse1_in_Clear(); break;
-                    case 1: efuse2_in_Clear(); break;
-                    case 2: efuse3_in_Clear(); break;
-                    case 3: efuse4_in_Clear(); break;
-                    case 4: Relay_Output_1_Clear(); break;
-                    case 5: Relay_Output_2_Clear(); break;                    
-                    default: break;
-                }
-            }
-        }
-      // Send acknowledgment via UDP
-        uint8_t message[2] = {0xCC, 0xCC};  // Data to be sent
-
-        if (TCPIP_UDP_PutIsReady(sIOServerSocket) >= sizeof(message)) {
-            TCPIP_UDP_ArrayPut(sIOServerSocket, message, sizeof(message));
-            TCPIP_UDP_Flush(sIOServerSocket);  // Ensure data is sent
-            TCPIP_UDP_Discard(sIOServerSocket);
-
-            SYS_CONSOLE_PRINT("Sent Data via UDP: CCCC\n");
-        } else {
-            SYS_CONSOLE_PRINT("UDP Socket not ready\n");
-        }
+    // Placeholder for actual charging control logic
+    //SYS_CONSOLE_PRINT("[CHARGING] Control for Dock %d, Action: %s\r\n", u8DockNo, action ? "START" : "STOP");
+    static uint8_t u8PevChargingState[4] = {0}; // Assuming max 4 docks for example
+    if (u8PevChargingState[u8DockNo] != action) {
+        SYS_CONSOLE_PRINT("[CHARGING] Dock %d already in desired state\r\n", u8DockNo);
+        // SESSION_SetAuthenticationCommand(u8DockNo, action);
+        u8PevChargingState[u8DockNo] = action;
     }
     
-    // Check if the first byte is the fixed header 0xAA (Digital Output Command)
-    if (u8IOBuffer[0] == 0xAA) {
-        SYS_CONSOLE_PRINT("Digital Write Command Received\n");
-
-        // Extract the 16-bit digital output control data (the last 2 bytes: "XXXX")
-        uint16_t digitalWriteStatus = (u8IOBuffer[6] << 8) | u8IOBuffer[7]; // XXXX from u8IOBuffer[6] and u8IOBuffer[7]
-
-        // We now have the first 16 bits controlling digital outputs 1-16
-        // Iterate through each digital output (assuming 20 digital outputs)
-        for (int i = 0; i < 16; i++) {
-            // Check if the corresponding bit is 1 or 0 (0-15 bits)
-            if (digitalWriteStatus & (1 << i)) {
-                // Digital Output is ON
-                switch (i) {
-                    case 0: Digital_Output_1_Set(); break;
-                    case 1: Digital_Output_2_Set(); break;
-                    case 2: Digital_Output_3_Set(); break;
-                    case 3: Digital_Output_4_Set(); break;
-                    case 4: Digital_Output_5_Set(); break;
-                    case 5: Digital_Output_6_Set(); break;
-                    case 6: Digital_Output_7_Set(); break;
-                    case 7: Digital_Output_8_Set(); break;
-                    case 8: Digital_Output_9_Set(); break;
-                    case 9: Digital_Output_10_Set(); break;
-                    case 10: Digital_Output_11_Set(); break;
-                    case 11: Digital_Output_12_Set(); break;
-                    case 12: Digital_Output_13_Set(); break;
-                    case 13: Digital_Output_14_Set(); break;
-                    case 14: Digital_Output_15_Set(); break;
-                    case 15: Digital_Output_16_Set(); break;
-                    default: break;
-                }
-            } else {
-                // Digital Output is OFF
-                switch (i) {
-                    case 0: Digital_Output_1_Clear(); break;
-                    case 1: Digital_Output_2_Clear(); break;
-                    case 2: Digital_Output_3_Clear(); break;
-                    case 3: Digital_Output_4_Clear(); break;
-                    case 4: Digital_Output_5_Clear(); break;
-                    case 5: Digital_Output_6_Clear(); break;
-                    case 6: Digital_Output_7_Clear(); break;
-                    case 7: Digital_Output_8_Clear(); break;
-                    case 8: Digital_Output_9_Clear(); break;
-                    case 9: Digital_Output_10_Clear(); break;
-                    case 10: Digital_Output_11_Clear(); break;
-                    case 11: Digital_Output_12_Clear(); break;
-                    case 12: Digital_Output_13_Clear(); break;
-                    case 13: Digital_Output_14_Clear(); break;
-                    case 14: Digital_Output_15_Clear(); break;
-                    case 15: Digital_Output_16_Clear(); break;
-                    default: break;
-                }
-            }
-        }
-
-        // Extract the byte X (the 6th byte, u8IOBuffer[5])
-        uint8_t extraControl = u8IOBuffer[5];  // This is the byte X that controls outputs 17-20
-
-        // Iterate over the bits of extraControl and control the corresponding digital outputs (17 to 20)
-        for (int i = 0; i < 4; i++) {
-            // Shift the appropriate bit into the least significant position
-            if (extraControl & (1 << i)) {
-                // If the bit is 1, turn the corresponding digital output ON
-                switch (i) {
-                    case 0: Digital_Output_17_Set(); break;
-                    case 1: Digital_Output_18_Set(); break;
-                    case 2: Digital_Output_19_Set(); break;
-                    case 3: Digital_Output_20_Set(); break;
-                    default: break;
-                }
-            } else {
-                // If the bit is 0, turn the corresponding digital output OFF
-                switch (i) {
-                    case 0: Digital_Output_17_Clear(); break;
-                    case 1: Digital_Output_18_Clear(); break;
-                    case 2: Digital_Output_19_Clear(); break;
-                    case 3: Digital_Output_20_Clear(); break;
-                    default: break;
-                }
-            }
-        }
-        // Send acknowledgment via UDP
-        uint8_t message[2] = {0xAA, 0xAA};  // Data to be sent
-
-        if (TCPIP_UDP_PutIsReady(sIOServerSocket) >= sizeof(message)) {
-            TCPIP_UDP_ArrayPut(sIOServerSocket, message, sizeof(message));
-            TCPIP_UDP_Flush(sIOServerSocket);  // Ensure data is sent
-            TCPIP_UDP_Discard(sIOServerSocket);
-
-            SYS_CONSOLE_PRINT("Sent Data via UDP: AAAA\n");
-        } else {
-            SYS_CONSOLE_PRINT("UDP Socket not ready\n");
-        }        
-    }
-}
-
-/**
- * @brief   Monitors specific digital input pins and controls an output pin based on their state.
- * 
- * This function checks if the predefined digital input pins are active (logic HIGH). 
- * If any of them are active, it sets Digital_Output_1 HIGH and waits for 1 second.
- * If none are active, it clears Digital_Output_1 and waits for 10 seconds.
- * 
- * If `Two_Wheeler_IO_Aggregator1` is true, the function ensures Digital_Output_1 is OFF.
- * 
- * Note: The function uses `vTaskDelay`, which blocks execution for the specified time.
- *       Consider optimizing with an event-driven approach if needed.
- */
-void Active_Safety_Pins()
-{
-    if (!Two_Wheeler_IO_Aggregator1)  // Avoid redundant comparisons (== false)
-    {
-        // Read all digital inputs once
-        bool input_active = Digital_Input_1_Get() || Digital_Input_2_Get() || 
-                            Digital_Input_3_Get() || Digital_Input_8_Get() || 
-                            Digital_Input_10_Get() || Digital_Input_12_Get() || 
-                            Digital_Input_16_Get() || Digital_Input_17_Get() || 
-                            Digital_Input_18_Get();
-
-        if (input_active)
-        {    
-            Digital_Output_1_Set();  // Activate the output if any input is active
-            vTaskDelay(1000);
-        }
-        else
-        {
-            Digital_Output_1_Clear();
-            vTaskDelay(10000);
-        }
-    }
-    else 
-    {
-        Digital_Output_1_Clear();
-        vTaskDelay(10000);
-    }
-}
-
-/**
- * @brief   Configures the default state of digital and relay outputs based on the aggregator type.
- * 
- * This function checks whether the `Two_Wheeler_IO_Aggregator` is defined and applies 
- * the appropriate default pin configurations. It also updates the version number frame.
- * 
- * - If `Two_Wheeler_IO_Aggregator1` is **true**, it enables **Digital_Output_1** 
- *   and sets all **15 relay outputs**.
- * - If `Two_Wheeler_IO_Aggregator1` is **false**, it sets multiple **digital outputs** 
- *   (excluding Digital_Output_1).
- * 
- * @note The function currently does nothing if `HEV_IO_Aggregator` is defined. 
- *       Future functionality may be added inside its preprocessor block.
- */
-void Default_Pin_Status()
-{
-#if HEV_IO_Aggregator
-
-#endif
-    
-#if Two_Wheeler_IO_Aggregator
-    updateFirmwareVersionNumberFrame();
-    if(Two_Wheeler_IO_Aggregator1) {    
-        // Enable Digital Output 1
-        Digital_Output_1_Set();
-
-        // Enable all relay outputs (1-15)
-        Relay_Output_1_Set();
-        Relay_Output_2_Set();
-        Relay_Output_3_Set();
-        Relay_Output_4_Set();
-        Relay_Output_5_Set();
-        Relay_Output_6_Set();
-        Relay_Output_7_Set();
-        Relay_Output_8_Set();
-        Relay_Output_9_Set();
-        Relay_Output_10_Set();
-        Relay_Output_11_Set();
-        Relay_Output_12_Set();
-        Relay_Output_13_Set();
-        Relay_Output_14_Set();
-        Relay_Output_15_Set();
-    }
-    else {
-        // Enable multiple digital outputs except Digital_Output_1
-        Digital_Output_2_Set();
-        Digital_Output_3_Set();
-        Digital_Output_4_Set();
-        Digital_Output_5_Set();
-        Digital_Output_6_Set();
-        Digital_Output_7_Set();
-        Digital_Output_8_Set();
-        Digital_Output_9_Set();
-        Digital_Output_10_Set();
-        Digital_Output_11_Set();
-        Digital_Output_12_Set();
-        Digital_Output_13_Set();
-        Digital_Output_14_Set();
-        Digital_Output_15_Set();
-        Digital_Output_16_Set();
-        Digital_Output_18_Set();
-        Digital_Output_19_Set();
-    }
-#endif
-}
-
-void SendFixedUDPTestData(void)
-{
-    const char testMessage[] = "Test UDP Data";  // Fixed message to send
-    uint16_t messageLength = sizeof(testMessage) - 1;  // Exclude null terminator
-
-    if (!TCPIP_UDP_IsConnected(sIOServerSocket))
-    {
-        SYS_CONSOLE_MESSAGE("Server Connection was closed\r\n");
-        return;
-    }
-
-    // Check if we can send data
-    int16_t wMaxPut = TCPIP_UDP_PutIsReady(sIOServerSocket);
-    if (wMaxPut < messageLength)
-    {
-        SYS_CONSOLE_MESSAGE("UDP TX buffer is full, cannot send test data\r\n");
-        return;
-    }
-
-    // Send the fixed test message
-    TCPIP_UDP_ArrayPut(sIOServerSocket, (uint8_t*)testMessage, messageLength);
-    TCPIP_UDP_Flush(sIOServerSocket);  // Ensure data is sent immediately
-
-    SYS_CONSOLE_PRINT("Sent test UDP message: '%s'\r\n", testMessage);
-//    vTaskDelay(1000);
-}
-
-/**
- * @brief   Receives and processes incoming UDP packets.
- * 
- * This function checks for available data in the UDP socket buffer. If data is available:
- * - It reads the incoming bytes into a buffer (`u8IOBuffer`).
- * - The received data is null-terminated to ensure proper string handling.
- * - The data is printed to the console for debugging.
- * - The function `Parse_Wheeler_Received_Data()` is called to process the received data.
- * 
- * After processing, the UDP receive buffer is discarded to free up space for new data.
- */
-void UDP_Receive()
-{
-    int16_t availableBytes = TCPIP_UDP_GetIsReady(sIOServerSocket);
-    
-    if (availableBytes > 0) 
-    {
-        uint8_t u8IOBuffer[64];  // Adjust buffer size as needed
-        memset(u8IOBuffer, 0, sizeof(u8IOBuffer));
-
-        int bytesReceived = TCPIP_UDP_ArrayGet(sIOServerSocket, u8IOBuffer, sizeof(u8IOBuffer) - 1);
-
-        if (bytesReceived > 0) 
-        {
-            u8IOBuffer[bytesReceived] = '\0';  // Null-terminate the received data
-            SYS_CONSOLE_PRINT("Received UDP Data: %s (Length: %d)\r\n", u8IOBuffer, bytesReceived);
-            Parse_Wheeler_Received_Data(u8IOBuffer);
-        }
-
-        TCPIP_UDP_Discard(sIOServerSocket);  // Free the RX buffer
-    }
-}
-
-/**
- * @brief   Resets inbound and outbound data structures.
- * 
- * This function clears and resets various inbound (`inb*`) and outbound (`outb*`) 
- * data variables to their default states. It ensures that:
- * - Message subtype, port numbers, and values are set to zero or -1 as needed.
- * - The packet buffers (`inbPacketBuf` and `outbPacketBuf`) are fully cleared (set to 0x00).
- * - Packet sizes are reset to zero.
- * - The error code for outbound messages is reset to `errorNoError`.
- * 
- * This function is typically used before processing new messages to ensure
- * no residual data from previous transmissions affects the new operation.
- */
-void ResetInbOutbData()
-{
-    inbMsgSubType = 0x00;
-    inbNumTuples = 0; // Allow only max of 1 for now
-    inbPortNo = -1;
-    inbPortVal = -1;
-    inbCrc = -1;
-    
-    for (int i = 0; i < 256; i++)
-    {
-        inbPacketBuf[i] = 0x00;
-    }
-    inbPacketSz = 0;
-
-    // Outgoing Command
-    outbRemotePort = 0;
-    outbErrorCode = errorNoError;
-    outbMsgSubType = 0x00;
-    outbNumTuples = 0; // Allow only max of 1 for now
-    outbPortNo = -1;
-    outbPortVal = -1;
-    outbCrc = -1;
-    
-    for (int i = 0; i < 256; i++)
-    {
-        outbPacketBuf[i] = 0x00;
-    }
-    
-    outbPacketSz = 0;
-}
-/**
- * @brief   IO Handler Server Task.
- * 
- * This FreeRTOS task is responsible for:
- * - Configuring IO expanders.
- * - Initializing and managing server communication (TCP for HEV, UDP for Two-Wheeler).
- * - Reading stored output states from Flash.
- * - Handling digital and analog input readings.
- * - Processing incoming commands and responding accordingly.
- * - Ensuring reconnection if the TCP/UDP server socket is disconnected.
- * 
- * The task continuously runs in a loop, performing these operations periodically.
- * 
- * @param pvParameters Unused task parameter.
- */
-void vIOHandlerServerTask(void *pvParameters) {    
-    // Configure IO expanders
-    vConfigureIOexpanders();
-
-    // Read stored output states from Flash memory
-    SYS_CONSOLE_PRINT("Reading stored output states from Flash\n");
-    readOutputsFromFlash();
-    
-    // Print function entry for debugging
-    SYS_CONSOLE_PRINT("In Function: %s\r\n", __FUNCTION__);  
-
-    // Open server socket based on the aggregator type
-    #if HEV_IO_Aggregator
-        sIOServerSocket = TCPIP_TCP_ServerOpen(IP_ADDRESS_TYPE_IPV4, IO_SERVER_PORT_HEV, 0);
-    #elif Two_Wheeler_IO_Aggregator
-        sIOServerSocket = TCPIP_UDP_ServerOpen(IP_ADDRESS_TYPE_IPV4, IO_SERVER_PORT_Wheeler, 0);
-    #endif    
-    
-    if (sIOServerSocket == INVALID_SOCKET) {
-        SYS_CONSOLE_PRINT("Error opening IO server socket\r\n");
-        vTaskDelete(NULL);
-        return;
-    }
-for (uint8_t i = 0; i < (NUM_ANALOG_PINS - NUM_TEMPERATURE_ANALOG_PINS); i++)
-{
-    prevAIQueueBuffer[i] = 0xFFFFU;
-}
-
-    while (true) {
-        // Read digital and analog inputs
-        readDigitalInputs();
-        ReadAllAnalogInputPins();
-        #if HEV_IO_Aggregator
-            uint8_t u8IOBuffer[256] = {0};
-            if (TCPIP_TCP_IsConnected(sIOServerSocket)) {
-                int16_t bytesRead = TCPIP_TCP_ArrayGet(sIOServerSocket, u8IOBuffer, sizeof(u8IOBuffer));
-
-                if (bytesRead > 0) {
-                    SYS_CONSOLE_PRINT("Got Data on IO Server Handler (TCP)\r\n");
-                    // Read and process incoming commands if any
-                    ParseInbPacket(u8IOBuffer,bytesRead);  
-                    if(custom_message == false)
-                    {
-                        ProcessInbPacket();
-
-                        // Prepare and dispatch response to incoming commands
-                        PrepareDispatchOutbPacket();
-
-                        // Reset incoming/outgoing data buffers before ending the loop
-                        ResetInbOutbData();
-                        StoreRelay_DigitalOutputsFrame();
-                    }
-                    custom_message = false;
-                }
-
-                if (!TCPIP_TCP_IsConnected(sIOServerSocket) || TCPIP_TCP_WasDisconnected(sIOServerSocket)) {
-                    SYS_CONSOLE_PRINT("\r\nTCP Connection Closed\r\n");
-                    TCPIP_TCP_Close(sIOServerSocket);
-                    sIOServerSocket = INVALID_SOCKET;
-                }
-            }
-            // Ensure reconnection logic is handled correctly
-            if (sIOServerSocket == INVALID_SOCKET) {
-                SYS_CONSOLE_PRINT("TCP server socket disconnected, attempting to reconnect...\r\n");
-
-                // Attempt to open the socket again
-                sIOServerSocket = TCPIP_TCP_ServerOpen(IP_ADDRESS_TYPE_IPV4, IO_SERVER_PORT_HEV, 0);
-
-                if (sIOServerSocket == INVALID_SOCKET) {
-                    SYS_CONSOLE_PRINT("Failed to reopen IO socket, retrying...\r\n");
-                } else {
-                    SYS_CONSOLE_PRINT("Reconnected successfully IO Socket!\r\n");
-                }
-
-                vTaskDelay(RECONNECT_DELAY_MS);
-            }   
-            // Check if digital or analog input state has changed
-            IsDigitalInputChanged();
-        #endif
-
-        #if Two_Wheeler_IO_Aggregator
-            // Handle UDP-based input processing
-            UDP_Receive();
-//                IOExpander1_00_Data();
-//                SendFixedUDPTestData();            
-            // Update input and output frames
-            updateDigitalInputsFrame();
-            updateAnalogInputsFrame();
-            updateRelayOutputFrame();
-            updateDigitalOutputsFrame();
-            updateBDUFrame();
-            
-            // Store relay and digital output states
-            StoreRelay_DigitalOutputsFrame();
-            
-            // Activate safety-related pins
-            Active_Safety_Pins();                
-        #endif       
-        vTaskDelay(800); // Add a small delay to avoid consuming too much CPU time
-    }
-}
-
-/**
- * @brief   Initializes and starts IO handler tasks.
- * 
- * This function creates two FreeRTOS tasks:
- * - vIOHandlerServerTask: Manages IO server communication and processing.
- * - vToggleLEDTask: Handles periodic LED toggling.
- * 
- * The tasks are created with predefined stack sizes and priorities.
- */
-void vIOHandler()
-{
-    // Create IO Handler Server Task for managing IO communication
-    xTaskCreate(vIOHandlerServerTask, 
-                "vIOHandlerServerTask", 
-                IO_SERVER_HANDLER_HEAP_DEPTH, 
-                NULL, 
-                IO_SERVER_HANDLER_TASK_PRIORITY, 
-                NULL);    
+    // Implement the actual control logic here based on your hardware design
 }
 /* *****************************************************************************
  End of File
  */
+
