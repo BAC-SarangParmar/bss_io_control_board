@@ -374,21 +374,7 @@ TCPIP_HTTP_NET_IO_RESULT TCPIP_HTTP_NET_ConnectionPostExecute(TCPIP_HTTP_NET_CON
                         if (index >= 0 && index < 6) {
                             writeData.canPorts[index] = tcpPort;
                             SYS_CONSOLE_PRINT("Updated %s to port %d\n", interfaceItem->valuestring, tcpPort);
-                        }
-#if HEV_IO_Aggregator                       
-                        TCPIP_TCP_Close(sCan0ServerSocket);
-                        sCan0ServerSocket = INVALID_SOCKET;
-                        TCPIP_TCP_Close(sCan1ServerSocket);
-                        sCan1ServerSocket = INVALID_SOCKET;  
-                        TCPIP_TCP_Close(sCan2ServerSocket);
-                        sCan2ServerSocket = INVALID_SOCKET;  
-                        TCPIP_TCP_Close(sCan3ServerSocket);
-                        sCan3ServerSocket = INVALID_SOCKET;  
-                        TCPIP_TCP_Close(sCan4ServerSocket);
-                        sCan4ServerSocket = INVALID_SOCKET;  
-                        TCPIP_TCP_Close(sCan5ServerSocket);
-                        sCan5ServerSocket = INVALID_SOCKET;
-#endif                        
+                        }                       
                     } else if (strncmp(typeItem->valuestring, "RS485", 5) == 0) {
                         int index = atoi(&interfaceItem->valuestring[6]) - 1;
                         if (index >= 0 && index < 2) {

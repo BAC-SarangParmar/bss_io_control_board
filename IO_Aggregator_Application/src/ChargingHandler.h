@@ -19,6 +19,7 @@ extern "C" {
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "sessionDBHandler.h"
 /*=================================================================
    MACRO DEFINITIONS
    ============================================================ */
@@ -35,19 +36,10 @@ extern "C" {
 #define LEVDC_CAN_ID_EVSE_OUTPUT_INFO      0x509
 #define LEVDC_CAN_ID_EVSE_CAPABILITY       0x510
 #define LEVDC_CAN_ID_EVSE_CHARGER_ID       0x584
-// extern CH_State_e CH_LiveStage[MAX_DOCKS];
-/* Function to set CH_LiveStage */
-// inline void SET_CHARGING_LIVE_STAGE(uint8_t u8DockNo, uint8_t value)
-// {
-//     CH_LiveStage[u8DockNo] = value;
-// }
 
-// /* Function to get CH_LiveStage */
-// inline uint8_t GET_CHARGING_LIVE_STAGE(uint8_t u8DockNo)
-// {
-//     return CH_LiveStage[u8DockNo];
-// }
-
+#define TONHE_MODULE_START (0xAA)
+#define TONHE_MODULE_STOP (0x55)
+#define TONHE_MOD_BASE_ID (0x080601A0U)
 #pragma pack(push,1)
 
 /* ============================================================
@@ -162,17 +154,20 @@ typedef struct
 } ChargingMsgFrameInfo_t;
 
 
-#pragma pack(pop)
-    typedef enum
+/**
+ *  PM_TONHE Msg TX
+ */
+typedef struct Tonhe_PM_Tx
 {
-    DOCK_1 = 0,
-    DOCK_2,
-    DOCK_3,
-    MAX_DOCKS
-} Dock_e;
-// extern ChargingMsgFrameInfo_t Charging_LiveInfo[MAX_DOCKS];
+    uint8_t u8ModuleStartStop;
+    uint8_t u8ChargingMode;
+    uint16_t u16chargingVoltage;
+    uint16_t u16chargingCurrent;
+    uint16_t u16StandBy;
+} tonhe_pm_Tx_t;
+#pragma pack(pop)
 
-
+extern ChargingMsgFrameInfo_t Charging_LiveInfo[MAX_DOCKS];
     /*Evse Stop Control Bit Description*/
     typedef enum
     {
@@ -213,6 +208,15 @@ typedef struct
         GUN_LATCHED = 1U
     } EvseGunLatch;
 
+    typedef enum
+    {
+        EVSE_NOT_READY_FOR_CHARGE = 0U,
+        EVSE_READY_FOR_CHARGE = 1U
+    } EvseReadyForCharge_e;
+
+/*=================================================================
+   FUNCTION PROTOTYPES
+    ============================================================ */
 
 #ifdef __cplusplus
 }

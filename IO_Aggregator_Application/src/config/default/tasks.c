@@ -227,7 +227,7 @@ void SYS_Tasks ( void )
     vIOHandler();
     Telemetry_Init();
     // vRS485HandlerInit();
-    // vCanHandlerInit();
+    vCanHandlerInit();
     vCommonTaskHandler();
      /**********************************************************************
      * Create all Threads for APP Tasks before starting FreeRTOS Scheduler *

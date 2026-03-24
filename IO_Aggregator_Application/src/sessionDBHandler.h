@@ -30,17 +30,23 @@
 extern "C" {
 #endif
 
-// /* ************************************************************************** */
-// /* Section: Constants                                                         */
-// /* ************************************************************************** */
-// /**
-//  * @brief Invalid Session ID
-//  */
-// #define SESSION_DB_INVALID_ID         (0xFFU)
+/* ************************************************************************** */
+/* Section: Constants                                                         */
+/* ************************************************************************** */
+/**
+ * @brief Invalid Session ID
+ */
+#define SESSION_DB_INVALID_ID         (0xFFU)
 
-// /* ************************************************************************** */
-// /* Section: Data Types                                                        */
-// /* ************************************************************************** */
+#define FACTOR_10 10U
+#define FACTOR_100 100U
+#define FACTOR_1000 1000U
+#define FACTOR_0_1 0.1f
+#define FACTOR_0_01 0.01f
+#define FACTOR_0_001 0.001f
+/* ************************************************************************** */
+/* Section: Data Types                                                        */
+/* ************************************************************************** */
 
   /* Charging State Enum */
 typedef enum
@@ -48,6 +54,7 @@ typedef enum
   CH_STATE_INIT = 0,
   CH_STATE_AUTH_SUCCESS,
   CH_STATE_PARAM_VALIDATE,
+  CH_STATE_CONNECTION_CONFIRMED,
   CH_STATE_INITIALIZE,
   CH_STATE_PRECHARGE,
   CH_STATE_CHARGING,
@@ -56,32 +63,47 @@ typedef enum
   CH_STATE_ERROR
 } CH_State_e;
 
-// typedef enum
-// {
-//     DOCK_1 = 0,
-//     DOCK_2,
-//     DOCK_3,
-//     MAX_DOCKS
-// } Dock_e;
+typedef enum
+{
+    DOCK_1 = 0,
+    DOCK_2,
+    DOCK_3,
+    MAX_DOCKS
+} Dock_e;
 
-// typedef enum
-// {
-//     GET_PARA = 0x01U,
-//     SET_PARA = 0x02U
-// }
+typedef enum {
+  CANBUS_0,
+  CANBUS_1,
+  CANBUS_2,
+  CANBUS_3,
+  CANBUS_4,
+  CANBUS_5,
+} CANBus_e;
+typedef enum
+{
+  RECTIFIER_OFF = 0,
+  RECTIFIER_ON
+} RectifierState_e;
+typedef enum
+{
+    GET_PARA = 0x01U,
+    SET_PARA = 0x02U
+}GetSet_e;
 
-// typedef enum
-// {
-//     CHARGING_SESSION_STARTED = 0x01U,
-//     CHARGING_SESSION_STOPPED = 0x00U,
-// } SessionEvent_e;
-// /**
-//  * @brief Session data structure
-//  */
+typedef enum
+{
+    CHARGING_SESSION_STARTED = 0x01U,
+    CHARGING_SESSION_STOPPED = 0x00U,
+} SessionEvent_e;
+
+/**
+ * @brief Session data structure
+ */
 typedef struct
 {
-    CH_State_e state;
-    bool bPMOnOffStatus;
+    CH_State_e eChargingState;
+    RectifierState_e bPMOnOffStatus;
+    bool bStartChargingComm;
     uint8_t u8CurrentSoc;
     uint8_t u8InitialSoc;
     uint8_t u8SessionEndReason;
@@ -93,25 +115,30 @@ typedef struct
     uint8_t u8PMTemperature;
     uint8_t u8BMSFaultCode;
     uint8_t u8PMFaultCode;
-    uint16_t u16PmOutputVoltage;
-    uint16_t u16PmOutputCurrent;
-    uint16_t u16BMSDemandVoltage;
-    uint16_t u16BMSDemandCurrent;
     uint16_t u16OutputPower;
+    float fPmOutputVoltage;
+    float fPmOutputCurrent;
+    float fPmSetVoltage;
+    float fPmSetCurrent;
+    float fBMSDemandVoltage;
+    float fBMSDemandCurrent;
     uint32_t u32EnergyDelivered;
 } SESSION_Data_t;
-extern SESSION_Data_t sessionDB[4];
+extern SESSION_Data_t sessionDB[MAX_DOCKS]; /* Global session database */
 
 /*
 * Session Database Handler Macros
 */
 
 /* State */
-#define SESSION_SetState(idx, val)          (sessionDB[(idx)].state = (val))
-#define SESSION_GetState(idx)               (sessionDB[(idx)].state)
+#define SESSION_SetChargingState(idx, val)          (sessionDB[(idx)].eChargingState = (val))
+#define SESSION_GetChargingState(idx)               (sessionDB[(idx)].eChargingState)
 
 #define SESSION_SetPMState(idx, val)          (sessionDB[(idx)].bPMOnOffStatus = (val))
 #define SESSION_GetPMState(idx)               (sessionDB[(idx)].bPMOnOffStatus)
+
+#define SESSION_SetStartChargingComm(idx, val)          (sessionDB[(idx)].bStartChargingComm = (val))
+#define SESSION_GetStartChargingComm(idx)               (sessionDB[(idx)].bStartChargingComm)
 
 /* Vehicle and PM status variables */
 #define SESSION_SetCurrentSoc(idx, val)     (sessionDB[(idx)].u8CurrentSoc = (val))
@@ -148,17 +175,23 @@ extern SESSION_Data_t sessionDB[4];
 #define SESSION_GetPMFaultCode(idx)         (sessionDB[(idx)].u8PMFaultCode)
 
 /* 16-bit variables */
-#define SESSION_SetPmOutputVoltage(idx,val) (sessionDB[(idx)].u16PmOutputVoltage = (val))
-#define SESSION_GetPmOutputVoltage(idx)     (sessionDB[(idx)].u16PmOutputVoltage)
+#define SESSION_SetPmOutputVoltage(idx,val) (sessionDB[(idx)].fPmOutputVoltage = (val))
+#define SESSION_GetPmOutputVoltage(idx)     (sessionDB[(idx)].fPmOutputVoltage)
 
-#define SESSION_SetPmOutputCurrent(idx,val) (sessionDB[(idx)].u16PmOutputCurrent = (val))
-#define SESSION_GetPmOutputCurrent(idx)     (sessionDB[(idx)].u16PmOutputCurrent)
+#define SESSION_SetPmOutputCurrent(idx,val) (sessionDB[(idx)].fPmOutputCurrent = (val))
+#define SESSION_GetPmOutputCurrent(idx)     (sessionDB[(idx)].fPmOutputCurrent)
 
-#define SESSION_SetBMSDemandVoltage(idx,val) (sessionDB[(idx)].u16BMSDemandVoltage = (val))
-#define SESSION_GetBMSDemandVoltage(idx)     (sessionDB[(idx)].u16BMSDemandVoltage)
+#define SESSION_SetBMSDemandVoltage(idx,val) (sessionDB[(idx)].fBMSDemandVoltage = (val))
+#define SESSION_GetBMSDemandVoltage(idx)     (sessionDB[(idx)].fBMSDemandVoltage)
 
-#define SESSION_SetBMSDemandCurrent(idx,val) (sessionDB[(idx)].u16BMSDemandCurrent = (val))
-#define SESSION_GetBMSDemandCurrent(idx)     (sessionDB[(idx)].u16BMSDemandCurrent)
+#define SESSION_SetBMSDemandCurrent(idx,val) (sessionDB[(idx)].fBMSDemandCurrent = (val))
+#define SESSION_GetBMSDemandCurrent(idx)     (sessionDB[(idx)].fBMSDemandCurrent)
+
+#define SESSION_SetPmSetVoltage(idx,val) (sessionDB[(idx)].fPmSetVoltage = (val))
+#define SESSION_GetPmSetVoltage(idx)     (sessionDB[(idx)].fPmSetVoltage)
+
+#define SESSION_SetPmSetCurrent(idx,val) (sessionDB[(idx)].fPmSetCurrent = (val))
+#define SESSION_GetPmSetCurrent(idx)     (sessionDB[(idx)].fPmSetCurrent)
 
 #define SESSION_SetOutputPower(idx,val)      (sessionDB[(idx)].u16OutputPower = (val))
 #define SESSION_GetOutputPower(idx)          (sessionDB[(idx)].u16OutputPower)
