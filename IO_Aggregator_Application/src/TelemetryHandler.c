@@ -22,7 +22,7 @@
 /* ****************************************************************************/
 #define TELEMETRY_TASK_STACK_SIZE    1024U
 #define TELEMETRY_TASK_PRIORITY      2U
-#define TELEMETRY_TASK_DELAY_MS      10U
+#define TELEMETRY_TASK_DELAY_MS      1000U
 /* TCP/IP Definitions */
 #define TELEMETRY_PORT_HEV           8889
 #define FACTOR_1000                 1000U
@@ -283,12 +283,12 @@ void Telemetry_Task(void *pvParameters)
         }
         if (TCPIP_TCP_IsConnected(sTelemetryServerSocket))
         {
-            for (uint8_t dock = 1U; dock < 4U; dock++)
+            for (uint8_t u8DockNo = DOCK_1; u8DockNo < MAX_DOCKS; u8DockNo++)
             {
-                Telemetry_UpdateFromSession(dock);
-                Telemetry_SendBMS(TELEMETRY_COMPARTMENT_ID, dock);
+                Telemetry_UpdateFromSession(u8DockNo);
+                Telemetry_SendBMS(TELEMETRY_COMPARTMENT_ID, u8DockNo);
                 vTaskDelay(pdMS_TO_TICKS(1U)); /* Small delay between sends */
-                Telemetry_SendPM(TELEMETRY_COMPARTMENT_ID, dock);
+                Telemetry_SendPM(TELEMETRY_COMPARTMENT_ID, u8DockNo);
                 vTaskDelay(pdMS_TO_TICKS(1U)); /* Small delay between sends */
             }
             Telemetry_SendTemperature(TELEMETRY_COMPARTMENT_ID, 0xFFU); /* Broadcast dock ID for temperature */

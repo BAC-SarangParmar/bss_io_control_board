@@ -140,6 +140,17 @@ static void SetStaticIPAddress(const char* ipStr);
 volatile bool bIOOperation = false;
 uint32_t *ramStart = (uint32_t *)BTL_TRIGGER_RAM_START;
 TCP_RequestFrame_t Reqframe_St;
+const Board_gpio_st Gpio_conf = {
+    .AC_Relay_Pin = {61,62,63},
+    .DC_Relay_Pin = {64,65,66},
+    .Solenoid_PinHi = {67,68,69},
+    .Solenoid_PinLo = {70,71,72},
+    .R_LED_Pin = {73,74,75},
+    .G_LED_Pin = {76,77,78},
+    .B_LED_Pin = {79,80,81},
+    .Dock_Fan_Pin = {86,87,88},
+    .Compartment_Fan_Pin = {85}
+};
 /*  A brief description of a section can be given directly below the section
     banner.
  */
@@ -507,24 +518,7 @@ void readOutputsFromFlash(void)
         while (FCW_IsBusy());
 
         SYS_CONSOLE_MESSAGE("Default configuration saved to flash.\r\n");
-    }
-#if HEV_IO_Aggregator
-    TCPIP_TCP_Close(sCan0ServerSocket);
-    sCan0ServerSocket = INVALID_SOCKET;
-    TCPIP_TCP_Close(sCan1ServerSocket);
-    sCan1ServerSocket = INVALID_SOCKET;  
-    TCPIP_TCP_Close(sCan2ServerSocket);
-    sCan2ServerSocket = INVALID_SOCKET;  
-    TCPIP_TCP_Close(sCan3ServerSocket);
-    sCan3ServerSocket = INVALID_SOCKET;  
-    TCPIP_TCP_Close(sCan4ServerSocket);
-    sCan4ServerSocket = INVALID_SOCKET;  
-    TCPIP_TCP_Close(sCan5ServerSocket);
-    sCan5ServerSocket = INVALID_SOCKET; 
-                        
-    // Print loaded or default configuration
-    PrintLoadedConfig();
-#endif    
+    }  
 }
 
 
@@ -1073,67 +1067,55 @@ void ParseAndProcessInbPacket(uint8_t *buf, uint16_t len)
 
 void HandleGPIOCommand(void)
 {
-    uint8_t payload[4];
-    inbMsgSubType = Reqframe_St.payload[0];
-    if ((inbMsgSubType == msgSubTypeDigitalWrite && Reqframe_St.payloadLen != 4) ||
-        (inbMsgSubType == msgSubTypeDigitalRead && Reqframe_St.payloadLen != 3))
+    uint8_t payload[5];
+
+    uint8_t msgType;
+    uint16_t portNo;
+    uint8_t portVal = 0;
+    uint8_t outVal = 0;
+    uint8_t errorCode = errorNoError;
+
+    msgType = Reqframe_St.payload[0];
+
+    if ((msgType == msgSubTypeDigitalWrite && Reqframe_St.payloadLen != 4) ||
+        (msgType == msgSubTypeDigitalRead && Reqframe_St.payloadLen != 3))
     {
         SYS_CONSOLE_PRINT("[GPIO] ERROR: Payload size mismatch\r\n");
-        outbErrorCode = errorInvalidMsg;
-
-        payload[0] = inbMsgSubType;
-        payload[1] = (inbPortNo >> 8) & 0xFF;
-        payload[2] = inbPortNo & 0xFF;
-        payload[3] = outbErrorCode;
-
-        SendResponsePayload(payload, 4);
-        return;
+        errorCode = errorInvalidMsg;
     }
 
-    inbMsgSubType = Reqframe_St.payload[0];
-    inbPortNo = ((uint16_t)Reqframe_St.payload[1] << 8) | Reqframe_St.payload[2];
-    if (inbMsgSubType == msgSubTypeDigitalWrite || inbMsgSubType == msgSubTypeDigitalRead)
+    portNo = ((uint16_t)Reqframe_St.payload[1] << 8) | Reqframe_St.payload[2];
+
+    if (msgType == msgSubTypeDigitalWrite)
     {
-        inbPortVal = (inbMsgSubType == msgSubTypeDigitalWrite) ? Reqframe_St.payload[3] : 0;
+        portVal = Reqframe_St.payload[3];
     }
-    else
-    {
-        SYS_CONSOLE_PRINT("[GPIO] ERROR: Invalid Message Subtype\r\n");
-        outbErrorCode = errorInvalidMsg;
-    } 
-    /* Validate port */
-    if (inbPortNo < 1 || inbPortNo > 110)
+
+    if (portNo < 1 || portNo > 110)
     {
         SYS_CONSOLE_PRINT("[GPIO] ERROR: Invalid Port\r\n");
-        outbErrorCode = errorInvalidPort;
+        errorCode = errorInvalidPort;
     }
-    /* Validate value */
-    if ((inbPortVal != 0) && (inbPortVal != 1))
+
+    if ((portVal != 0) && (portVal != 1))
     {
         SYS_CONSOLE_PRINT("[GPIO] ERROR: Invalid Value\r\n");
-        outbErrorCode = errorInvalidValue;
+        errorCode = errorInvalidValue;
     }
-    if (outbErrorCode == errorNoError)
+
+    if (errorCode == errorNoError)
     {
-        ProcessInbPacket();
+        ProcessInbPacket(msgType, portNo, portVal, &outVal, &errorCode);
         StoreRelay_DigitalOutputsFrame();
     }
 
-    /* Build response payload */
+    // Build response
+    payload[0] = msgType;
+    payload[1] = (portNo >> 8) & 0xFF;
+    payload[2] = portNo & 0xFF;
+    payload[3] = errorCode;
+    payload[4] = (msgType == msgSubTypeDigitalWrite) ? portVal : outVal;
 
-    payload[0] = inbMsgSubType;
-    payload[1] = (inbPortNo >> 8) & 0xFF;
-    payload[2] = inbPortNo & 0xFF;
-    payload[3] = outbErrorCode;
-
-    if (inbMsgSubType == msgSubTypeDigitalWrite)
-    {
-        payload[4] = (inbPortVal != 0) ? 1 : 0;
-    }
-    else
-    {
-        payload[4] = (outbPortVal != 0) ? 1 : 0;
-    }
     SendResponsePayload(payload, 5);
 }
 
@@ -1581,6 +1563,159 @@ uint32_t Analog_Input_Get(uint8_t channel)
     return currentTempAIQueueBuffer[channel - 1];
 }
 
+uint8_t GPIO_Read(uint16_t portNo, uint8_t *pErrorCode)
+{
+    switch (portNo)
+    {
+        // Digital Inputs (1–60)
+        case 1:  return Digital_Input_1_Get();
+        case 2:  return Digital_Input_2_Get();
+        case 3:  return Digital_Input_3_Get();
+        case 4:  return Digital_Input_4_Get();
+        case 5:  return Digital_Input_5_Get();
+        case 6:  return Digital_Input_6_Get();
+        case 7:  return Digital_Input_7_Get();
+        case 8:  return Digital_Input_8_Get();
+        case 9:  return Digital_Input_9_Get();
+        case 10: return Digital_Input_10_Get();
+        case 11: return Digital_Input_11_Get();
+        case 12: return Digital_Input_12_Get();
+        case 13: return Digital_Input_13_Get();
+        case 14: return Digital_Input_14_Get();
+        case 15: return Digital_Input_15_Get();
+        case 16: return Digital_Input_16_Get();
+        case 17: return Digital_Input_17_Get();
+        case 18: return Digital_Input_18_Get();
+        case 19: return Digital_Input_19_Get();
+        case 20: return Digital_Input_20_Get();
+        case 21: return Digital_Input_21_Get();
+        case 22: return Digital_Input_22_Get();
+        case 23: return Digital_Input_23_Get();
+        case 24: return Digital_Input_24_Get();
+        case 25: return Digital_Input_25_Get();
+        case 26: return Digital_Input_26_Get();
+        case 27: return Digital_Input_27_Get();
+        case 28: return Digital_Input_28_Get();
+        case 29: return Digital_Input_29_Get();
+        case 30: return Digital_Input_30_Get();
+        case 31: return Digital_Input_31_Get();
+        case 32: return Digital_Input_32_Get();
+        case 33: return Digital_Input_33_Get();
+        case 34: return Digital_Input_34_Get();
+        case 35: return Digital_Input_35_Get();
+        case 36: return Digital_Input_36_Get();
+        case 37: return Digital_Input_37_Get();
+        case 38: return Digital_Input_38_Get();
+        case 39: return Digital_Input_39_Get();
+        case 40: return Digital_Input_40_Get();
+        case 41: return Digital_Input_41_Get();
+        case 42: return Digital_Input_42_Get();
+        case 43: return Digital_Input_43_Get();
+        case 44: return Digital_Input_44_Get();
+        case 45: return Digital_Input_45_Get();
+        case 46: return Digital_Input_46_Get();
+        case 47: return Digital_Input_47_Get();
+        case 48: return Digital_Input_48_Get();
+        case 49: return Digital_Input_49_Get();
+        case 50: return Digital_Input_50_Get();
+        case 51: return Digital_Input_51_Get();
+        case 52: return Digital_Input_52_Get();
+        case 53: return Digital_Input_53_Get();
+        case 54: return Digital_Input_54_Get();
+        case 55: return Digital_Input_55_Get();
+        case 56: return Digital_Input_56_Get();
+        case 57: return Digital_Input_57_Get();
+        case 58: return Digital_Input_58_Get();
+        case 59: return Digital_Input_59_Get();
+        case 60: return Digital_Input_60_Get();
+
+        // Digital Outputs (61–84)
+        case 61: return Digital_Output_1_Get();
+        case 62: return Digital_Output_2_Get();
+        case 63: return Digital_Output_3_Get();
+        case 64: return Digital_Output_4_Get();
+        case 65: return Digital_Output_5_Get();
+        case 66: return Digital_Output_6_Get();
+        case 67: return Digital_Output_7_Get();
+        case 68: return Digital_Output_8_Get();
+        case 69: return Digital_Output_9_Get();
+        case 70: return Digital_Output_10_Get();
+        case 71: return Digital_Output_11_Get();
+        case 72: return Digital_Output_12_Get();
+        case 73: return Digital_Output_13_Get();
+        case 74: return Digital_Output_14_Get();
+        case 75: return Digital_Output_15_Get();
+        case 76: return Digital_Output_16_Get();
+        case 77: return Digital_Output_17_Get();
+        case 78: return Digital_Output_18_Get();
+        case 79: return Digital_Output_19_Get();
+        case 80: return Digital_Output_20_Get();
+        case 81: return Digital_Output_21_Get();
+        case 82: return Digital_Output_22_Get();
+        case 83: return Digital_Output_23_Get();
+        case 84: return Digital_Output_24_Get();
+
+        // Efuse + Relay
+        case 85: return efuse1_in_Get();
+        case 86: return efuse2_in_Get();
+        case 87: return efuse3_in_Get();
+        case 88: return efuse4_in_Get();
+        case 89: return Relay_Output_1_Get();
+        case 90: return Relay_Output_2_Get();
+
+        default:
+            *pErrorCode = errorInvalidPort;
+            return 0;
+    }
+}
+
+void GPIO_Write(uint16_t portNo, bool bPortVal, uint8_t *pErrorCode)
+{
+    if (portNo < 61 || portNo > 90)
+    {
+        *pErrorCode = errorInvalidPort;
+        return;
+    }
+
+    switch (portNo)
+    {
+        case 61: bPortVal ? Digital_Output_1_Set()  : Digital_Output_1_Clear(); break;
+        case 62: bPortVal ? Digital_Output_2_Set()  : Digital_Output_2_Clear(); break;
+        case 63: bPortVal ? Digital_Output_3_Set()  : Digital_Output_3_Clear(); break;
+        case 64: bPortVal ? Digital_Output_4_Set()  : Digital_Output_4_Clear(); break;
+        case 65: bPortVal ? Digital_Output_5_Set()  : Digital_Output_5_Clear(); break;
+        case 66: bPortVal ? Digital_Output_6_Set()  : Digital_Output_6_Clear(); break;
+        case 67: bPortVal ? Digital_Output_7_Set()  : Digital_Output_7_Clear(); break;
+        case 68: bPortVal ? Digital_Output_8_Set()  : Digital_Output_8_Clear(); break;
+        case 69: bPortVal ? Digital_Output_9_Set()  : Digital_Output_9_Clear(); break;
+        case 70: bPortVal ? Digital_Output_10_Set() : Digital_Output_10_Clear(); break;
+        case 71: bPortVal ? Digital_Output_11_Set() : Digital_Output_11_Clear(); break;
+        case 72: bPortVal ? Digital_Output_12_Set() : Digital_Output_12_Clear(); break;
+        case 73: bPortVal ? Digital_Output_13_Set() : Digital_Output_13_Clear(); break;
+        case 74: bPortVal ? Digital_Output_14_Set() : Digital_Output_14_Clear(); break;
+        case 75: bPortVal ? Digital_Output_15_Set() : Digital_Output_15_Clear(); break;
+        case 76: bPortVal ? Digital_Output_16_Set() : Digital_Output_16_Clear(); break;
+        case 77: bPortVal ? Digital_Output_17_Set() : Digital_Output_17_Clear(); break;
+        case 78: bPortVal ? Digital_Output_18_Set() : Digital_Output_18_Clear(); break;
+        case 79: bPortVal ? Digital_Output_19_Set() : Digital_Output_19_Clear(); break;
+        case 80: bPortVal ? Digital_Output_20_Set() : Digital_Output_20_Clear(); break;
+        case 81: bPortVal ? Digital_Output_21_Set() : Digital_Output_21_Clear(); break;
+        case 82: bPortVal ? Digital_Output_22_Set() : Digital_Output_22_Clear(); break;
+        case 83: bPortVal ? Digital_Output_23_Set() : Digital_Output_23_Clear(); break;
+        case 84: bPortVal ? Digital_Output_24_Set() : Digital_Output_24_Clear(); break;
+
+        case 85: bPortVal ? efuse1_in_Set() : efuse1_in_Clear(); break;
+        case 86: bPortVal ? efuse2_in_Set() : efuse2_in_Clear(); break;
+        case 87: bPortVal ? efuse3_in_Set() : efuse3_in_Clear(); break;
+        case 88: bPortVal ? efuse4_in_Set() : efuse4_in_Clear(); break;
+        case 89: bPortVal ? Relay_Output_1_Set() : Relay_Output_1_Clear(); break;
+        case 90: bPortVal ? Relay_Output_2_Set() : Relay_Output_2_Clear(); break;
+
+        default:
+            *pErrorCode = errorInvalidPort;
+            return;
+    }
+}
 /**
  * @brief Processes the parsed incoming packet.
  *
@@ -1592,176 +1727,102 @@ uint32_t Analog_Input_Get(uint8_t channel)
  *
  * @note The function **does not process** the packet if there are any prior errors.
  */
-void ProcessInbPacket() 
-{  
-    // No processing for any errors thus far
-    if (outbErrorCode != errorNoError) {
+void ProcessInbPacket(uint8_t msgType,
+                      uint16_t portNo,
+                      uint8_t portVal,
+                      uint8_t *pOutVal,
+                      uint8_t *pErrorCode)
+{
+    if (*pErrorCode != errorNoError)
         return;
-    }
-    if (inbMsgSubType == msgSubTypeDigitalRead) 
+
+    if (msgType == msgSubTypeDigitalRead)
     {
-        SYS_CONSOLE_PRINT("[GPIO] Processing Digital Read for Port %d\r\n", inbPortNo);
-        switch (inbPortNo) {
-            // **Digital Input Read Handling (DI1 - DI60)**
-            case 1:  outbPortVal = Digital_Input_1_Get();  break;
-            case 2:  outbPortVal = Digital_Input_2_Get();  break;
-            case 3:  outbPortVal = Digital_Input_3_Get();  break;
-            case 4:  outbPortVal = Digital_Input_4_Get();  break;
-            case 5:  outbPortVal = Digital_Input_5_Get();  break;
-            case 6:  outbPortVal = Digital_Input_6_Get();  break;
-            case 7:  outbPortVal = Digital_Input_7_Get();  break;
-            case 8:  outbPortVal = Digital_Input_8_Get();  break;
-            case 9:  outbPortVal = Digital_Input_9_Get();  break;
-            case 10: outbPortVal = Digital_Input_10_Get(); break;
-            case 11: outbPortVal = Digital_Input_11_Get(); break;
-            case 12: outbPortVal = Digital_Input_12_Get(); break;
-            case 13: outbPortVal = Digital_Input_13_Get(); break;
-            case 14: outbPortVal = Digital_Input_14_Get(); break;
-            case 15: outbPortVal = Digital_Input_15_Get(); break;
-            case 16: outbPortVal = Digital_Input_16_Get(); break;
-            case 17: outbPortVal = Digital_Input_17_Get(); break;
-            case 18: outbPortVal = Digital_Input_18_Get(); break;
-            case 19: outbPortVal = Digital_Input_19_Get(); break;
-            case 20: outbPortVal = Digital_Input_20_Get(); break;
-            case 21: outbPortVal = Digital_Input_21_Get(); break;
-            case 22: outbPortVal = Digital_Input_22_Get(); break;
-            case 23: outbPortVal = Digital_Input_23_Get(); break;
-            case 24: outbPortVal = Digital_Input_24_Get(); break;
-            case 25: outbPortVal = Digital_Input_25_Get(); break;
-            case 26: outbPortVal = Digital_Input_26_Get(); break;
-            case 27: outbPortVal = Digital_Input_27_Get(); break;
-            case 28: outbPortVal = Digital_Input_28_Get(); break;
-            case 29: outbPortVal = Digital_Input_29_Get(); break;
-            case 30: outbPortVal = Digital_Input_30_Get(); break;
-            case 31: outbPortVal = Digital_Input_31_Get(); break;
-            case 32: outbPortVal = Digital_Input_32_Get(); break;
-            case 33: outbPortVal = Digital_Input_33_Get(); break;
-            case 34: outbPortVal = Digital_Input_34_Get(); break;
-            case 35: outbPortVal = Digital_Input_35_Get(); break;
-            case 36: outbPortVal = Digital_Input_36_Get(); break;
-            case 37: outbPortVal = Digital_Input_37_Get(); break;
-            case 38: outbPortVal = Digital_Input_38_Get(); break;
-            case 39: outbPortVal = Digital_Input_39_Get(); break;
-            case 40: outbPortVal = Digital_Input_40_Get(); break;
-            case 41: outbPortVal = Digital_Input_41_Get(); break;
-            case 42: outbPortVal = Digital_Input_42_Get(); break;
-            case 43: outbPortVal = Digital_Input_43_Get(); break;
-            case 44: outbPortVal = Digital_Input_44_Get(); break;
-            case 45: outbPortVal = Digital_Input_45_Get(); break;
-            case 46: outbPortVal = Digital_Input_46_Get(); break;
-            case 47: outbPortVal = Digital_Input_47_Get(); break;
-            case 48: outbPortVal = Digital_Input_48_Get(); break;
-            case 49: outbPortVal = Digital_Input_49_Get(); break;
-            case 50: outbPortVal = Digital_Input_50_Get(); break;
-            case 51: outbPortVal = Digital_Input_51_Get(); break;
-            case 52: outbPortVal = Digital_Input_52_Get(); break;
-            case 53: outbPortVal = Digital_Input_53_Get(); break;
-            case 54: outbPortVal = Digital_Input_54_Get(); break;
-            case 55: outbPortVal = Digital_Input_55_Get(); break;
-            case 56: outbPortVal = Digital_Input_56_Get(); break;
-            case 57: outbPortVal = Digital_Input_57_Get(); break;
-            case 58: outbPortVal = Digital_Input_58_Get(); break;
-            case 59: outbPortVal = Digital_Input_59_Get(); break;
-            case 60: outbPortVal = Digital_Input_60_Get(); break;
-            
-            // **Digital Output Handling (DO1 - DO20) with Read**
-            case 61: outbPortVal = Digital_Output_1_Get();  break;
-            case 62: outbPortVal = Digital_Output_2_Get();  break;
-            case 63: outbPortVal = Digital_Output_3_Get();  break;
-            case 64: outbPortVal = Digital_Output_4_Get();  break;
-            case 65: outbPortVal = Digital_Output_5_Get();  break;
-            case 66: outbPortVal = Digital_Output_6_Get();  break;
-            case 67: outbPortVal = Digital_Output_7_Get();  break;
-            case 68: outbPortVal = Digital_Output_8_Get();  break;
-            case 69: outbPortVal = Digital_Output_9_Get();  break;
-            case 70: outbPortVal = Digital_Output_10_Get(); break;
-            case 71: outbPortVal = Digital_Output_11_Get(); break;
-            case 72: outbPortVal = Digital_Output_12_Get(); break;
-            case 73: outbPortVal = Digital_Output_13_Get(); break;
-            case 74: outbPortVal = Digital_Output_14_Get(); break;
-            case 75: outbPortVal = Digital_Output_15_Get(); break;
-            case 76: outbPortVal = Digital_Output_16_Get(); break;
-            case 77: outbPortVal = Digital_Output_17_Get(); break;
-            case 78: outbPortVal = Digital_Output_18_Get(); break;
-            case 79: outbPortVal = Digital_Output_19_Get(); break;
-            case 80: outbPortVal = Digital_Output_20_Get(); break;
-            case 81: outbPortVal = Digital_Output_21_Get(); break;
-            case 82: outbPortVal = Digital_Output_22_Get(); break;
-            case 83: outbPortVal = Digital_Output_23_Get(); break;
-            case 84: outbPortVal = Digital_Output_24_Get(); break;   
-            
-            // **Relay Output Handling (R1 - R6) with Read**
-            case 85:  outbPortVal = efuse1_in_Get();  break;
-            case 86:  outbPortVal = efuse2_in_Get();  break;
-            case 87:  outbPortVal = efuse3_in_Get();  break;
-            case 88:  outbPortVal = efuse4_in_Get();  break;
-            case 89:  outbPortVal = Relay_Output_1_Get();  break;
-            case 90:  outbPortVal = Relay_Output_2_Get();  break;
-            default:
-                outbErrorCode = errorInvalidPort;
-                return;
-        }
+        *pOutVal = GPIO_Read(portNo, pErrorCode);
     }
-    else if (inbMsgSubType == msgSubTypeDigitalWrite)
+    else if (msgType == msgSubTypeDigitalWrite)
     {
-        if (inbPortNo >= 61 && inbPortNo <= 90)  
-        {
-            SYS_CONSOLE_PRINT("[GPIO] Writing to Port : %d, Value: %d\r\n", inbPortNo, inbPortVal);
-            switch (inbPortNo) {
-                //Digital Output
-                case 61:  inbPortVal ? Digital_Output_1_Set()  : Digital_Output_1_Clear();  break;
-                case 62:  inbPortVal ? Digital_Output_2_Set()  : Digital_Output_2_Clear();  break;
-                case 63:  inbPortVal ? Digital_Output_3_Set()  : Digital_Output_3_Clear();  break;
-                case 64:  inbPortVal ? Digital_Output_4_Set()  : Digital_Output_4_Clear();  break;
-                case 65:  inbPortVal ? Digital_Output_5_Set()  : Digital_Output_5_Clear();  break;
-                case 66:  inbPortVal ? Digital_Output_6_Set()  : Digital_Output_6_Clear();  break;
-                case 67:  inbPortVal ? Digital_Output_7_Set()  : Digital_Output_7_Clear();  break;
-                case 68:  inbPortVal ? Digital_Output_8_Set()  : Digital_Output_8_Clear();  break;
-                case 69:  inbPortVal ? Digital_Output_9_Set()  : Digital_Output_9_Clear();  break;
-                case 70:  inbPortVal ? Digital_Output_10_Set() : Digital_Output_10_Clear(); break;
-                case 71:  inbPortVal ? Digital_Output_11_Set() : Digital_Output_11_Clear(); break;
-                case 72:  inbPortVal ? Digital_Output_12_Set() : Digital_Output_12_Clear(); break;
-                case 73:  inbPortVal ? Digital_Output_13_Set() : Digital_Output_13_Clear(); break;
-                case 74:  inbPortVal ? Digital_Output_14_Set() : Digital_Output_14_Clear(); break;
-                case 75:  inbPortVal ? Digital_Output_15_Set() : Digital_Output_15_Clear(); break;
-                case 76:  inbPortVal ? Digital_Output_16_Set() : Digital_Output_16_Clear(); break;
-                case 77:  inbPortVal ? Digital_Output_17_Set() : Digital_Output_17_Clear(); break;
-                case 78:  inbPortVal ? Digital_Output_18_Set() : Digital_Output_18_Clear(); break;
-                case 79:  inbPortVal ? Digital_Output_19_Set() : Digital_Output_19_Clear(); break;
-                case 80:  inbPortVal ? Digital_Output_20_Set() : Digital_Output_20_Clear(); break;
-                case 81:  inbPortVal ? Digital_Output_21_Set() : Digital_Output_21_Clear(); break;
-                case 82:  inbPortVal ? Digital_Output_22_Set() : Digital_Output_22_Clear(); break;
-                case 83:  inbPortVal ? Digital_Output_23_Set() : Digital_Output_23_Clear(); break;
-                case 84:  inbPortVal ? Digital_Output_24_Set() : Digital_Output_24_Clear(); break;
-                
-                //Relay Output
-                case 85:  inbPortVal ? efuse1_in_Set()  : efuse1_in_Clear();  break;
-                case 86:  inbPortVal ? efuse2_in_Set()  : efuse2_in_Clear();  break;
-                case 87:  inbPortVal ? efuse3_in_Set()  : efuse3_in_Clear();  break;
-                case 88:  inbPortVal ? efuse4_in_Set()  : efuse4_in_Clear();  break;
-                case 89:  inbPortVal ? Relay_Output_1_Set()  : Relay_Output_1_Clear();  break;
-                case 90:  inbPortVal ? Relay_Output_2_Set()  : Relay_Output_2_Clear();  break;                
-                default:
-                    outbErrorCode = errorInvalidPort;
-                    return;
-            }        
-        }
+        GPIO_Write(portNo, portVal, pErrorCode);
     }
-    return;
+    else
+    {
+        *pErrorCode = errorInvalidMsg;
+    }
 }
 
 void ChargingControl(uint8_t u8DockNo, uint8_t action)
 {
     // Placeholder for actual charging control logic
     //SYS_CONSOLE_PRINT("[CHARGING] Control for Dock %d, Action: %s\r\n", u8DockNo, action ? "START" : "STOP");
-    static uint8_t u8PevChargingState[4] = {0}; // Assuming max 4 docks for example
+    static uint8_t u8PevChargingState[MAX_DOCKS] = {0}; // Assuming max 4 docks for example
     if (u8PevChargingState[u8DockNo] != action) {
-        SYS_CONSOLE_PRINT("[CHARGING] Dock %d already in desired state\r\n", u8DockNo);
-        // SESSION_SetAuthenticationCommand(u8DockNo, action);
+        SYS_CONSOLE_PRINT("[CHARGING] Dock %d Charging State %s\r\n", u8DockNo, action ? "START" : "STOP");
+        SESSION_SetAuthenticationCommand(u8DockNo, action);
         u8PevChargingState[u8DockNo] = action;
     }
-    
-    // Implement the actual control logic here based on your hardware design
+}
+
+void vDO_Operation(GPIOOperation_e eGPIOType, uint8_t u8DockNo)
+{
+    uint8_t outbErrorCode = errorNoError;
+    switch (eGPIOType)
+    {
+    case GPIO_AC_RELAY_ON:
+        GPIO_Write(Gpio_conf.AC_Relay_Pin[u8DockNo], true, &outbErrorCode);
+        break;
+    case GPIO_AC_RELAY_OFF:
+        GPIO_Write(Gpio_conf.AC_Relay_Pin[u8DockNo], false, &outbErrorCode);
+        break;
+    case GPIO_DC_RELAY_ON:
+        GPIO_Write(Gpio_conf.DC_Relay_Pin[u8DockNo], true, &outbErrorCode);
+        break;
+    case GPIO_DC_RELAY_OFF:
+        GPIO_Write(Gpio_conf.DC_Relay_Pin[u8DockNo], false, &outbErrorCode);
+        break;
+    case GPIO_SOLENOID_HIGH:
+        GPIO_Write(Gpio_conf.Solenoid_PinHi[u8DockNo], true, &outbErrorCode);
+        vTaskDelay(100); // Add delay if solenoid needs time to actuate
+        GPIO_Write(Gpio_conf.Solenoid_PinHi[u8DockNo], false, &outbErrorCode);
+        break;
+    case GPIO_SOLENOID_LOW:
+        GPIO_Write(Gpio_conf.Solenoid_PinLo[u8DockNo], true, &outbErrorCode);
+        vTaskDelay(100); // Add delay if solenoid needs time to actuate
+        GPIO_Write(Gpio_conf.Solenoid_PinLo[u8DockNo], false, &outbErrorCode);
+        break;
+    case GPIO_R_LED_HIGH:
+        GPIO_Write(Gpio_conf.R_LED_Pin[u8DockNo], true, &outbErrorCode);
+        break;
+    case GPIO_R_LED_LOW:
+        GPIO_Write(Gpio_conf.R_LED_Pin[u8DockNo], false, &outbErrorCode);
+        break;
+    case GPIO_G_LED_HIGH:
+        GPIO_Write(Gpio_conf.G_LED_Pin[u8DockNo], true, &outbErrorCode);
+        break;
+    case GPIO_G_LED_LOW:
+        GPIO_Write(Gpio_conf.G_LED_Pin[u8DockNo], false, &outbErrorCode);
+        break;
+    case GPIO_B_LED_HIGH:
+        GPIO_Write(Gpio_conf.B_LED_Pin[u8DockNo], true, &outbErrorCode);
+        break;
+    case GPIO_B_LED_LOW:
+        GPIO_Write(Gpio_conf.B_LED_Pin[u8DockNo], false, &outbErrorCode);
+        break;
+    case GPIO_DOCK_FAN_HIGH:
+        GPIO_Write(Gpio_conf.Dock_Fan_Pin[u8DockNo], true, &outbErrorCode);
+        break;
+    case GPIO_DOCK_FAN_LOW:
+        GPIO_Write(Gpio_conf.Dock_Fan_Pin[u8DockNo], false, &outbErrorCode);
+        break;
+    case GPIO_COMPARTMENT_FAN_HIGH:
+        GPIO_Write(Gpio_conf.Compartment_Fan_Pin, true, &outbErrorCode);
+        break;
+    case GPIO_COMPARTMENT_FAN_LOW:
+        GPIO_Write(Gpio_conf.Compartment_Fan_Pin, false, &outbErrorCode);
+        break;
+    default:
+        SYS_CONSOLE_PRINT("[GPIO] Unknown GPIO Operation\r\n");
+        break;
+    }
 }
 /* *****************************************************************************
  End of File

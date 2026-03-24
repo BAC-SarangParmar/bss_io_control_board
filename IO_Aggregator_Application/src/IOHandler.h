@@ -22,9 +22,9 @@
 // *****************************************************************************
 // Section: Included Files
 // *****************************************************************************
-#include <stddef.h>  // Defines NULL
-#include <stdbool.h> // Defines true
-
+#include <stddef.h> 
+#include <stdbool.h> 
+#include "sessionDBHandler.h" // For session management functions
 // *****************************************************************************
 // IO Server Task Configuration
 // *****************************************************************************
@@ -95,6 +95,7 @@
 
 #define BTL_TRIGGER_PATTERN (0x5048434DUL)
 #define BTL_TRIGGER_RAM_START  0x20020000U
+
 extern uint32_t *ramStart;
 // External declarations for ADC handling
 extern const char* sensor_names[NUM_ANALOG_PINS];
@@ -153,7 +154,81 @@ typedef enum
     CMD_SOFT_RESET_COMMAND  = 0x06
 
 } CommandID_t;
-
+typedef struct
+{
+    uint8_t AC_Relay_Pin[MAX_DOCKS];
+    uint8_t DC_Relay_Pin[MAX_DOCKS];
+    uint8_t Solenoid_PinHi[MAX_DOCKS];
+    uint8_t Solenoid_PinLo[MAX_DOCKS];
+    uint8_t R_LED_Pin[MAX_DOCKS];
+    uint8_t G_LED_Pin[MAX_DOCKS];
+    uint8_t B_LED_Pin[MAX_DOCKS];
+    uint8_t Dock_Fan_Pin[MAX_DOCKS];
+    uint8_t Compartment_Fan_Pin;
+} Board_gpio_st;
+typedef enum {
+    GPIO_AC_RELAY_ON = 0,
+    GPIO_AC_RELAY_OFF,
+    GPIO_DC_RELAY_ON,
+    GPIO_DC_RELAY_OFF,
+    GPIO_SOLENOID_HIGH,
+    GPIO_SOLENOID_LOW,
+    GPIO_R_LED_HIGH,
+    GPIO_R_LED_LOW,
+    GPIO_G_LED_HIGH,
+    GPIO_G_LED_LOW,
+    GPIO_B_LED_HIGH,
+    GPIO_B_LED_LOW,
+    GPIO_DOCK_FAN_HIGH,
+    GPIO_DOCK_FAN_LOW,
+    GPIO_COMPARTMENT_FAN_HIGH,
+    GPIO_COMPARTMENT_FAN_LOW,
+    // GPIO_DOCK1_AC_RELAY_ON = 0,
+    // GPIO_DOCK1_AC_RELAY_OFF,
+    // GPIO_DOCK2_AC_RELAY_ON,
+    // GPIO_DOCK2_AC_RELAY_OFF,
+    // GPIO_DOCK3_AC_RELAY_ON,
+    // GPIO_DOCK3_AC_RELAY_OFF,
+    // GPIO_DOCK1_DC_RELAY_ON,
+    // GPIO_DOCK1_DC_RELAY_OFF,
+    // GPIO_DOCK2_DC_RELAY_ON,
+    // GPIO_DOCK2_DC_RELAY_OFF,
+    // GPIO_DOCK3_DC_RELAY_ON,
+    // GPIO_DOCK3_DC_RELAY_OFF,
+    // GPIO_DOCK1_SOLENOID_HIGH,
+    // GPIO_DOCK1_SOLENOID_LOW,
+    // GPIO_DOCK2_SOLENOID_HIGH,
+    // GPIO_DOCK2_SOLENOID_LOW,
+    // GPIO_DOCK3_SOLENOID_HIGH,
+    // GPIO_DOCK3_SOLENOID_LOW,
+    // GPIO_DOCK1_R_LED_HIGH,
+    // GPIO_DOCK1_R_LED_LOW,
+    // GPIO_DOCK1_G_LED_HIGH,
+    // GPIO_DOCK1_G_LED_LOW,
+    // GPIO_DOCK1_B_LED_HIGH,
+    // GPIO_DOCK1_B_LED_LOW,
+    // GPIO_DOCK2_R_LED_HIGH,
+    // GPIO_DOCK2_R_LED_LOW,
+    // GPIO_DOCK2_G_LED_HIGH,
+    // GPIO_DOCK2_G_LED_LOW,
+    // GPIO_DOCK2_B_LED_HIGH,
+    // GPIO_DOCK2_B_LED_LOW,
+    // GPIO_DOCK3_R_LED_HIGH,
+    // GPIO_DOCK3_R_LED_LOW,
+    // GPIO_DOCK3_G_LED_HIGH,
+    // GPIO_DOCK3_G_LED_LOW,
+    // GPIO_DOCK3_B_LED_HIGH,
+    // GPIO_DOCK3_B_LED_LOW,
+    // GPIO_COMPARTMENT_FAN_HIGH,
+    // GPIO_COMPARTMENT_FAN_LOW,
+    // GPIO_DOCK1_FAN_HIGH,
+    // GPIO_DOCK1_FAN_LOW,
+    // GPIO_DOCK2_FAN_HIGH,
+    // GPIO_DOCK2_FAN_LOW,
+    // GPIO_DOCK3_FAN_HIGH,
+    // GPIO_DOCK3_FAN_LOW,
+    GPIO_MAX
+}GPIOOperation_e;
 // Extern declaration
 extern flash_data_t writeData;
 
@@ -217,6 +292,10 @@ void checkIOExpanderInput(uint8_t *expanderData);
  */
 uint8_t TCA9539_ReadRegister(uint8_t reg);
 
+/**
+ * 
+ */
+void vDO_Operation(GPIOOperation_e eGPIOType, uint8_t u8DockNo);
 #endif /* _APP_IO_HANDLER_H */
 
 /*******************************************************************************

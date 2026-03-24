@@ -49,27 +49,11 @@
 #define WRITE_ID(id) ((id) << 18)  // Convert 29-bit ID for transmission
 #define READ_ID(id)  ((id) >> 18)  // Convert received ID to readable format
 
+#define EXT_CAN_MSG (1U)
+#define STD_CAN_MSG (0U)
 // *****************************************************************************
 // CAN Server Port Configuration
 // *****************************************************************************
-#if HEV_IO_Aggregator
-    extern flash_data_t writeData;    
-    extern TCP_SOCKET sCan0ServerSocket ;
-    extern TCP_SOCKET sCan1ServerSocket ;
-    extern TCP_SOCKET sCan2ServerSocket ;
-    extern TCP_SOCKET sCan3ServerSocket ;
-    extern TCP_SOCKET sCan4ServerSocket ;
-    extern TCP_SOCKET sCan5ServerSocket ;    
-#endif
-
-#if Two_Wheeler_IO_Aggregator
-    #define CAN0_SERVER_PORT  32000
-    #define CAN1_SERVER_PORT  32001
-    #define CAN2_SERVER_PORT  32002
-    #define CAN3_SERVER_PORT  32003
-    #define CAN4_SERVER_PORT  32004
-    #define CAN5_SERVER_PORT  32005
-#endif
 
 // *****************************************************************************
 // Data Size Definitions
@@ -126,13 +110,10 @@ void vCanHandlerInit(void);
  * @return True if the message was successfully transmitted, false otherwise.
  */
 bool CAN_Write(uint8_t canIndex, uint8_t *u8data, char i8len);
-bool CAN0_Write(uint8_t *u8data, char i8len);
-bool CAN1_Write(uint8_t *u8data, char i8len);
-bool CAN2_Write(uint8_t *u8data, char i8len);
-bool CAN3_Write(uint8_t *u8data, char i8len);
-bool CAN4_Write(uint8_t *u8data, char i8len);
-bool CAN5_Write(uint8_t *u8data, char i8len);
-
+bool CAN0_Write(const CAN_TX_BUFFER *const tx_buffer);
+bool CAN1_Write(const CAN_TX_BUFFER *const tx_buffer);
+bool CAN2_Write(const CAN_TX_BUFFER *const tx_buffer);
+void vSendCanTxMsgToQueue(const CAN_TX_BUFFER *const pCanTxBuffer, uint8_t u8DockNo);
 #endif /* _APP_CAN_HANDLER_H */
 
 /*******************************************************************************

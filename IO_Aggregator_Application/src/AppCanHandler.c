@@ -51,73 +51,36 @@ uint8_t CACHE_ALIGN __attribute__((space(data), section (".can4_message_ram"))) 
 uint8_t CACHE_ALIGN __attribute__((space(data), section (".can5_message_ram"))) Can5MessageRAM[CAN5_MESSAGE_RAM_CONFIG_SIZE];
 
 uint8_t CanMessageRAM[CAN3_MESSAGE_RAM_CONFIG_SIZE];
-// ********** CAN Server Sockets **********
-TCP_SOCKET sCan0ServerSocket = INVALID_SOCKET;
-TCP_SOCKET sCan1ServerSocket = INVALID_SOCKET;
-TCP_SOCKET sCan2ServerSocket = INVALID_SOCKET;
-TCP_SOCKET sCan3ServerSocket = INVALID_SOCKET;
-TCP_SOCKET sCan4ServerSocket = INVALID_SOCKET;
-TCP_SOCKET sCan5ServerSocket = INVALID_SOCKET;
 
-
-#if Two_Wheeler_IO_Aggregator
- #define CCU_IP_ADDRESS "192.168.1.251"
-// ********** Port Definitions **********    
-#define CAN0_CCU_PORT     "33001"
-
-#define CAN1_MIRROR1_PORT "33002"
-#define CAN1_MIRROR2_PORT "33102"
-#define CAN1_MIRROR3_PORT "33105"
-
-#define CAN2_MIRROR1_PORT "33003"
-#define CAN2_MIRROR2_PORT "33103"
-#define CAN2_MIRROR3_PORT "33105"
-
-#define CAN3_MIRROR1_PORT "33004"
-#define CAN3_MIRROR2_PORT "33104"
-#define CAN3_MIRROR3_PORT "33105"
-#endif
 #define CAN_TX_PAYLOAD_SIZE 8
-// ********** CAN RX Buffers **********
-static uint8_t can0rxFiFo0[CAN0_RX_FIFO0_SIZE];
-static uint8_t can1rxFiFo0[CAN1_RX_FIFO0_SIZE];
-static uint8_t can2rxFiFo0[CAN2_RX_FIFO0_SIZE];
-static uint8_t can3rxFiFo0[CAN3_RX_FIFO0_SIZE];
-static uint8_t can4rxFiFo0[CAN4_RX_FIFO0_SIZE];
-static uint8_t can5rxFiFo0[CAN5_RX_FIFO0_SIZE];
-
+#define CAN_TASK_DELAY 10U
 static uint32_t status = 0;// ********** CAN Data Buffers **********
 // ********** CAN Data Buffers **********
 static uint8_t u8CAN0buffer[256];
 static uint8_t u8CAN1buffer[256];
 static uint8_t u8CAN2buffer[256];
-static uint8_t u8CAN3buffer[256];
-static uint8_t u8CAN4buffer[256];
-static uint8_t u8CAN5buffer[256];
 
 // Declare the mutex handle globally
-SemaphoreHandle_t xCan0QueueMutex;
-SemaphoreHandle_t xCan1QueueMutex;
-SemaphoreHandle_t xCan2QueueMutex;
-SemaphoreHandle_t xCan3QueueMutex;
-SemaphoreHandle_t xCan4QueueMutex;
-SemaphoreHandle_t xCan5QueueMutex;
+SemaphoreHandle_t xCan0RXQueueMutex;
+SemaphoreHandle_t xCan0TXQueueMutex;
+SemaphoreHandle_t xCan1RXQueueMutex;
+SemaphoreHandle_t xCan1TXQueueMutex;
+SemaphoreHandle_t xCan2RXQueueMutex;
+SemaphoreHandle_t xCan2TXQueueMutex;
 
 // ********** FreeRTOS Queue Handlers **********
-QueueHandle_t xCAN0QueueHandler;
-QueueHandle_t xCAN1QueueHandler;
-QueueHandle_t xCAN2QueueHandler;
-QueueHandle_t xCAN3QueueHandler;
-QueueHandle_t xCAN4QueueHandler;
-QueueHandle_t xCAN5QueueHandler;
-// ********** FreeRTOS Queue Buffers **********
-static uint8_t u8CAN0QueueBuffer[128];
-static uint8_t u8CAN1QueueBuffer[128];
-static uint8_t u8CAN2QueueBuffer[128];
-static uint8_t u8CAN3QueueBuffer[128];
-static uint8_t u8CAN4QueueBuffer[128];
-static uint8_t u8CAN5QueueBuffer[128];
+QueueHandle_t xCAN0RXQueueHandler;
+QueueHandle_t xCAN1RXQueueHandler;
+QueueHandle_t xCAN2RXQueueHandler;
+QueueHandle_t xCAN0TXQueueHandler;
+QueueHandle_t xCAN1TXQueueHandler;
+QueueHandle_t xCAN2TXQueueHandler;
 
+/* ========================================================
+    FUNCTION PROTOTYPES
+     ============================================================ */
+extern void vProcessBMSCanMessage(CAN_RX_BUFFER *rxBuf, uint8_t canBus);
+extern void vProcessPMCanMessage(CAN_RX_BUFFER *rxBuf, uint8_t canBus);
 
 /**
  * @brief Swaps the endianness of a 32-bit unsigned integer.
@@ -187,303 +150,102 @@ bool CAN_Write(uint8_t canIndex, uint8_t *u8data, char i8len)
         case 0: return CAN0_MessageTransmitFifo(1, &txBuffer);
         case 1: return CAN1_MessageTransmitFifo(1, &txBuffer);
         case 2: return CAN2_MessageTransmitFifo(1, &txBuffer);
-        case 3: return CAN3_MessageTransmitFifo(1, &txBuffer);
-        case 4: return CAN4_MessageTransmitFifo(1, &txBuffer);
-        case 5: return CAN5_MessageTransmitFifo(1, &txBuffer);
+        // case 3: return CAN3_MessageTransmitFifo(1, &txBuffer);
+        // case 4: return CAN4_MessageTransmitFifo(1, &txBuffer);
+        // case 5: return CAN5_MessageTransmitFifo(1, &txBuffer);
         default:
             SYS_CONSOLE_PRINT("Invalid CAN index.\r\n");
             return false;
     }
 }
-
-bool CAN0_Write(uint8_t *u8data, char i8len)
+bool CAN0_Write(const CAN_TX_BUFFER *const tx_buffer)
 {
-    CAN_TX_BUFFER txBuffer;
-    memset(&txBuffer, 0, sizeof(CAN_TX_BUFFER));
-
-    uint32_t canId = ((uint32_t)u8data[0] << 24) |
-                     ((uint32_t)u8data[1] << 16) |
-                     ((uint32_t)u8data[2] << 8)  |
-                     ((uint32_t)u8data[3]);
-
-    txBuffer.id = WRITE_ID(canId);
-    txBuffer.dlc = CAN_TX_PAYLOAD_SIZE;
-
-    for (uint8_t i = 0; i < CAN_TX_PAYLOAD_SIZE; i++)
+    if (tx_buffer == NULL)
     {
-        txBuffer.data[i] = u8data[i + 4];
+        SYS_CONSOLE_PRINT("CAN0: NULL TX buffer\r\n");
+        return false;
     }
 
-    bool result = CAN0_MessageTransmitFifo(1, &txBuffer);
-    if (!result)
+    // Validate DLC
+    if (tx_buffer->dlc > 8)
     {
-        SYS_CONSOLE_PRINT("Error: CAN0 message transmission failed!\r\n");
+        SYS_CONSOLE_PRINT("CAN0: Invalid DLC\r\n");
+        return false;
     }
-    return result;
+
+    // Try transmit
+    if (!CAN0_MessageTransmitFifo(1U, tx_buffer))
+    {
+        SYS_CONSOLE_PRINT("CAN0: TX failed\r\n");
+        return false;
+    }
+
+    return true;
+}
+bool CAN1_Write(const CAN_TX_BUFFER *const tx_buffer)
+{
+    if (tx_buffer == NULL)
+    {
+        SYS_CONSOLE_PRINT("CAN1: NULL TX buffer\r\n");
+        return false;
+    }
+
+    // Validate DLC
+    if (tx_buffer->dlc > 8)
+    {
+        SYS_CONSOLE_PRINT("CAN1: Invalid DLC\r\n");
+        return false;
+    }
+
+    // Attempt transmit using FIFO 0
+    if (!CAN1_MessageTransmitFifo(0, tx_buffer))
+    {
+        SYS_CONSOLE_PRINT("CAN1: TX failed\r\n");
+        return false;
+    }
+
+    return true;
 }
 
-bool CAN1_Write(uint8_t *u8data, char i8len)
+bool CAN2_Write(const CAN_TX_BUFFER *const tx_buffer)
 {
-    CAN_TX_BUFFER txBuffer;
-    memset(&txBuffer, 0, sizeof(CAN_TX_BUFFER));
-
-    uint32_t canId = ((uint32_t)u8data[0] << 24) |
-                     ((uint32_t)u8data[1] << 16) |
-                     ((uint32_t)u8data[2] << 8)  |
-                     ((uint32_t)u8data[3]);
-
-    txBuffer.id = WRITE_ID(canId);
-    txBuffer.dlc = CAN_TX_PAYLOAD_SIZE;
-
-    for (uint8_t i = 0; i < CAN_TX_PAYLOAD_SIZE; i++)
+    if (tx_buffer == NULL)
     {
-        txBuffer.data[i] = u8data[i + 4];
+        SYS_CONSOLE_PRINT("CAN2: NULL TX buffer\r\n");
+        return false;
     }
 
-    bool result = CAN1_MessageTransmitFifo(1, &txBuffer);
-    if (!result)
+    // Validate DLC
+    if (tx_buffer->dlc > 8)
     {
-        SYS_CONSOLE_PRINT("Error: CAN1 message transmission failed!\r\n");
+        SYS_CONSOLE_PRINT("CAN2: Invalid DLC\r\n");
+        return false;
     }
-    return result;
+
+    // Attempt transmit using FIFO 0
+    if (!CAN2_MessageTransmitFifo(0, tx_buffer))
+    {
+        SYS_CONSOLE_PRINT("CAN2: TX failed\r\n");
+        return false;
+    }
+
+    return true;
 }
-
-bool CAN2_Write(uint8_t *u8data, char i8len)
+void vProcessCanRxMessage(CAN_RX_BUFFER *rxBuf, uint8_t canBus)
 {
-    CAN_TX_BUFFER txBuffer;
-    memset(&txBuffer, 0, sizeof(CAN_TX_BUFFER));
-
-    uint32_t canId = ((uint32_t)u8data[0] << 24) |
-                     ((uint32_t)u8data[1] << 16) |
-                     ((uint32_t)u8data[2] << 8)  |
-                     ((uint32_t)u8data[3]);
-
-    txBuffer.id = WRITE_ID(canId);
-    txBuffer.dlc = CAN_TX_PAYLOAD_SIZE;
-
-    for (uint8_t i = 0; i < CAN_TX_PAYLOAD_SIZE; i++)
+    if (rxBuf == NULL)
     {
-        txBuffer.data[i] = u8data[i + 4];
+        SYS_CONSOLE_PRINT("Received NULL CAN RX buffer\r\n");
+        return;
     }
-
-    bool result = CAN2_MessageTransmitFifo(1, &txBuffer);
-    if (!result)
+    if (rxBuf->xtd)
     {
-        SYS_CONSOLE_PRINT("Error: CAN2 message transmission failed!\r\n");
+        vProcessPMCanMessage(rxBuf, canBus);
     }
-    return result;
-}
-
-bool CAN3_Write(uint8_t *u8data, char i8len)
-{
-    CAN_TX_BUFFER txBuffer;
-    memset(&txBuffer, 0, sizeof(CAN_TX_BUFFER));
-
-    uint32_t canId = ((uint32_t)u8data[0] << 24) |
-                     ((uint32_t)u8data[1] << 16) |
-                     ((uint32_t)u8data[2] << 8)  |
-                     ((uint32_t)u8data[3]);
-
-    txBuffer.id = WRITE_ID(canId);
-    txBuffer.dlc = CAN_TX_PAYLOAD_SIZE;
-
-    for (uint8_t i = 0; i < CAN_TX_PAYLOAD_SIZE; i++)
+    else
     {
-        txBuffer.data[i] = u8data[i + 4];
+        vProcessBMSCanMessage(rxBuf, canBus);
     }
-
-    bool result = CAN3_MessageTransmitFifo(1, &txBuffer);
-    if (!result)
-    {
-        SYS_CONSOLE_PRINT("Error: CAN3 message transmission failed!\r\n");
-    }
-    return result;
-}
-
-bool CAN4_Write(uint8_t *u8data, char i8len)
-{
-    CAN_TX_BUFFER txBuffer;
-    memset(&txBuffer, 0, sizeof(CAN_TX_BUFFER));
-
-    uint32_t canId = ((uint32_t)u8data[0] << 24) |
-                     ((uint32_t)u8data[1] << 16) |
-                     ((uint32_t)u8data[2] << 8)  |
-                     ((uint32_t)u8data[3]);
-
-    txBuffer.id = WRITE_ID(canId);
-    txBuffer.dlc = CAN_TX_PAYLOAD_SIZE;
-
-    for (uint8_t i = 0; i < CAN_TX_PAYLOAD_SIZE; i++)
-    {
-        txBuffer.data[i] = u8data[i + 4];
-    }
-
-    bool result = CAN4_MessageTransmitFifo(1, &txBuffer);
-    if (!result)
-    {
-        SYS_CONSOLE_PRINT("Error: CAN4 message transmission failed!\r\n");
-    }
-    return result;
-}
-
-bool CAN5_Write(uint8_t *u8data, char i8len)
-{
-    CAN_TX_BUFFER txBuffer;
-    memset(&txBuffer, 0, sizeof(CAN_TX_BUFFER));
-
-    uint32_t canId = ((uint32_t)u8data[0] << 24) |
-                     ((uint32_t)u8data[1] << 16) |
-                     ((uint32_t)u8data[2] << 8)  |
-                     ((uint32_t)u8data[3]);
-
-    txBuffer.id = WRITE_ID(canId);
-    txBuffer.dlc = CAN_TX_PAYLOAD_SIZE;
-
-    for (uint8_t i = 0; i < CAN_TX_PAYLOAD_SIZE; i++)
-    {
-        txBuffer.data[i] = u8data[i + 4];
-    }
-
-    bool result = CAN5_MessageTransmitFifo(1, &txBuffer);
-    if (!result)
-    {
-        SYS_CONSOLE_PRINT("Error: CAN5 message transmission failed!\r\n");
-    }
-    return result;
-}
-/*
- * @brief Transmit received CAN messages over TCP
- * 
- * This function processes received CAN messages and transmits them over a TCP socket.
- * It ensures compliance with MISRA standards, including type safety, pointer arithmetic,
- * and avoiding potential run-time issues.
- * 
- * @param numberOfMessage Number of CAN messages to process
- * @param rxBuf Pointer to the received CAN buffer
- * @param rxBufLen Length of each received CAN message
- * @param sCanServerSocket TCP socket for transmission
- */
-void vCanRxMessageTxTCP(uint8_t numberOfMessage, CAN_RX_BUFFER *rxBuf, uint8_t rxBufLen, TCP_SOCKET sCanServerSocket)
-{
-    uint32_t id = 0;
-    uint8_t tcpBuffer[13U]; /* 1 byte header + 4 bytes CAN ID + 8 bytes CAN Data */
-
-    if ((rxBuf == NULL) || (numberOfMessage == 0U))
-    {
-        return; /* Prevent null pointer dereference and unnecessary execution */
-    }
-    for (uint8_t count = 0; count < numberOfMessage; count++)
-    {
-        id = rxBuf->xtd ? rxBuf->id : READ_ID(rxBuf->id);
-        id = swap_endian_32(id);/* Convert CAN ID to big-endian format */
-
-        /* Construct the extra byte (4 bits CAN type, 4 bits payload length) */
-        uint8_t headerByte = (rxBuf->xtd != 0U) ? 0x8U : 0x0U;
-        headerByte |= 0x8U; /* Payload length fixed to 8 bytes */
-
-        /* Copy header byte, CAN ID, and Data to buffer */
-        tcpBuffer[0] = headerByte;
-        (void)memcpy(&tcpBuffer[1], &id, sizeof(id));
-        (void)memcpy(&tcpBuffer[5], rxBuf->data, 8U);       
-        // Transmit over TCP if connected
-        if (TCPIP_TCP_IsConnected(sCanServerSocket))
-        {
-            TCPIP_TCP_ArrayPut(sCanServerSocket, tcpBuffer, sizeof(tcpBuffer));
-            TCPIP_TCP_Flush(sCanServerSocket);
-
-            // Debug Output
-//            SYS_CONSOLE_PRINT("Transmitting over Ethernet -> Header: 0x%x, CAN ID: 0x%x, Data: ", headerByte, (unsigned int)id);
-//            for (uint8_t i = 0; i < 8; i++)
-//            {
-//                SYS_CONSOLE_PRINT("0x%x ", rxBuf->data[i]);
-//            }
-//            SYS_CONSOLE_PRINT("\r\n");
-        }
-        rxBuf += rxBufLen;  // Move to next message after processing                
-    }
-}
-
-/**********************************************************************
- * @brief   Sends a UDP packet containing CAN message data
- * 
- * @param   ipAddress         Pointer to a string containing the destination IP address
- * @param   port              Pointer to a string containing the destination port number
- * @param   rxBuf             Pointer to the CAN receive buffer containing messages
- * @param   numberOfMessage   Number of CAN messages to send
- * 
- * @details This function converts a given IP address string into an IPV4 address,
- *          opens a UDP client socket, and transmits CAN messages over UDP.
- *          Each message includes a 1-byte header, a 4-byte CAN ID, and an 8-byte payload.
- **********************************************************************/
-void Send_UDP_Packet(const char* ipAddress, const char* port, CAN_RX_BUFFER *rxBuf, uint8_t numberOfMessage)
-{
-    IPV4_ADDR addr;          /* Structure to store the destination IP address */
-    uint16_t udpPort;        /* UDP port number */
-    UDP_SOCKET udpSocket;    /* UDP socket handle */
-    uint8_t tcpBuffer[13U];  /* Buffer for UDP payload: header + CAN ID + CAN data */
-    uint32_t id;             /* Variable to store the CAN ID */
-    uint8_t headerByte;      /* Header byte for UDP packet */
-    uint8_t count;           /* Loop counter */
-
-    /* Convert port string to integer */
-    udpPort = (uint16_t)atoi(port);
-
-    /* Convert string IP address to IPV4 address structure */
-    if (TCPIP_Helper_StringToIPAddress(ipAddress, &addr) == false)
-    {
-        SYS_CONSOLE_PRINT("Invalid IP address: %s\r\n", ipAddress);
-        return;  /* Exit function if IP address conversion fails */
-    }
-
-    /* Open a UDP client socket */
-    udpSocket = TCPIP_UDP_ClientOpen(IP_ADDRESS_TYPE_IPV4, udpPort, (IP_MULTI_ADDRESS*)&addr);
-    if (udpSocket == INVALID_SOCKET)
-    {
-        SYS_CONSOLE_PRINT("Failed to open UDP socket\r\n");
-        return;  /* Exit function if socket opening fails */
-    }
-
-    /* Loop through each CAN message */
-    for (count = 0U; count < numberOfMessage; count++)
-    {
-        /* Extract and convert CAN ID to big-endian format */
-        id = (rxBuf->xtd != 0U) ? rxBuf->id : READ_ID(rxBuf->id);
-        id = swap_endian_32(id);
-
-        /* Construct the extra byte (4 bits CAN type, 4 bits payload length) */
-        headerByte = (rxBuf->xtd != 0U) ? 0x8U : 0x0U;
-        headerByte |= 0x8U; /* Payload length fixed to 8 bytes */
-
-        /* Copy header byte, CAN ID, and data to the transmission buffer */
-        tcpBuffer[0] = headerByte;
-        (void)memcpy(&tcpBuffer[1], &id, sizeof(id));
-        (void)memcpy(&tcpBuffer[5], rxBuf->data, 8U);
-
-        /* Check if socket is ready before sending data */
-        if (TCPIP_UDP_PutIsReady(udpSocket) >= sizeof(tcpBuffer))
-        {
-            (void)TCPIP_UDP_ArrayPut(udpSocket, tcpBuffer, sizeof(tcpBuffer));
-            (void)TCPIP_UDP_Flush(udpSocket);
-            
-            SYS_CONSOLE_PRINT("UDP Packet sent to %s:%s -> CAN ID: 0x%x, Data: ", ipAddress, port, (unsigned int)id);
-
-            /* Print CAN message data */
-            for (uint8_t i = 0U; i < 8U; i++)
-            {
-                SYS_CONSOLE_PRINT("0x%x ", rxBuf->data[i]);
-            }
-            SYS_CONSOLE_PRINT("\r\n");
-        }
-        else
-        {
-            SYS_CONSOLE_PRINT("UDP socket not ready for sending\r\n");
-        }
-
-        rxBuf++; /* Move to the next CAN message */
-    }
-
-    /* Close the UDP socket after transmitting all messages */
-    TCPIP_UDP_Close(udpSocket);
 }
 
 /**
@@ -497,801 +259,337 @@ void Send_UDP_Packet(const char* ipAddress, const char* port, CAN_RX_BUFFER *rxB
  * 
  * @param[in] pvParameters Pointer to task parameters (unused).
  */
-void vCan0HandlerServerTask(void *pvParameters) 
+
+void vCan0HandlerServerTask(void *pvParameters)
 {
+    (void)pvParameters; // Unused parameter
     SYS_CONSOLE_PRINT("In Function: %s\r\n", __FUNCTION__);
+    while (true)
+    {
+        CAN_RX_BUFFER canRxBuffer = {0};
+        CAN_TX_BUFFER canTxBuffer = {0};
 
-    while (true) {
-        #if HEV_IO_Aggregator
-            /* Handle TCP connection for CAN0 Server */
-            if (TCPIP_TCP_IsConnected(sCan0ServerSocket)) {
-                int16_t bytesRead = TCPIP_TCP_ArrayGet(sCan0ServerSocket, u8CAN0buffer, sizeof(u8CAN0buffer));
-                /* Check if data was received */
-                if (bytesRead > 0) {
-                    SYS_CONSOLE_PRINT("Got Data on CAN0 Server Handler - Data Send to CAN0\r\n");
-                    CAN_Write(0,(uint8_t*)u8CAN0buffer, (uint8_t)bytesRead);
-//                    CAN0_Write((uint8_t*)u8CAN0buffer, (uint8_t)bytesRead);
-                }
-                /* Handle disconnection scenarios */
-                if (!TCPIP_TCP_IsConnected(sCan0ServerSocket) || TCPIP_TCP_WasDisconnected(sCan0ServerSocket)) {
-                    SYS_CONSOLE_PRINT("\r\nTCP Connection Closed\r\n");
-                    TCPIP_TCP_Close(sCan0ServerSocket);
-                    sCan0ServerSocket = INVALID_SOCKET;
-                }
-            }
-
-            /* Reconnection logic if socket is invalid */
-            if (sCan0ServerSocket == INVALID_SOCKET) {
-                sCan0ServerSocket = TCPIP_TCP_ServerOpen(IP_ADDRESS_TYPE_IPV4, writeData.canPorts[0], 0);
-
-                if (sCan0ServerSocket == INVALID_SOCKET) {
-                    SYS_CONSOLE_PRINT("Failed to reopen CAN0 socket, retrying...\r\n");
-                } 
-                vTaskDelay(RECONNECT_DELAY_MS);
-            }
-            /* Process CAN0 queue messages and transmit via TCP */
-            xSemaphoreTake(xCan0QueueMutex, portMAX_DELAY);
-            if (xQueueReceive(xCAN0QueueHandler, &u8CAN0QueueBuffer, (TickType_t) 10) == pdPASS) {
-                vCanRxMessageTxTCP(1, (CAN_RX_BUFFER*)&u8CAN0QueueBuffer, sizeof(CAN_RX_BUFFER), sCan0ServerSocket);                
-            }
-            xSemaphoreGive(xCan0QueueMutex);            
-        #elif Two_Wheeler_IO_Aggregator
-            /* Handle UDP connection for CAN0 Server */
-            if (TCPIP_UDP_IsConnected(sCan0ServerSocket)) {
-                int16_t bytesRead = TCPIP_UDP_ArrayGet(sCan0ServerSocket, u8CAN0buffer, sizeof(u8CAN0buffer));
-                /* Check if data was received */
-                if (bytesRead > 0) {
-                    SYS_CONSOLE_PRINT("Got Data on CAN0 Server Handler - Data Send to CAN0\r\n");
-//                    CAN0_Write((uint8_t*)u8CAN0buffer, (uint8_t)bytesRead);
-                    CAN_Write(0,(uint8_t*)u8CAN0buffer, (uint8_t)bytesRead);
-                }
-            }
-            /* Reconnection logic if socket is invalid */
-            if (sCan0ServerSocket == INVALID_SOCKET) {
-                sCan0ServerSocket = TCPIP_UDP_ServerOpen(IP_ADDRESS_TYPE_IPV4, CAN0_SERVER_PORT, 0);
-
-                if (sCan0ServerSocket == INVALID_SOCKET) {
-                    SYS_CONSOLE_PRINT("Failed to reopen CAN0 socket, retrying...\r\n");
-                } 
-                vTaskDelay(RECONNECT_DELAY_MS);
-            }
-            /* Process CAN0 queue messages and transmit via UDP */
-            if( xQueueReceive(xCAN0QueueHandler, &u8CAN0QueueBuffer, (TickType_t) 10) == pdPASS )
+        // -----------------------------
+        // Handle CAN TX Queue
+        // -----------------------------
+        if (xSemaphoreTake(xCan0TXQueueMutex, pdMS_TO_TICKS(10)) == pdTRUE)
+        {
+            if (xQueueReceive(xCAN0TXQueueHandler, &canTxBuffer, 0) == pdPASS)
             {
-//                vCanRxMessageTxTCP_UDP(1, (CAN_RX_BUFFER*)&u8CAN0QueueBuffer, sizeof(CAN_RX_BUFFER), sCan0ServerSocket); 
-//                vCanRxMessageTx_UDP(1, (CAN_RX_BUFFER*)&u8CAN0QueueBuffer, sizeof(CAN_RX_BUFFER), sCan0ServerSocket);
-                Send_UDP_Packet(CCU_IP_ADDRESS, CAN0_CCU_PORT, (CAN_RX_BUFFER*)u8CAN0QueueBuffer, 1);
-            } 
-            
-        #endif
-        vTaskDelay(10); // Add a small delay to avoid consuming too much CPU time
+                if (!CAN0_Write(&canTxBuffer))
+                {
+                    SYS_CONSOLE_PRINT("CAN0: Write failed\r\n");
+                }
+            }
+
+            xSemaphoreGive(xCan0TXQueueMutex);
+        }
+
+        // -----------------------------
+        // 2. Handle CAN RX Queue
+        // -----------------------------
+        if (xSemaphoreTake(xCan0RXQueueMutex, pdMS_TO_TICKS(10)) == pdPASS)
+        {
+            if (xQueueReceive(xCAN0RXQueueHandler, &canRxBuffer, 0) == pdPASS)
+            {
+                vProcessCanRxMessage(&canRxBuffer, CANBUS_0); // Process received CAN message for CAN0
+            }
+            xSemaphoreGive(xCan0RXQueueMutex);
+        }
+
+        // -----------------------------
+        // 3. Small delay to yield CPU
+        // -----------------------------
+        vTaskDelay(pdMS_TO_TICKS(CAN_TASK_DELAY));
     }
 }
 
-/**
- * @brief CAN1 Server Task
- * 
- * This FreeRTOS task handles TCP/UDP communication for CAN1.
- * It manages incoming connections, reads data from the socket,
- * transmits it to the CAN bus, and processes CAN queue messages
- * to send over the network. The task also ensures reconnection
- * if the socket is closed or disconnected.
- * 
- * @param[in] pvParameters Pointer to task parameters (unused).
- */
-void vCan1HandlerServerTask(void *pvParameters) {
+void vCan1HandlerServerTask(void *pvParameters)
+{
+    (void)pvParameters; // Unused parameter
     SYS_CONSOLE_PRINT("In Function: %s\r\n", __FUNCTION__);
 
-    while (true) {
-        #if HEV_IO_Aggregator
-            // CAN1 Server Handling
-            if (TCPIP_TCP_IsConnected(sCan1ServerSocket)) {
-                int16_t bytesRead = TCPIP_TCP_ArrayGet(sCan1ServerSocket, u8CAN1buffer, sizeof(u8CAN1buffer));
+    while (true)
+    {
+        CAN_RX_BUFFER canRxBuffer = {0};
+        CAN_TX_BUFFER canTxBuffer = {0};
 
-                if (bytesRead > 0) {
-                    SYS_CONSOLE_PRINT("Got Data on CAN1 Server Handler - Data Send to CAN1\r\n");
-//                    CAN1_Write((uint8_t*)u8CAN1buffer, (uint8_t)bytesRead);
-                    CAN_Write(1,(uint8_t*)u8CAN1buffer, (uint8_t)bytesRead);
-                }
-
-                if (!TCPIP_TCP_IsConnected(sCan1ServerSocket) || TCPIP_TCP_WasDisconnected(sCan1ServerSocket)) {
-                    SYS_CONSOLE_PRINT("\r\nTCP Connection Closed\r\n");
-                    TCPIP_TCP_Close(sCan1ServerSocket);
-                    sCan1ServerSocket = INVALID_SOCKET;
-                }
-            }
-
-            // Ensure reconnection logic is handled correctly
-            if (sCan1ServerSocket == INVALID_SOCKET) {
-                sCan1ServerSocket = TCPIP_TCP_ServerOpen(IP_ADDRESS_TYPE_IPV4, writeData.canPorts[1], 0);
-
-                if (sCan1ServerSocket == INVALID_SOCKET) {
-                    SYS_CONSOLE_PRINT("Failed to reopen CAN1 socket, retrying...\r\n");
-                } 
-                vTaskDelay(RECONNECT_DELAY_MS);
-            }
-            xSemaphoreTake(xCan1QueueMutex, portMAX_DELAY);
-            if (xQueueReceive(xCAN1QueueHandler, &u8CAN1QueueBuffer, (TickType_t) 10) == pdPASS) {
-                vCanRxMessageTxTCP(1, (CAN_RX_BUFFER*)&u8CAN1QueueBuffer, sizeof(CAN_RX_BUFFER), sCan1ServerSocket);                
-            }
-            xSemaphoreGive(xCan1QueueMutex);   
-        #elif Two_Wheeler_IO_Aggregator
-            if (TCPIP_UDP_IsConnected(sCan1ServerSocket)) {
-                int16_t bytesRead = TCPIP_UDP_ArrayGet(sCan1ServerSocket, u8CAN1buffer, sizeof(u8CAN1buffer));
-                if (bytesRead > 0) {
-                    SYS_CONSOLE_PRINT("Got Data on CAN1 Server Handler - Data Send to CAN1\r\n");
-//                    CAN1_Write((uint8_t*)u8CAN1buffer, (uint8_t)bytesRead);
-                    CAN_Write(1,(uint8_t*)u8CAN1buffer, (uint8_t)bytesRead);
-                }
-            }
-            // Ensure reconnection logic is handled correctly
-            if (sCan1ServerSocket == INVALID_SOCKET) {
-                sCan1ServerSocket = TCPIP_UDP_ServerOpen(IP_ADDRESS_TYPE_IPV4, CAN1_SERVER_PORT, 0);
-
-                if (sCan1ServerSocket == INVALID_SOCKET) {
-                    SYS_CONSOLE_PRINT("Failed to reopen CAN1 socket, retrying...\r\n");
-                } 
-                vTaskDelay(RECONNECT_DELAY_MS);
-            }
-            if( xQueueReceive(xCAN1QueueHandler, &u8CAN1QueueBuffer, (TickType_t) 10) == pdPASS )
+        // -----------------------------
+        // Handle CAN TX Queue
+        // -----------------------------
+        if (xSemaphoreTake(xCan1TXQueueMutex, pdMS_TO_TICKS(10)) == pdTRUE)
+        {
+            if (xQueueReceive(xCAN1TXQueueHandler, &canTxBuffer, 0) == pdPASS)
             {
-                Send_UDP_Packet(CCU_IP_ADDRESS, CAN1_MIRROR1_PORT, (CAN_RX_BUFFER*)u8CAN1QueueBuffer, 1);
-                Send_UDP_Packet(CCU_IP_ADDRESS, CAN1_MIRROR2_PORT, (CAN_RX_BUFFER*)u8CAN1QueueBuffer, 1);
-                Send_UDP_Packet(CCU_IP_ADDRESS, CAN1_MIRROR3_PORT, (CAN_RX_BUFFER*)u8CAN1QueueBuffer, 1);
-            }                         
-        #endif
+                if (!CAN1_Write(&canTxBuffer))
+                {
+                    SYS_CONSOLE_PRINT("CAN1: Write failed\r\n");
+                }
+            }
 
-        vTaskDelay(10); // Add a small delay to avoid consuming too much CPU time
+            xSemaphoreGive(xCan1TXQueueMutex);
+        }
+
+        // -----------------------------
+        // Handle CAN RX Queue
+        // -----------------------------
+        if (xSemaphoreTake(xCan1RXQueueMutex, pdMS_TO_TICKS(10)) == pdTRUE)
+        {
+            if (xQueueReceive(xCAN1RXQueueHandler, &canRxBuffer, 0) == pdPASS)
+            {
+                vProcessCanRxMessage(&canRxBuffer, CANBUS_1); // Process received CAN message for CAN1
+            }
+
+            xSemaphoreGive(xCan1RXQueueMutex);
+        }
+
+        // -----------------------------
+        // Small delay to yield CPU
+        // -----------------------------
+        vTaskDelay(pdMS_TO_TICKS(CAN_TASK_DELAY));
     }
 }
 
-/**
- * @brief CAN2 Server Task
- * 
- * This FreeRTOS task handles TCP/UDP communication for CAN2.
- * It manages incoming connections, reads data from the socket,
- * transmits it to the CAN bus, and processes CAN queue messages
- * to send over the network. The task also ensures reconnection
- * if the socket is closed or disconnected.
- * 
- * @param[in] pvParameters Pointer to task parameters (unused).
- */
-void vCan2HandlerServerTask(void *pvParameters) {
-    SYS_CONSOLE_PRINT("In Function: %s\r\n", __FUNCTION__);
-    
-    while (true) {
-        #if HEV_IO_Aggregator
-           if (TCPIP_TCP_IsConnected(sCan2ServerSocket)) {
-                int16_t bytesRead = TCPIP_TCP_ArrayGet(sCan2ServerSocket, u8CAN2buffer, sizeof(u8CAN2buffer));
-
-                if (bytesRead >= 12) {  // Expecting at least 4 bytes CAN ID + 8 bytes CAN Data
-                    SYS_CONSOLE_PRINT("Got Data on CAN2 Server Handler - Data Send to CAN2\r\n");
-//                    CAN2_Write((uint8_t*)u8CAN2buffer, (uint8_t)bytesRead);
-                    CAN_Write(2,(uint8_t*)u8CAN2buffer, (uint8_t)bytesRead);
-                }
-
-                // Handle TCP connection loss
-                if (!TCPIP_TCP_IsConnected(sCan2ServerSocket) || TCPIP_TCP_WasDisconnected(sCan2ServerSocket)) {
-                    SYS_CONSOLE_PRINT("\r\nCAN2 TCP Connection Closed\r\n");
-                    TCPIP_TCP_Close(sCan2ServerSocket);
-                    sCan2ServerSocket = INVALID_SOCKET;
-                }
-            }                       
-            // Ensure reconnection logic is handled correctly
-            if (sCan2ServerSocket == INVALID_SOCKET) {
-                // Attempt to open the socket again
-                sCan2ServerSocket = TCPIP_TCP_ServerOpen(IP_ADDRESS_TYPE_IPV4, writeData.canPorts[2], 0);
-
-                if (sCan2ServerSocket == INVALID_SOCKET) {
-                    SYS_CONSOLE_PRINT("Failed to reopen CAN2 socket, retrying...\r\n");
-                }
-                vTaskDelay(RECONNECT_DELAY_MS);
-            }
-            xSemaphoreTake(xCan2QueueMutex, portMAX_DELAY);
-            if (xQueueReceive(xCAN2QueueHandler, &u8CAN2QueueBuffer, (TickType_t) 10) == pdPASS) {
-                vCanRxMessageTxTCP(1, (CAN_RX_BUFFER*)&u8CAN2QueueBuffer, sizeof(CAN_RX_BUFFER), sCan2ServerSocket);                
-            }
-            xSemaphoreGive(xCan2QueueMutex);           
-        #elif Two_Wheeler_IO_Aggregator
-            if (TCPIP_UDP_IsConnected(sCan2ServerSocket)) {
-                int16_t bytesRead = TCPIP_UDP_ArrayGet(sCan2ServerSocket, u8CAN2buffer, sizeof(u8CAN2buffer));
-                if (bytesRead > 0) {
-                    SYS_CONSOLE_PRINT("Got Data on CAN2 Server Handler - Data Send to CAN2\r\n");
-//                    CAN2_Write((uint8_t*)u8CAN2buffer, (uint8_t)bytesRead);
-                    CAN_Write(2,(uint8_t*)u8CAN2buffer, (uint8_t)bytesRead);
-                }
-            }
-            // Ensure reconnection logic is handled correctly
-            if (sCan2ServerSocket == INVALID_SOCKET) {
-                sCan2ServerSocket = TCPIP_UDP_ServerOpen(IP_ADDRESS_TYPE_IPV4, CAN2_SERVER_PORT, 0);
-
-                if (sCan2ServerSocket == INVALID_SOCKET) {
-                    SYS_CONSOLE_PRINT("Failed to reopen CAN2 socket, retrying...\r\n");
-                } 
-                vTaskDelay(RECONNECT_DELAY_MS);
-            }
-            if( xQueueReceive(xCAN2QueueHandler, &u8CAN2QueueBuffer, (TickType_t) 10) == pdPASS )
-            {
-                Send_UDP_Packet(CCU_IP_ADDRESS, CAN2_MIRROR1_PORT, (CAN_RX_BUFFER*)u8CAN2QueueBuffer, 1);
-                Send_UDP_Packet(CCU_IP_ADDRESS, CAN2_MIRROR2_PORT, (CAN_RX_BUFFER*)u8CAN2QueueBuffer, 1);
-                Send_UDP_Packet(CCU_IP_ADDRESS, CAN2_MIRROR3_PORT, (CAN_RX_BUFFER*)u8CAN2QueueBuffer, 1);              
-            }                       
-        #endif
-        
-        vTaskDelay(10); // Add a small delay to avoid consuming too much CPU time
-    }
-}
-
-/**
- * @brief CAN3 Server Task
- * 
- * This FreeRTOS task handles TCP/UDP communication for CAN3.
- * It manages incoming connections, reads data from the socket,
- * transmits it to the CAN bus, and processes CAN queue messages
- * to send over the network. The task also ensures reconnection
- * if the socket is closed or disconnected.
- * 
- * @param[in] pvParameters Pointer to task parameters (unused).
- */
-void vCan3HandlerServerTask(void *pvParameters) {
+void vCan2HandlerServerTask(void *pvParameters)
+{
+    (void)pvParameters; // Unused parameter
     SYS_CONSOLE_PRINT("In Function: %s\r\n", __FUNCTION__);
 
-    while (true) {
-        #if HEV_IO_Aggregator
-            // CAN3 Server Handling
-            if (TCPIP_TCP_IsConnected(sCan3ServerSocket)) {
-                int16_t bytesRead = TCPIP_TCP_ArrayGet(sCan3ServerSocket, u8CAN3buffer, sizeof(u8CAN3buffer));
+    while (true)
+    {
+        CAN_RX_BUFFER canRxBuffer = {0};
+        CAN_TX_BUFFER canTxBuffer = {0};
 
-                if (bytesRead > 0) {
-                    SYS_CONSOLE_PRINT("Got Data on CAN3 Server Handler - Data Send to CAN3\r\n");
-//                    CAN3_Write((uint8_t*)u8CAN3buffer, (uint8_t)bytesRead);
-                    CAN_Write(3,(uint8_t*)u8CAN3buffer, (uint8_t)bytesRead);
-                }
-
-                if (!TCPIP_TCP_IsConnected(sCan3ServerSocket) || TCPIP_TCP_WasDisconnected(sCan3ServerSocket)) {
-                    SYS_CONSOLE_PRINT("\r\nTCP Connection Closed\r\n");
-                    TCPIP_TCP_Close(sCan3ServerSocket);
-                    sCan3ServerSocket = INVALID_SOCKET;
-                }
-            }
-
-            // Ensure reconnection logic is handled correctly
-            if (sCan3ServerSocket == INVALID_SOCKET) {
-                sCan3ServerSocket = TCPIP_TCP_ServerOpen(IP_ADDRESS_TYPE_IPV4, writeData.canPorts[3], 0);
-
-                if (sCan3ServerSocket == INVALID_SOCKET) {
-                    SYS_CONSOLE_PRINT("Failed to reopen CAN3 socket, retrying...\r\n");
-                } 
-                vTaskDelay(RECONNECT_DELAY_MS);
-            }
-            xSemaphoreTake(xCan3QueueMutex, portMAX_DELAY);
-            if (xQueueReceive(xCAN3QueueHandler, &u8CAN3QueueBuffer, (TickType_t) 10) == pdPASS) {
-                vCanRxMessageTxTCP(1, (CAN_RX_BUFFER*)&u8CAN3QueueBuffer, sizeof(CAN_RX_BUFFER), sCan3ServerSocket);                
-            }
-            xSemaphoreGive(xCan3QueueMutex);             
-        #elif Two_Wheeler_IO_Aggregator
-            if (TCPIP_UDP_IsConnected(sCan3ServerSocket)) {
-                int16_t bytesRead = TCPIP_UDP_ArrayGet(sCan3ServerSocket, u8CAN3buffer, sizeof(u8CAN3buffer));
-                if (bytesRead > 0) {
-                    SYS_CONSOLE_PRINT("Got Data on CAN3 Server Handler - Data Send to CAN3\r\n");
-//                    CAN3_Write((uint8_t*)u8CAN3buffer, (uint8_t)bytesRead);
-                    CAN_Write(3,(uint8_t*)u8CAN3buffer, (uint8_t)bytesRead);
-                }
-            }
-            // Ensure reconnection logic is handled correctly
-            if (sCan3ServerSocket == INVALID_SOCKET) {
-                sCan3ServerSocket = TCPIP_UDP_ServerOpen(IP_ADDRESS_TYPE_IPV4, CAN3_SERVER_PORT, 0);
-
-                if (sCan3ServerSocket == INVALID_SOCKET) {
-                    SYS_CONSOLE_PRINT("Failed to reopen CAN3 socket, retrying...\r\n");
-                } 
-                vTaskDelay(RECONNECT_DELAY_MS);
-            }
-            if( xQueueReceive(xCAN3QueueHandler, &u8CAN3QueueBuffer, (TickType_t) 10) == pdPASS )
+        // -----------------------------
+        // Handle CAN TX Queue
+        // -----------------------------
+        if (xSemaphoreTake(xCan2TXQueueMutex, pdMS_TO_TICKS(10)) == pdTRUE)
+        {
+            if (xQueueReceive(xCAN2TXQueueHandler, &canTxBuffer, 0) == pdPASS)
             {
-                Send_UDP_Packet(CCU_IP_ADDRESS, CAN3_MIRROR1_PORT, (CAN_RX_BUFFER*)u8CAN3QueueBuffer, 1);
-                Send_UDP_Packet(CCU_IP_ADDRESS, CAN3_MIRROR2_PORT, (CAN_RX_BUFFER*)u8CAN3QueueBuffer, 1);
-                Send_UDP_Packet(CCU_IP_ADDRESS, CAN3_MIRROR3_PORT, (CAN_RX_BUFFER*)u8CAN3QueueBuffer, 1);                
-            }                         
-        #endif
+                if (!CAN2_Write(&canTxBuffer))
+                {
+                    SYS_CONSOLE_PRINT("CAN2: Write failed\r\n");
+                }
+            }
 
-        vTaskDelay(10); // Add a small delay to avoid consuming too much CPU time
+            xSemaphoreGive(xCan2TXQueueMutex);
+        }
+
+        // -----------------------------
+        // Handle CAN RX Queue
+        // -----------------------------
+        if (xSemaphoreTake(xCan2RXQueueMutex, pdMS_TO_TICKS(10)) == pdTRUE)
+        {
+            if (xQueueReceive(xCAN2RXQueueHandler, &canRxBuffer, 0) == pdPASS)
+            {
+                vProcessCanRxMessage(&canRxBuffer, CANBUS_2); // Process received CAN message for CAN2
+            }
+
+            xSemaphoreGive(xCan2RXQueueMutex);
+        }
+
+        // -----------------------------
+        // Small delay to yield CPU
+        // -----------------------------
+        vTaskDelay(pdMS_TO_TICKS(CAN_TASK_DELAY));
     }
 }
-
-/**
- * @brief CAN4 Server Task
- * 
- * This FreeRTOS task handles TCP/UDP communication for CAN4.
- * It manages incoming connections, reads data from the socket,
- * transmits it to the CAN bus, and processes CAN queue messages
- * to send over the network. The task also ensures reconnection
- * if the socket is closed or disconnected.
- * 
- * @param[in] pvParameters Pointer to task parameters (unused).
- */
-void vCan4HandlerServerTask(void *pvParameters) {
-    SYS_CONSOLE_PRINT("In Function: %s\r\n", __FUNCTION__);
-
-    while (true) {
-        #if HEV_IO_Aggregator
-            // CAN4 Server Handling
-            if (TCPIP_TCP_IsConnected(sCan4ServerSocket)) {
-                int16_t bytesRead = TCPIP_TCP_ArrayGet(sCan4ServerSocket, u8CAN4buffer, sizeof(u8CAN4buffer));
-
-                if (bytesRead > 0) {
-                    SYS_CONSOLE_PRINT("Got Data on CAN4 Server Handler - Data Send to CAN4\r\n");
-//                    CAN4_Write((uint8_t*)u8CAN4buffer, (uint8_t)bytesRead);
-                    CAN_Write(4,(uint8_t*)u8CAN4buffer, (uint8_t)bytesRead);
-                }
-
-                if (!TCPIP_TCP_IsConnected(sCan4ServerSocket) || TCPIP_TCP_WasDisconnected(sCan4ServerSocket)) {
-                    SYS_CONSOLE_PRINT("\r\nTCP Connection Closed\r\n");
-                    TCPIP_TCP_Close(sCan4ServerSocket);
-                    sCan4ServerSocket = INVALID_SOCKET;
-                }
-            }
-
-            // Ensure reconnection logic is handled correctly
-            if (sCan4ServerSocket == INVALID_SOCKET) {
-                sCan4ServerSocket = TCPIP_TCP_ServerOpen(IP_ADDRESS_TYPE_IPV4, writeData.canPorts[4], 0);
-
-                if (sCan4ServerSocket == INVALID_SOCKET) {
-                    SYS_CONSOLE_PRINT("Failed to reopen CAN4 socket, retrying...\r\n");
-                } 
-                vTaskDelay(RECONNECT_DELAY_MS);
-            }
-            xSemaphoreTake(xCan4QueueMutex, portMAX_DELAY);
-            if (xQueueReceive(xCAN4QueueHandler, &u8CAN4QueueBuffer, (TickType_t) 10) == pdPASS) {
-                vCanRxMessageTxTCP(1, (CAN_RX_BUFFER*)&u8CAN4QueueBuffer, sizeof(CAN_RX_BUFFER), sCan4ServerSocket);                
-            }
-            xSemaphoreGive(xCan4QueueMutex);             
-        #elif Two_Wheeler_IO_Aggregator
-            if (TCPIP_UDP_IsConnected(sCan4ServerSocket)) {
-                int16_t bytesRead = TCPIP_UDP_ArrayGet(sCan4ServerSocket, u8CAN4buffer, sizeof(u8CAN4buffer));
-                if (bytesRead > 0) {
-                    SYS_CONSOLE_PRINT("Got Data on CAN4 Server Handler - Data Send to CAN4\r\n");
-//                    CAN4_Write((uint8_t*)u8CAN4buffer, (uint8_t)bytesRead);
-                    CAN_Write(4,(uint8_t*)u8CAN4buffer, (uint8_t)bytesRead);
-                }
-            }
-            // Ensure reconnection logic is handled correctly
-            if (sCan4ServerSocket == INVALID_SOCKET) {
-                sCan4ServerSocket = TCPIP_UDP_ServerOpen(IP_ADDRESS_TYPE_IPV4, CAN4_SERVER_PORT, 0);
-
-                if (sCan4ServerSocket == INVALID_SOCKET) {
-                    SYS_CONSOLE_PRINT("Failed to reopen CAN0 socket, retrying...\r\n");
-                } 
-                vTaskDelay(RECONNECT_DELAY_MS);
-            }
-            if( xQueueReceive(xCAN4QueueHandler, &u8CAN4QueueBuffer, (TickType_t) 10) == pdPASS )
-            {
-//                vCanRxMessageTxTCP_UDP(1, (CAN_RX_BUFFER*)&u8CAN4QueueBuffer, sizeof(CAN_RX_BUFFER), sCan4ServerSocket);               
-            }             
-        #endif
-
-        vTaskDelay(10); // Add a small delay to avoid consuming too much CPU time
-    }
-}
-
-/**
- * @brief CAN5 Server Task
- * 
- * This FreeRTOS task handles TCP/UDP communication for CAN5.
- * It manages incoming connections, reads data from the socket,
- * transmits it to the CAN bus, and processes CAN queue messages
- * to send over the network. The task also ensures reconnection
- * if the socket is closed or disconnected.
- * 
- * @param[in] pvParameters Pointer to task parameters (unused).
- */
-void vCan5HandlerServerTask(void *pvParameters) {
-    SYS_CONSOLE_PRINT("In Function: %s\r\n", __FUNCTION__);
-    
-    while (true) {
-        #if HEV_IO_Aggregator
-            // CAN5 Server Handling
-            if (TCPIP_TCP_IsConnected(sCan5ServerSocket)) {
-                int16_t bytesRead = TCPIP_TCP_ArrayGet(sCan5ServerSocket, u8CAN5buffer, sizeof(u8CAN5buffer));
-
-                if (bytesRead > 0) {
-                    SYS_CONSOLE_PRINT("Got Data on CAN5 Server Handler - Data Send to CAN5\r\n");
-//                    CAN5_Write((uint8_t*)u8CAN5buffer, (uint8_t)bytesRead);
-                    CAN_Write(5,(uint8_t*)u8CAN5buffer, (uint8_t)bytesRead);
-                }
-
-                if (!TCPIP_TCP_IsConnected(sCan5ServerSocket) || TCPIP_TCP_WasDisconnected(sCan5ServerSocket)) {
-                    SYS_CONSOLE_PRINT("\r\nTCP Connection Closed\r\n");
-                    TCPIP_TCP_Close(sCan5ServerSocket);
-                    sCan5ServerSocket = INVALID_SOCKET;
-                }
-            }
-
-            // Ensure reconnection logic is handled correctly
-            if (sCan5ServerSocket == INVALID_SOCKET) {
-                sCan5ServerSocket = TCPIP_TCP_ServerOpen(IP_ADDRESS_TYPE_IPV4, writeData.canPorts[5], 0);
-
-                if (sCan5ServerSocket == INVALID_SOCKET) {
-                    SYS_CONSOLE_PRINT("Failed to reopen CAN5 socket, retrying...\r\n");
-                }
-                vTaskDelay(RECONNECT_DELAY_MS);
-            } 
-            xSemaphoreTake(xCan5QueueMutex, portMAX_DELAY);
-            if( xQueueReceive(xCAN5QueueHandler, &u8CAN5QueueBuffer, (TickType_t) 10) == pdPASS ) {
-                vCanRxMessageTxTCP(1, (CAN_RX_BUFFER*)&u8CAN5QueueBuffer, sizeof(CAN_RX_BUFFER), sCan5ServerSocket);               
-            }
-            xSemaphoreGive(xCan5QueueMutex);             
-        #elif Two_Wheeler_IO_Aggregator
-            if (TCPIP_UDP_IsConnected(sCan5ServerSocket)) {
-                int16_t bytesRead = TCPIP_UDP_ArrayGet(sCan5ServerSocket, u8CAN5buffer, sizeof(u8CAN5buffer));
-                if (bytesRead > 0) {
-                    SYS_CONSOLE_PRINT("Got Data on CAN5 Server Handler - Data Send to CAN5\r\n");
-//                    CAN5_Write((uint8_t*)u8CAN5buffer, (uint8_t)bytesRead);
-                    CAN_Write(5,(uint8_t*)u8CAN5buffer, (uint8_t)bytesRead);
-                }
-            }
-            // Ensure reconnection logic is handled correctly
-            if (sCan5ServerSocket == INVALID_SOCKET) {
-                sCan5ServerSocket = TCPIP_UDP_ServerOpen(IP_ADDRESS_TYPE_IPV4, CAN5_SERVER_PORT, 0);
-
-                if (sCan5ServerSocket == INVALID_SOCKET) {
-                    SYS_CONSOLE_PRINT("Failed to reopen CAN5 socket, retrying...\r\n");
-                } 
-                vTaskDelay(RECONNECT_DELAY_MS);
-            }
-            if( xQueueReceive(xCAN5QueueHandler, &u8CAN5QueueBuffer, (TickType_t) 10) == pdPASS )
-            {
-//                vCanRxMessageTxTCP_UDP(1, (CAN_RX_BUFFER*)&u8CAN5QueueBuffer, sizeof(CAN_RX_BUFFER), sCan5ServerSocket);                
-            }             
-        #endif
-        
-        vTaskDelay(10); // Add a small delay to avoid consuming too much CPU time
-    }
-}
-
-static void vDisplayCanRxMessage(uint8_t numberOfMessage, CAN_RX_BUFFER *rxBuf, uint8_t rxBufLen)
+static void vDisplayCanRxMessage(CAN_RX_BUFFER *rxBuf, uint8_t rxBufLen)
 {
     uint8_t length = 0;
     uint8_t msgLength = 0;
     uint32_t id = 0;
-
-    for (uint8_t count = 0; count < numberOfMessage; count++)
+    id = rxBuf->xtd ? rxBuf->id : READ_ID(rxBuf->id);
+    msgLength = rxBuf->dlc;
+    length = msgLength;
+    SYS_CONSOLE_PRINT(" Message - ID : 0x%x Length : 0x%x ", (unsigned int)id, (unsigned int)msgLength);
+    SYS_CONSOLE_PRINT("Message : ");
+    while (length)
     {
-        id = rxBuf->xtd ? rxBuf->id : READ_ID(rxBuf->id);
-        msgLength = rxBuf->dlc;
-        length = msgLength;
-        SYS_CONSOLE_PRINT(" Message - ID : 0x%x Length : 0x%x ", (unsigned int)id, (unsigned int)msgLength);
-        SYS_CONSOLE_PRINT("Message : ");
-        while(length)
-        {
-            SYS_CONSOLE_PRINT("0x%x ", rxBuf->data[msgLength - length--]);
-        }
-        SYS_CONSOLE_PRINT("\r\n");
-        rxBuf += rxBufLen;
+        SYS_CONSOLE_PRINT("0x%x ", rxBuf->data[msgLength - length--]);
+    }
+    SYS_CONSOLE_PRINT("\r\n");
+}
+static void vDisplayCanErrorStatus(uint32_t status, const char *canName)
+{
+    SYS_CONSOLE_PRINT("%s status: 0x%08lX\r\n", canName, (unsigned long)status);
+
+    switch (status & CAN_PSR_LEC_Msk)
+    {
+        case 1: SYS_CONSOLE_PRINT("%s: Stuff error\n", canName); break;
+        case 2: SYS_CONSOLE_PRINT("%s: Form error\n", canName); break;
+        case 3: SYS_CONSOLE_PRINT("%s: ACK error\n", canName); break;
+        case 4: SYS_CONSOLE_PRINT("%s: Bit-1 error\n", canName); break;
+        case 5: SYS_CONSOLE_PRINT("%s: Bit-0 error\n", canName); break;
+        case 6: SYS_CONSOLE_PRINT("%s: CRC error\n", canName); break;
+        case 7: SYS_CONSOLE_PRINT("%s: LEC unchanged\n", canName); break;
+        default: break;
+    }
+
+    if (status & CAN_PSR_BO_Msk)
+    {
+        SYS_CONSOLE_PRINT("%s: Bus-Off state detected\r\n", canName);
     }
 }
 
-void vCanRxHandlerTask(void *pvParameters) {
-    uint8_t numberOfMessage = 0; 
-    
-    while(true) {       
+static inline bool CAN_IsRxOK(uint32_t status)
+{
+    uint32_t lec = status & CAN_PSR_LEC_Msk;
+    return (lec == CAN_ERROR_NONE) || (lec == CAN_ERROR_LEC_NC);
+}
+
+void vCanRxHandlerTask(void *pvParameters)
+{
+    while (true)
+    {
         if (CAN0_InterruptGet(CAN_INTERRUPT_RF0N_MASK))
-        {    
+        {
             CAN0_InterruptClear(CAN_INTERRUPT_RF0N_MASK);
 
-            /* Check CAN Status */
-            status = CAN0_ErrorGet();
-            /* Decode and print it */
-            SYS_CONSOLE_PRINT("CAN0 status: 0x%08lX\r\n", (unsigned long)status);
-            /* -------- Last-Error-Code (LEC) field -------- */
-            switch (status & 0x7u)
-            {
-//                case 0: SYS_CONSOLE_PRINT("  ? No error\n"); break;
-                case 1: SYS_CONSOLE_PRINT("  ? Stuff error\n"); ReportError(ERR_CAN1_STUFF); break;
-                case 2: SYS_CONSOLE_PRINT("  ? Form error\n"); break;
-                case 3: SYS_CONSOLE_PRINT("  ? ACK error\n"); ReportError(ERR_CAN1_ACK); break;
-                case 4: SYS_CONSOLE_PRINT("  ? Bit-1 error (recessive expected)\n"); break;
-                case 5: SYS_CONSOLE_PRINT("  ? Bit-0 error (dominant expected)\n"); break;
-                case 6: SYS_CONSOLE_PRINT("  ? CRC error\n"); ReportError(ERR_CAN1_CRC); break;
-                case 7: SYS_CONSOLE_PRINT("  ? LEC unchanged\n"); break;
-                default:  break;
-            }
+            uint32_t status = CAN0_ErrorGet();
+            vDisplayCanErrorStatus(status, "CAN0");
 
-            /* -------- Status flags -------- */
-            if (status & CAN_PSR_BO_Msk)  { SYS_CONSOLE_PRINT("  ? **Bus-Off** state\n"); ReportError(ERR_CAN1_BUS_OFF); }
-//            if (status & CAN_PSR_EP_Msk)  SYS_CONSOLE_PRINT("  ? Error-Passive state\n");
-//            if (status & CAN_PSR_EW_Msk)  SYS_CONSOLE_PRINT("  ? Error-Warning state\n");
-//            if (status & CAN_PSR_PXE_Msk) SYS_CONSOLE_PRINT("  ? Protocol-Exception event\n");
-//            if (status & CAN_PSR_DLEC_Msk)SYS_CONSOLE_PRINT("  ? Data-phase error (CAN FD)\n");
-            
-            if (((status & CAN_PSR_LEC_Msk) == CAN_ERROR_NONE) || ((status & CAN_PSR_LEC_Msk) == CAN_ERROR_LEC_NC))
+            if (CAN_IsRxOK(status))
             {
-                numberOfMessage = CAN0_RxFifoFillLevelGet(CAN_RX_FIFO_0);
-                if (numberOfMessage != 0)
+                uint8_t u8NumberOfMessage = CAN0_RxFifoFillLevelGet(CAN_RX_FIFO_0);
+
+                if (u8NumberOfMessage > 0)
                 {
-                    memset(can0rxFiFo0, 0x00, (numberOfMessage * CAN0_RX_FIFO0_ELEMENT_SIZE));
-                    if (CAN0_MessageReceiveFifo(CAN_RX_FIFO_0, numberOfMessage, (CAN_RX_BUFFER *)can0rxFiFo0) == true)
+                    if (u8NumberOfMessage > CAN0_RX_FIFO0_SIZE)
                     {
-//                        SYS_CONSOLE_PRINT(" CAN0 Rx FIFO0 : New Message Received\r\n");
-                        vDisplayCanRxMessage(numberOfMessage, (CAN_RX_BUFFER *)can0rxFiFo0, CAN0_RX_FIFO0_ELEMENT_SIZE);
-                        xSemaphoreTake(xCan0QueueMutex, portMAX_DELAY);
-                        if (xQueueSend(xCAN0QueueHandler, &can0rxFiFo0, (TickType_t) 10) != pdPASS) {
-                            SYS_CONSOLE_PRINT("Failed to send message in CAN0 queue\r\n");
+                        SYS_CONSOLE_PRINT("CAN0 RX FIFO overflow!\r\n");
+                        u8NumberOfMessage = CAN0_RX_FIFO0_SIZE;
+                    }
+
+                    CAN_RX_BUFFER canRxBuffer[CAN0_RX_FIFO0_SIZE] = {0};
+
+                    if (CAN0_MessageReceiveFifo(CAN_RX_FIFO_0, u8NumberOfMessage, canRxBuffer))
+                    {
+                        for (uint8_t u8Count = 0; u8Count < u8NumberOfMessage; u8Count++)
+                        {
+                            vDisplayCanRxMessage(&canRxBuffer[u8Count], CAN0_RX_FIFO0_ELEMENT_SIZE);
+
+                            if (xSemaphoreTake(xCan0RXQueueMutex, pdMS_TO_TICKS(10)) == pdTRUE)
+                            {
+                                if (xQueueSend(xCAN0RXQueueHandler, &canRxBuffer[u8Count], 0) != pdPASS)
+                                {
+                                    SYS_CONSOLE_PRINT("CAN0 queue full\r\n");
+                                }
+                                xSemaphoreGive(xCan0RXQueueMutex);
+                            }
+                            else
+                            {
+                                SYS_CONSOLE_PRINT("CAN0 mutex timeout\r\n");
+                            }
                         }
-                        xSemaphoreGive(xCan0QueueMutex); 
                     }
                     else
                     {
-                        SYS_CONSOLE_PRINT(" Error in received CAN0 message\r\n");
+                        SYS_CONSOLE_PRINT("Error receiving CAN0 message\r\n");
                     }
                 }
             }
-        }       
+        }
 
         if (CAN1_InterruptGet(CAN_INTERRUPT_RF0N_MASK))
-        {    
+        {
             CAN1_InterruptClear(CAN_INTERRUPT_RF0N_MASK);
 
-            /* Check CAN Status */
-            status = CAN1_ErrorGet();
-            /* Decode and print it */
-            SYS_CONSOLE_PRINT("CAN1 status: 0x%08lX\r\n", (unsigned long)status);
-            /* -------- Last-Error-Code (LEC) field -------- */
-            switch (status & 0x7u)
-            {
-//                case 0: SYS_CONSOLE_PRINT("  ? No error\n"); break;
-                case 1: SYS_CONSOLE_PRINT("  ? Stuff error\n"); ReportError(ERR_CAN2_STUFF); break;
-                case 2: SYS_CONSOLE_PRINT("  ? Form error\n"); break;
-                case 3: SYS_CONSOLE_PRINT("  ? ACK error\n"); ReportError(ERR_CAN2_ACK); break;
-                case 4: SYS_CONSOLE_PRINT("  ? Bit-1 error (recessive expected)\n"); break;
-                case 5: SYS_CONSOLE_PRINT("  ? Bit-0 error (dominant expected)\n"); break;
-                case 6: SYS_CONSOLE_PRINT("  ? CRC error\n"); ReportError(ERR_CAN2_CRC); break;
-                case 7: SYS_CONSOLE_PRINT("  ? LEC unchanged\n"); break;
-                default:  break;
-            }
+            uint32_t status = CAN1_ErrorGet();
+            vDisplayCanErrorStatus(status, "CAN1");
 
-            /* -------- Status flags -------- */
-            if (status & CAN_PSR_BO_Msk)  { SYS_CONSOLE_PRINT("  ? **Bus-Off** state\n"); ReportError(ERR_CAN2_BUS_OFF); }
-//            if (status & CAN_PSR_EP_Msk)  SYS_CONSOLE_PRINT("  ? Error-Passive state\n");
-//            if (status & CAN_PSR_EW_Msk)  SYS_CONSOLE_PRINT("  ? Error-Warning state\n");
-//            if (status & CAN_PSR_PXE_Msk) SYS_CONSOLE_PRINT("  ? Protocol-Exception event\n");
-//            if (status & CAN_PSR_DLEC_Msk)SYS_CONSOLE_PRINT("  ? Data-phase error (CAN FD)\n");
-            
-            if (((status & CAN_PSR_LEC_Msk) == CAN_ERROR_NONE) || ((status & CAN_PSR_LEC_Msk) == CAN_ERROR_LEC_NC))
+            if (CAN_IsRxOK(status))
             {
-                numberOfMessage = CAN1_RxFifoFillLevelGet(CAN_RX_FIFO_0);
-                if (numberOfMessage != 0)
+              uint8_t u8NumberOfMessage = CAN1_RxFifoFillLevelGet(CAN_RX_FIFO_0);
+
+                if (u8NumberOfMessage > 0)
                 {
-                    memset(can1rxFiFo0, 0x00, (numberOfMessage * CAN1_RX_FIFO0_ELEMENT_SIZE));
-                    if (CAN1_MessageReceiveFifo(CAN_RX_FIFO_0, numberOfMessage, (CAN_RX_BUFFER *)can1rxFiFo0) == true)
+                    if (u8NumberOfMessage > CAN1_RX_FIFO0_SIZE)
                     {
-//                        SYS_CONSOLE_PRINT(" CAN1 Rx FIFO0 : New Message Received\r\n");
-                        vDisplayCanRxMessage(numberOfMessage, (CAN_RX_BUFFER *)can1rxFiFo0, CAN1_RX_FIFO0_ELEMENT_SIZE);
-                        xSemaphoreTake(xCan1QueueMutex, portMAX_DELAY);
-                        if (xQueueSend(xCAN1QueueHandler, &can1rxFiFo0, (TickType_t) 10) != pdPASS) {
-                            SYS_CONSOLE_PRINT("Failed to send message in CAN1 queue\r\n");
+                        SYS_CONSOLE_PRINT("CAN1 RX FIFO overflow!\r\n");
+                        u8NumberOfMessage = CAN1_RX_FIFO0_SIZE;
+                    }
+
+                    CAN_RX_BUFFER canRxBuffer[CAN1_RX_FIFO0_SIZE] = {0};
+
+                    if (CAN1_MessageReceiveFifo(CAN_RX_FIFO_0, u8NumberOfMessage, canRxBuffer))
+                    {
+                        for (uint8_t i = 0; i < u8NumberOfMessage; i++)
+                        {
+                            vDisplayCanRxMessage(&canRxBuffer[i], CAN1_RX_FIFO0_ELEMENT_SIZE);
+
+                            if (xSemaphoreTake(xCan1RXQueueMutex, pdMS_TO_TICKS(10)) == pdTRUE)
+                            {
+                                if (xQueueSend(xCAN1RXQueueHandler, &canRxBuffer[i], 0) != pdPASS)
+                                {
+                                    SYS_CONSOLE_PRINT("CAN1 queue full\r\n");
+                                }
+                                xSemaphoreGive(xCan1RXQueueMutex);
+                            }
+                            else
+                            {
+                                SYS_CONSOLE_PRINT("CAN1 mutex timeout\r\n");
+                            }
                         }
-                        xSemaphoreGive(xCan1QueueMutex);                        
                     }
                     else
                     {
-                        SYS_CONSOLE_PRINT(" Error in received CAN1 message\r\n");
+                        SYS_CONSOLE_PRINT("Error receiving CAN1 message\r\n");
                     }
                 }
-            }           
+            }
         }
+
         if (CAN2_InterruptGet(CAN_INTERRUPT_RF0N_MASK))
-        {    
+        {
             CAN2_InterruptClear(CAN_INTERRUPT_RF0N_MASK);
 
-            /* Check CAN Status */
-            status = CAN2_ErrorGet();
-            /* Decode and print it */
-            SYS_CONSOLE_PRINT("CAN2 status: 0x%08lX\r\n", (unsigned long)status);
-            /* -------- Last-Error-Code (LEC) field -------- */
-            switch (status & 0x7u)
-            {
-//                case 0: SYS_CONSOLE_PRINT("  ? No error\n"); break;
-                case 1: SYS_CONSOLE_PRINT("  ? Stuff error\n"); ReportError(ERR_CAN3_STUFF); break;
-                case 2: SYS_CONSOLE_PRINT("  ? Form error\n"); break;
-                case 3: SYS_CONSOLE_PRINT("  ? ACK error\n"); ReportError(ERR_CAN3_ACK); break;
-                case 4: SYS_CONSOLE_PRINT("  ? Bit-1 error (recessive expected)\n"); break;
-                case 5: SYS_CONSOLE_PRINT("  ? Bit-0 error (dominant expected)\n"); break;
-                case 6: SYS_CONSOLE_PRINT("  ? CRC error\n"); ReportError(ERR_CAN3_CRC); break;
-                case 7: SYS_CONSOLE_PRINT("  ? LEC unchanged\n"); break;
-                default:  break;
-            }
+            uint32_t status = CAN2_ErrorGet();
+            vDisplayCanErrorStatus(status, "CAN2");
 
-            /* -------- Status flags -------- */
-            if (status & CAN_PSR_BO_Msk)  { SYS_CONSOLE_PRINT("  ? **Bus-Off** state\n"); ReportError(ERR_CAN3_BUS_OFF); }
-//            if (status & CAN_PSR_EP_Msk)  SYS_CONSOLE_PRINT("  ? Error-Passive state\n");
-//            if (status & CAN_PSR_EW_Msk)  SYS_CONSOLE_PRINT("  ? Error-Warning state\n");
-//            if (status & CAN_PSR_PXE_Msk) SYS_CONSOLE_PRINT("  ? Protocol-Exception event\n");
-//            if (status & CAN_PSR_DLEC_Msk)SYS_CONSOLE_PRINT("  ? Data-phase error (CAN FD)\n");
-            
-            if (((status & CAN_PSR_LEC_Msk) == CAN_ERROR_NONE) || ((status & CAN_PSR_LEC_Msk) == CAN_ERROR_LEC_NC))
+            if (CAN_IsRxOK(status))
             {
-                numberOfMessage = CAN2_RxFifoFillLevelGet(CAN_RX_FIFO_0);
-                if (numberOfMessage != 0)
+               uint8_t u8NumberOfMessage = CAN2_RxFifoFillLevelGet(CAN_RX_FIFO_0);
+
+                if (u8NumberOfMessage > 0)
                 {
-                    memset(can2rxFiFo0, 0x00, (numberOfMessage * CAN2_RX_FIFO0_ELEMENT_SIZE));
-                    if (CAN2_MessageReceiveFifo(CAN_RX_FIFO_0, numberOfMessage, (CAN_RX_BUFFER *)can2rxFiFo0) == true)
+                    if (u8NumberOfMessage > CAN2_RX_FIFO0_SIZE)
                     {
-//                        SYS_CONSOLE_PRINT(" CAN2 Rx FIFO0 : New Message Received\r\n");
-                        vDisplayCanRxMessage(numberOfMessage, (CAN_RX_BUFFER *)can2rxFiFo0, CAN2_RX_FIFO0_ELEMENT_SIZE);
-                        xSemaphoreTake(xCan2QueueMutex, portMAX_DELAY);
-                        if (xQueueSend(xCAN2QueueHandler, &can2rxFiFo0, (TickType_t) 10) != pdPASS) {
-                            SYS_CONSOLE_PRINT("Failed to send message in CAN2 queue\r\n");
+                        SYS_CONSOLE_PRINT("CAN2 RX FIFO overflow!\r\n");
+                        u8NumberOfMessage = CAN2_RX_FIFO0_SIZE;
+                    }
+
+                    CAN_RX_BUFFER canRxBuffer[CAN2_RX_FIFO0_SIZE] = {0};
+
+                    if (CAN2_MessageReceiveFifo(CAN_RX_FIFO_0, u8NumberOfMessage, canRxBuffer))
+                    {
+                        for (uint8_t i = 0; i < u8NumberOfMessage; i++)
+                        {
+                            vDisplayCanRxMessage(&canRxBuffer[i], CAN2_RX_FIFO0_ELEMENT_SIZE);
+
+                            if (xSemaphoreTake(xCan2RXQueueMutex, pdMS_TO_TICKS(10)) == pdTRUE)
+                            {
+                                if (xQueueSend(xCAN2RXQueueHandler, &canRxBuffer[i], 0) != pdPASS)
+                                {
+                                    SYS_CONSOLE_PRINT("CAN2 queue full\r\n");
+                                }
+                                xSemaphoreGive(xCan2RXQueueMutex);
+                            }
+                            else
+                            {
+                                SYS_CONSOLE_PRINT("CAN2 mutex timeout\r\n");
+                            }
                         }
-                        xSemaphoreGive(xCan2QueueMutex); 
                     }
                     else
                     {
-                        SYS_CONSOLE_PRINT(" Error in received CAN2 message\r\n");
+                        SYS_CONSOLE_PRINT("Error receiving CAN2 message\r\n");
                     }
                 }
-            }           
-        }       
-       
-        if (CAN3_InterruptGet(CAN_INTERRUPT_RF0N_MASK))
-        {    
-            CAN3_InterruptClear(CAN_INTERRUPT_RF0N_MASK);
-
-            /* Check CAN Status */
-            status = CAN3_ErrorGet();
-            /* Decode and print it */
-            SYS_CONSOLE_PRINT("CAN3 status: 0x%08lX\r\n", (unsigned long)status);
-            /* -------- Last-Error-Code (LEC) field -------- */
-            switch (status & 0x7u)
-            {
-//                case 0: SYS_CONSOLE_PRINT("  ? No error\n"); break;
-                case 1: SYS_CONSOLE_PRINT("  ? Stuff error\n"); ReportError(ERR_CAN4_STUFF); break;
-                case 2: SYS_CONSOLE_PRINT("  ? Form error\n"); break;
-                case 3: SYS_CONSOLE_PRINT("  ? ACK error\n"); ReportError(ERR_CAN4_ACK); break;
-                case 4: SYS_CONSOLE_PRINT("  ? Bit-1 error (recessive expected)\n"); break;
-                case 5: SYS_CONSOLE_PRINT("  ? Bit-0 error (dominant expected)\n"); break;
-                case 6: SYS_CONSOLE_PRINT("  ? CRC error\n"); ReportError(ERR_CAN4_CRC); break;
-                case 7: SYS_CONSOLE_PRINT("  ? LEC unchanged\n"); break;
-                default:  break;
             }
-
-            /* -------- Status flags -------- */
-            if (status & CAN_PSR_BO_Msk)  { SYS_CONSOLE_PRINT("  ? **Bus-Off** state\n"); ReportError(ERR_CAN4_BUS_OFF); }
-//            if (status & CAN_PSR_EP_Msk)  SYS_CONSOLE_PRINT("  ? Error-Passive state\n");
-//            if (status & CAN_PSR_EW_Msk)  SYS_CONSOLE_PRINT("  ? Error-Warning state\n");
-//            if (status & CAN_PSR_PXE_Msk) SYS_CONSOLE_PRINT("  ? Protocol-Exception event\n");
-//            if (status & CAN_PSR_DLEC_Msk)SYS_CONSOLE_PRINT("  ? Data-phase error (CAN FD)\n");
-            
-            if (((status & CAN_PSR_LEC_Msk) == CAN_ERROR_NONE) || ((status & CAN_PSR_LEC_Msk) == CAN_ERROR_LEC_NC))
-            {
-                numberOfMessage = CAN3_RxFifoFillLevelGet(CAN_RX_FIFO_0);
-                if (numberOfMessage != 0)
-                {
-                    memset(can3rxFiFo0, 0x00, (numberOfMessage * CAN3_RX_FIFO0_ELEMENT_SIZE));
-                    if (CAN3_MessageReceiveFifo(CAN_RX_FIFO_0, numberOfMessage, (CAN_RX_BUFFER *)can3rxFiFo0) == true)
-                    {
-//                        SYS_CONSOLE_PRINT(" CAN3 Rx FIFO0 : New Message Received\r\n");
-                        vDisplayCanRxMessage(numberOfMessage, (CAN_RX_BUFFER *)can3rxFiFo0, CAN3_RX_FIFO0_ELEMENT_SIZE);
-                        xSemaphoreTake(xCan3QueueMutex, portMAX_DELAY);
-                        if (xQueueSend(xCAN3QueueHandler, &can3rxFiFo0, (TickType_t) 10) != pdPASS) {
-                            SYS_CONSOLE_PRINT("Failed to send message in CAN3 queue\r\n");
-                        }
-                        xSemaphoreGive(xCan3QueueMutex); 
-                    }
-                    else
-                    {
-                        SYS_CONSOLE_PRINT(" Error in received CAN3 message\r\n");
-                    }
-                }
-            }           
         }
-        
-        if (CAN4_InterruptGet(CAN_INTERRUPT_RF0N_MASK))
-        {    
-            CAN4_InterruptClear(CAN_INTERRUPT_RF0N_MASK);
-
-            /* Check CAN Status */
-            status = CAN4_ErrorGet();
-            /* Decode and print it */
-            SYS_CONSOLE_PRINT("CAN4 status: 0x%08lX\r\n", (unsigned long)status);
-            /* -------- Last-Error-Code (LEC) field -------- */
-            switch (status & 0x7u)
-            {
-//                case 0: SYS_CONSOLE_PRINT("  ? No error\n"); break;
-                case 1: SYS_CONSOLE_PRINT("  ? Stuff error\n"); ReportError(ERR_CAN5_STUFF); break;
-                case 2: SYS_CONSOLE_PRINT("  ? Form error\n"); break;
-                case 3: SYS_CONSOLE_PRINT("  ? ACK error\n"); ReportError(ERR_CAN5_ACK); break;
-                case 4: SYS_CONSOLE_PRINT("  ? Bit-1 error (recessive expected)\n"); break;
-                case 5: SYS_CONSOLE_PRINT("  ? Bit-0 error (dominant expected)\n"); break;
-                case 6: SYS_CONSOLE_PRINT("  ? CRC error\n"); ReportError(ERR_CAN5_CRC); break;
-                case 7: SYS_CONSOLE_PRINT("  ? LEC unchanged\n"); break;
-                default:  break;
-            }
-
-            /* -------- Status flags -------- */
-            if (status & CAN_PSR_BO_Msk)  { SYS_CONSOLE_PRINT("  ? **Bus-Off** state\n"); ReportError(ERR_CAN5_BUS_OFF); }
-//            if (status & CAN_PSR_EP_Msk)  SYS_CONSOLE_PRINT("  ? Error-Passive state\n");
-//            if (status & CAN_PSR_EW_Msk)  SYS_CONSOLE_PRINT("  ? Error-Warning state\n");
-//            if (status & CAN_PSR_PXE_Msk) SYS_CONSOLE_PRINT("  ? Protocol-Exception event\n");
-//            if (status & CAN_PSR_DLEC_Msk)SYS_CONSOLE_PRINT("  ? Data-phase error (CAN FD)\n");
-            
-            if (((status & CAN_PSR_LEC_Msk) == CAN_ERROR_NONE) || ((status & CAN_PSR_LEC_Msk) == CAN_ERROR_LEC_NC))
-            {
-                numberOfMessage = CAN4_RxFifoFillLevelGet(CAN_RX_FIFO_0);
-                if (numberOfMessage != 0)
-                {
-                    memset(can4rxFiFo0, 0x00, (numberOfMessage * CAN4_RX_FIFO0_ELEMENT_SIZE));
-                    if (CAN4_MessageReceiveFifo(CAN_RX_FIFO_0, numberOfMessage, (CAN_RX_BUFFER *)can4rxFiFo0) == true)
-                    {
-//                        SYS_CONSOLE_PRINT(" CAN4 Rx FIFO0 : New Message Received\r\n");
-                        vDisplayCanRxMessage(numberOfMessage, (CAN_RX_BUFFER *)can4rxFiFo0, CAN4_RX_FIFO0_ELEMENT_SIZE);
-                        xSemaphoreTake(xCan4QueueMutex, portMAX_DELAY);
-                        if (xQueueSend(xCAN4QueueHandler, &can4rxFiFo0, (TickType_t) 10) != pdPASS) {
-                            SYS_CONSOLE_PRINT("Failed to send message in CAN4 queue\r\n");
-                        }
-                        xSemaphoreGive(xCan4QueueMutex);                        
-                    }
-                    else
-                    {
-                        SYS_CONSOLE_PRINT(" Error in received CAN4 message\r\n");
-                    }
-                }
-            }           
-        }
-        
-        if (CAN5_InterruptGet(CAN_INTERRUPT_RF0N_MASK))
-        {    
-            CAN5_InterruptClear(CAN_INTERRUPT_RF0N_MASK);
-
-            /* Check CAN Status */
-            status = CAN5_ErrorGet();
-            /* Decode and print it */
-            SYS_CONSOLE_PRINT("CAN5 status: 0x%08lX\r\n", (unsigned long)status);
-            /* -------- Last-Error-Code (LEC) field -------- */
-            switch (status & 0x7u)
-            {
-//                case 0: SYS_CONSOLE_PRINT("  ? No error\n"); break;
-                case 1: SYS_CONSOLE_PRINT("  ? Stuff error\n"); ReportError(ERR_CAN6_STUFF); break;
-                case 2: SYS_CONSOLE_PRINT("  ? Form error\n"); break;
-                case 3: SYS_CONSOLE_PRINT("  ? ACK error\n"); ReportError(ERR_CAN6_ACK); break;
-                case 4: SYS_CONSOLE_PRINT("  ? Bit-1 error (recessive expected)\n"); break;
-                case 5: SYS_CONSOLE_PRINT("  ? Bit-0 error (dominant expected)\n"); break;
-                case 6: SYS_CONSOLE_PRINT("  ? CRC error\n"); ReportError(ERR_CAN6_CRC); break;
-                case 7: SYS_CONSOLE_PRINT("  ? LEC unchanged\n"); break;
-                default:  break;
-            }
-
-            /* -------- Status flags -------- */
-            if (status & CAN_PSR_BO_Msk)  { SYS_CONSOLE_PRINT("  ? **Bus-Off** state\n"); ReportError(ERR_CAN6_BUS_OFF); }
-//            if (status & CAN_PSR_EP_Msk)  SYS_CONSOLE_PRINT("  ? Error-Passive state\n");
-//            if (status & CAN_PSR_EW_Msk)  SYS_CONSOLE_PRINT("  ? Error-Warning state\n");
-//            if (status & CAN_PSR_PXE_Msk) SYS_CONSOLE_PRINT("  ? Protocol-Exception event\n");
-//            if (status & CAN_PSR_DLEC_Msk)SYS_CONSOLE_PRINT("  ? Data-phase error (CAN FD)\n");
-            
-            if (((status & CAN_PSR_LEC_Msk) == CAN_ERROR_NONE) || ((status & CAN_PSR_LEC_Msk) == CAN_ERROR_LEC_NC))
-            {
-                numberOfMessage = CAN5_RxFifoFillLevelGet(CAN_RX_FIFO_0);
-                if (numberOfMessage != 0)
-                {
-                    memset(can5rxFiFo0, 0x00, (numberOfMessage * CAN5_RX_FIFO0_ELEMENT_SIZE));
-                    if (CAN5_MessageReceiveFifo(CAN_RX_FIFO_0, numberOfMessage, (CAN_RX_BUFFER *)can5rxFiFo0) == true)
-                    {
-//                        SYS_CONSOLE_PRINT(" CAN5 Rx FIFO0 : New Message Received\r\n");
-                        vDisplayCanRxMessage(numberOfMessage, (CAN_RX_BUFFER *)can5rxFiFo0, CAN5_RX_FIFO0_ELEMENT_SIZE);
-                        xSemaphoreTake(xCan5QueueMutex, portMAX_DELAY);
-                        if (xQueueSend(xCAN5QueueHandler, &can5rxFiFo0, (TickType_t) 10) != pdPASS) {
-                            SYS_CONSOLE_PRINT("Failed to send message in CAN5 queue\r\n");
-                        }
-                        xSemaphoreGive(xCan5QueueMutex);                         
-                    }
-                    else
-                    {
-                        SYS_CONSOLE_PRINT(" Error in received CAN5 message\r\n");
-                    }
-                }
-            }           
-        }
-        vTaskDelay(pdMS_TO_TICKS(5));        
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
 /**
@@ -1307,52 +605,34 @@ void vCanHandlerInit(void)
     CAN0_MessageRAMConfigSet(Can0MessageRAM);
     CAN1_MessageRAMConfigSet(Can1MessageRAM);
     CAN2_MessageRAMConfigSet(Can2MessageRAM);
-    CAN3_MessageRAMConfigSet(Can3MessageRAM);
-    
-#if HEV_IO_Aggregator   
-    CAN4_MessageRAMConfigSet(Can4MessageRAM);
-    CAN5_MessageRAMConfigSet(Can5MessageRAM);
-#endif    
 
     /* Create CAN Queues */
-    xCAN0QueueHandler = xQueueCreate(CAN_QUEUE_SIZE, CAN_QUEUE_ITEM_SIZE);
-    xCAN1QueueHandler = xQueueCreate(CAN_QUEUE_SIZE, CAN_QUEUE_ITEM_SIZE);
-    xCAN2QueueHandler = xQueueCreate(CAN_QUEUE_SIZE, CAN_QUEUE_ITEM_SIZE);
-    xCAN3QueueHandler = xQueueCreate(CAN_QUEUE_SIZE, CAN_QUEUE_ITEM_SIZE);
-    
-#if HEV_IO_Aggregator
-    xCAN4QueueHandler = xQueueCreate(CAN_QUEUE_SIZE, CAN_QUEUE_ITEM_SIZE);
-    xCAN5QueueHandler = xQueueCreate(CAN_QUEUE_SIZE, CAN_QUEUE_ITEM_SIZE);
+    xCAN0RXQueueHandler = xQueueCreate(CAN_QUEUE_SIZE, CAN_QUEUE_ITEM_SIZE);
+    xCAN0TXQueueHandler = xQueueCreate(CAN_QUEUE_SIZE, CAN_QUEUE_ITEM_SIZE);
+    xCAN1RXQueueHandler = xQueueCreate(CAN_QUEUE_SIZE, CAN_QUEUE_ITEM_SIZE);
+    xCAN1TXQueueHandler = xQueueCreate(CAN_QUEUE_SIZE, CAN_QUEUE_ITEM_SIZE);
+    xCAN2RXQueueHandler = xQueueCreate(CAN_QUEUE_SIZE, CAN_QUEUE_ITEM_SIZE);
+    xCAN2TXQueueHandler = xQueueCreate(CAN_QUEUE_SIZE, CAN_QUEUE_ITEM_SIZE);
 
     /* Check if all required queues were created successfully */
-    if (xCAN0QueueHandler == NULL || xCAN1QueueHandler == NULL || 
-        xCAN2QueueHandler == NULL || xCAN3QueueHandler == NULL || 
-        xCAN4QueueHandler == NULL || xCAN5QueueHandler == NULL) 
+    if (xCAN0RXQueueHandler == NULL || xCAN0TXQueueHandler == NULL || 
+        xCAN1RXQueueHandler == NULL || xCAN1TXQueueHandler == NULL || 
+        xCAN2RXQueueHandler == NULL || xCAN2TXQueueHandler == NULL) 
     {
         SYS_CONSOLE_PRINT("Error: CANRX Queue creation failed\r\n");
         return;
     }
-    SYS_CONSOLE_PRINT("CANRX Queue creation successful\r\n");
-#elif Two_Wheeler_IO_Aggregator
-    /* Check if all required queues were created successfully */
-    if (xCAN0QueueHandler == NULL || xCAN1QueueHandler == NULL || 
-        xCAN2QueueHandler == NULL || xCAN3QueueHandler == NULL) 
-    {
-        SYS_CONSOLE_PRINT("Error: CANRX Queue creation failed\r\n");
-        return;
-    }
-    SYS_CONSOLE_PRINT("CANRX Queue creation successful\r\n");
-#endif    
-    xCan0QueueMutex = xSemaphoreCreateMutex();
-    xCan1QueueMutex = xSemaphoreCreateMutex();
-    xCan2QueueMutex = xSemaphoreCreateMutex();
-    xCan3QueueMutex = xSemaphoreCreateMutex();
-    xCan4QueueMutex = xSemaphoreCreateMutex();
-    xCan5QueueMutex = xSemaphoreCreateMutex();
+    SYS_CONSOLE_PRINT("CANRX Queue creation successful\r\n"); 
+    xCan0RXQueueMutex = xSemaphoreCreateMutex();
+    xCan0TXQueueMutex = xSemaphoreCreateMutex();
+    xCan1RXQueueMutex = xSemaphoreCreateMutex();
+    xCan1TXQueueMutex = xSemaphoreCreateMutex();
+    xCan2RXQueueMutex = xSemaphoreCreateMutex();
+    xCan2TXQueueMutex = xSemaphoreCreateMutex();
 
-    if (xCan0QueueMutex == NULL || xCan1QueueMutex == NULL || 
-        xCan2QueueMutex == NULL || xCan3QueueMutex == NULL || 
-        xCan4QueueMutex == NULL || xCan5QueueMutex == NULL)
+    if (xCan0RXQueueMutex == NULL || xCan0TXQueueMutex == NULL ||
+        xCan1RXQueueMutex == NULL || xCan1TXQueueMutex == NULL ||
+        xCan2RXQueueMutex == NULL || xCan2TXQueueMutex == NULL)
     {
         // Handle error: At least one mutex creation failed
          SYS_CONSOLE_PRINT("Error: Mutex creation failed\r\n");
@@ -1363,10 +643,49 @@ void vCanHandlerInit(void)
     xTaskCreate(vCan0HandlerServerTask, "vCan0HandlerServerTask", CAN_SERVER_HANDLER_HEAP_DEPTH, NULL, CAN_SERVER_HANDLER_TASK_PRIORITY, NULL);
     xTaskCreate(vCan1HandlerServerTask, "vCan1HandlerServerTask", CAN_SERVER_HANDLER_HEAP_DEPTH, NULL, CAN_SERVER_HANDLER_TASK_PRIORITY, NULL);
     xTaskCreate(vCan2HandlerServerTask, "vCan2HandlerServerTask", CAN_SERVER_HANDLER_HEAP_DEPTH, NULL, CAN_SERVER_HANDLER_TASK_PRIORITY, NULL);
-    xTaskCreate(vCan3HandlerServerTask, "vCan3HandlerServerTask", CAN_SERVER_HANDLER_HEAP_DEPTH, NULL, CAN_SERVER_HANDLER_TASK_PRIORITY, NULL);
+}
+void vSendCanTxMsgToQueue(const CAN_TX_BUFFER *const pCanTxBuffer, uint8_t u8DockNo)
+{
+    if (pCanTxBuffer == NULL)
+    {
+        SYS_CONSOLE_PRINT("vSendCanTxMsgToQueue: NULL CAN TX buffer\r\n");
+        return;
+    }
+    QueueHandle_t tx_queue = NULL;
+    SemaphoreHandle_t tx_mutex = NULL;
 
-#if HEV_IO_Aggregator      
-    xTaskCreate(vCan4HandlerServerTask, "vCan4HandlerServerTask", CAN_SERVER_HANDLER_HEAP_DEPTH, NULL, CAN_SERVER_HANDLER_TASK_PRIORITY, NULL);
-    xTaskCreate(vCan5HandlerServerTask, "vCan5HandlerServerTask", CAN_SERVER_HANDLER_HEAP_DEPTH, NULL, CAN_SERVER_HANDLER_TASK_PRIORITY, NULL);
-#endif    
+    switch (u8DockNo)
+    {
+    case DOCK_1:
+        tx_queue = xCAN0TXQueueHandler;
+        tx_mutex = xCan0TXQueueMutex;
+        break;
+    case DOCK_2:
+        tx_queue = xCAN1TXQueueHandler;
+        tx_mutex = xCan1TXQueueMutex;
+        break;
+    case DOCK_3:
+        tx_queue = xCAN2TXQueueHandler;
+        tx_mutex = xCan2TXQueueMutex;
+        break;
+    default:
+        SYS_CONSOLE_PRINT("vSendCanTxMsgToQueue: Invalid dock number\r\n");
+        return;
+    }
+
+    if ((tx_queue != NULL) && (tx_mutex != NULL))
+    {
+        if (xSemaphoreTake(tx_mutex, pdMS_TO_TICKS(10)) == pdTRUE)
+        {
+            if (xQueueSend(tx_queue, pCanTxBuffer, 0) != pdPASS)
+            {
+                SYS_CONSOLE_PRINT("Dock %u TX queue full\r\n", u8DockNo);
+            }
+            xSemaphoreGive(tx_mutex);
+        }
+        else
+        {
+            SYS_CONSOLE_PRINT("Dock %u TX mutex timeout\r\n", u8DockNo);
+        }
+    }
 }
