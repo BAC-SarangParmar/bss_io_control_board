@@ -22,7 +22,7 @@
 
 /* Telemetry Data Structures */
 
-typedef struct
+typedef struct __attribute__((packed))
 {
     uint32_t u32PmOutputVoltage_mV;   /**< Charging Voltage (mV) */
     uint32_t u32PmOutputCurrent_mA;   /**< Charging Current (mA) */
@@ -33,7 +33,7 @@ typedef struct
     uint8_t  u8PMStatus;              /**< Status */
 } TELEMETRY_PMData_t;
 
-typedef struct
+typedef struct __attribute__((packed))
 {
     uint32_t u32BMSDemandVoltage;     /**< Demand Voltage (mV) */
     uint32_t u32BMSDemandCurrent;     /**< Demand Current (mA) */
