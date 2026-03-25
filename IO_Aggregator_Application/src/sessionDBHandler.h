@@ -65,7 +65,7 @@ typedef enum
 
 typedef enum
 {
-    DOCK_1 = 0,
+    DOCK_1 = 1,
     DOCK_2,
     DOCK_3,
     MAX_DOCKS

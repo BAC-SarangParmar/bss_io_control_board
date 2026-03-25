@@ -66,28 +66,51 @@ static void Telemetry_SendTemperature(uint8_t compartmentId, uint8_t dockId);
 /* ************************************************************************** */
 static void Telemetry_UpdateFromSession(uint8_t dockId)
 {
+    // /* ---------------- PM Data ---------------- */
+    // telemetryData[dockId].pmData.u32PmOutputVoltage_mV = SESSION_GetPmOutputVoltage(dockId) * FACTOR_1000; /* Convert V to mV */
+    // telemetryData[dockId].pmData.u32PmOutputCurrent_mA = SESSION_GetPmOutputCurrent(dockId) * FACTOR_1000; /* Convert A to mA */
+    // telemetryData[dockId].pmData.u32OutputPower_W    = SESSION_GetOutputPower(dockId);
+    // telemetryData[dockId].pmData.u32TotalEnergy_Wh   = SESSION_GetEnergyDelivered(dockId);
+    // telemetryData[dockId].pmData.u32PMFaultCode      = SESSION_GetPMFaultCode(dockId);
+    // telemetryData[dockId].pmData.u8PMTemperature     = SESSION_GetPMTemperature(dockId);
+    // telemetryData[dockId].pmData.u8PMStatus          = SESSION_GetPMRxStatus(dockId);
+
+    // /* ---------------- BMS Data ---------------- */
+    // telemetryData[dockId].bmsData.u32BMSDemandVoltage = SESSION_GetBMSDemandVoltage(dockId) * FACTOR_1000; /* Convert V to mV */
+    // telemetryData[dockId].bmsData.u32BMSDemandCurrent = SESSION_GetBMSDemandCurrent(dockId) * FACTOR_1000; /* Convert A to mA */
+    // telemetryData[dockId].bmsData.u32EstimatedTime_s  = SESSION_GetEnergyDelivered(dockId); /* or another 32-bit field */
+    // telemetryData[dockId].bmsData.u32BMSFaultCode     = SESSION_GetBMSFaultCode(dockId);
+    // telemetryData[dockId].bmsData.u8CurrentSoc        = SESSION_GetCurrentSoc(dockId);
+    // telemetryData[dockId].bmsData.u8InitialSoc        = SESSION_GetInitialSoc(dockId);
+    // telemetryData[dockId].bmsData.u8BMSTemperature    = SESSION_GetBMSTemperature(dockId);
+    // telemetryData[dockId].bmsData.u8BMSStatus         = SESSION_GetBMSRxStatus(dockId);
+
+    // /* ---------------- Temperature Data ---------------- */
+    // telemetryData[dockId].tempData.u8CompartmentTemperature = SESSION_GetDockTemperature(dockId);
+    // telemetryData[dockId].tempData.u8DockTemperature        = SESSION_GetPMTemperature(dockId);
+
     /* ---------------- PM Data ---------------- */
-    telemetryData[dockId].pmData.u32PmOutputVoltage_mV = SESSION_GetPmOutputVoltage(dockId) * FACTOR_1000; /* Convert V to mV */
-    telemetryData[dockId].pmData.u32PmOutputCurrent_mA = SESSION_GetPmOutputCurrent(dockId) * FACTOR_1000; /* Convert A to mA */
-    telemetryData[dockId].pmData.u32OutputPower_W    = SESSION_GetOutputPower(dockId);
-    telemetryData[dockId].pmData.u32TotalEnergy_Wh   = SESSION_GetEnergyDelivered(dockId);
-    telemetryData[dockId].pmData.u32PMFaultCode      = SESSION_GetPMFaultCode(dockId);
-    telemetryData[dockId].pmData.u8PMTemperature     = SESSION_GetPMTemperature(dockId);
-    telemetryData[dockId].pmData.u8PMStatus          = SESSION_GetPMRxStatus(dockId);
+    telemetryData[dockId].pmData.u32PmOutputVoltage_mV = 5500 + dockId;//SESSION_GetPmOutputVoltage(dockId) * FACTOR_1000; /* Convert V to mV */
+    telemetryData[dockId].pmData.u32PmOutputCurrent_mA = 5100 + dockId; //SESSION_GetPmOutputCurrent(dockId) * FACTOR_1000; /* Convert A to mA */
+    telemetryData[dockId].pmData.u32OutputPower_W    =  6000 + dockId;//SESSION_GetOutputPower(dockId);
+    telemetryData[dockId].pmData.u32TotalEnergy_Wh   = 1000 + dockId;//SESSION_GetEnergyDelivered(dockId);
+    telemetryData[dockId].pmData.u32PMFaultCode      = 0;//SESSION_GetPMFaultCode(dockId);
+    telemetryData[dockId].pmData.u8PMTemperature     = 58 + dockId;//SESSION_GetPMTemperature(dockId);
+    telemetryData[dockId].pmData.u8PMStatus          = 1 + dockId;//SESSION_GetPMRxStatus(dockId);
 
     /* ---------------- BMS Data ---------------- */
-    telemetryData[dockId].bmsData.u32BMSDemandVoltage = SESSION_GetBMSDemandVoltage(dockId) * FACTOR_1000; /* Convert V to mV */
-    telemetryData[dockId].bmsData.u32BMSDemandCurrent = SESSION_GetBMSDemandCurrent(dockId) * FACTOR_1000; /* Convert A to mA */
-    telemetryData[dockId].bmsData.u32EstimatedTime_s  = SESSION_GetEnergyDelivered(dockId); /* or another 32-bit field */
-    telemetryData[dockId].bmsData.u32BMSFaultCode     = SESSION_GetBMSFaultCode(dockId);
-    telemetryData[dockId].bmsData.u8CurrentSoc        = SESSION_GetCurrentSoc(dockId);
-    telemetryData[dockId].bmsData.u8InitialSoc        = SESSION_GetInitialSoc(dockId);
-    telemetryData[dockId].bmsData.u8BMSTemperature    = SESSION_GetBMSTemperature(dockId);
-    telemetryData[dockId].bmsData.u8BMSStatus         = SESSION_GetBMSRxStatus(dockId);
+    telemetryData[dockId].bmsData.u32BMSDemandVoltage = 5800 + dockId; //SESSION_GetBMSDemandVoltage(dockId) * FACTOR_1000; /* Convert V to mV */
+    telemetryData[dockId].bmsData.u32BMSDemandCurrent = 5500 + dockId; //SESSION_GetBMSDemandCurrent(dockId) * FACTOR_1000; /* Convert A to mA */
+    telemetryData[dockId].bmsData.u32EstimatedTime_s  = 1000 + dockId; //SESSION_GetEnergyDelivered(dockId); /* or another 32-bit field */
+    telemetryData[dockId].bmsData.u32BMSFaultCode     = 0; //SESSION_GetBMSFaultCode(dockId);
+    telemetryData[dockId].bmsData.u8CurrentSoc        = 80 + dockId; //SESSION_GetCurrentSoc(dockId);
+    telemetryData[dockId].bmsData.u8InitialSoc        = 20 + dockId; //SESSION_GetInitialSoc(dockId);
+    telemetryData[dockId].bmsData.u8BMSTemperature    = 45 + dockId; //SESSION_GetBMSTemperature(dockId);
+    telemetryData[dockId].bmsData.u8BMSStatus         = 1 + dockId; //SESSION_GetBMSRxStatus(dockId);
 
     /* ---------------- Temperature Data ---------------- */
-    telemetryData[dockId].tempData.u8CompartmentTemperature = SESSION_GetDockTemperature(dockId);
-    telemetryData[dockId].tempData.u8DockTemperature        = SESSION_GetPMTemperature(dockId);
+    telemetryData[dockId].tempData.u8CompartmentTemperature = 40 + dockId; //SESSION_GetDockTemperature(dockId);
+    telemetryData[dockId].tempData.u8DockTemperature        = 30 + dockId; //SESSION_GetPMTemperature(dockId);
 }
 /**
  * @brief Send a single telemetry frame over TCP
@@ -166,13 +189,12 @@ static void Telemetry_SendPM(uint8_t compartmentId, uint8_t dockId)
     payload[i++] = (uint8_t)((telemetryData[dockId].pmData.u32TotalEnergy_Wh >> 8U) & 0xFFU);
     payload[i++] = (uint8_t)(telemetryData[dockId].pmData.u32TotalEnergy_Wh & 0xFFU);
 
-    payload[i++] = telemetryData[dockId].pmData.u8PMTemperature;
-
     payload[i++] = (uint8_t)((telemetryData[dockId].pmData.u32PMFaultCode >> 24U) & 0xFFU);
     payload[i++] = (uint8_t)((telemetryData[dockId].pmData.u32PMFaultCode >> 16U) & 0xFFU);
     payload[i++] = (uint8_t)((telemetryData[dockId].pmData.u32PMFaultCode >> 8U) & 0xFFU);
     payload[i++] = (uint8_t)(telemetryData[dockId].pmData.u32PMFaultCode & 0xFFU);
 
+    payload[i++] = telemetryData[dockId].pmData.u8PMTemperature;
     payload[i++] = telemetryData[dockId].pmData.u8PMStatus;
 
     Telemetry_SendFrame(TELEMETRY_CMD_PM_DATA, compartmentId, dockId, payload, i);
@@ -183,7 +205,7 @@ static void Telemetry_SendPM(uint8_t compartmentId, uint8_t dockId)
  */
 static void Telemetry_SendBMS(uint8_t compartmentId, uint8_t dockId)
 {
-    uint8_t payload[15U];
+    uint8_t payload[20U];
     uint16_t i = 0U;
 
     payload[i++] = (uint8_t)((telemetryData[dockId].bmsData.u32BMSDemandVoltage >> 24U) & 0xFFU);
@@ -196,10 +218,6 @@ static void Telemetry_SendBMS(uint8_t compartmentId, uint8_t dockId)
     payload[i++] = (uint8_t)((telemetryData[dockId].bmsData.u32BMSDemandCurrent >> 8U) & 0xFFU);
     payload[i++] = (uint8_t)(telemetryData[dockId].bmsData.u32BMSDemandCurrent & 0xFFU);
 
-    payload[i++] = telemetryData[dockId].bmsData.u8CurrentSoc;
-    payload[i++] = telemetryData[dockId].bmsData.u8InitialSoc;
-    payload[i++] = telemetryData[dockId].bmsData.u8BMSTemperature;
-
     payload[i++] = (uint8_t)((telemetryData[dockId].bmsData.u32EstimatedTime_s >> 24U) & 0xFFU);
     payload[i++] = (uint8_t)((telemetryData[dockId].bmsData.u32EstimatedTime_s >> 16U) & 0xFFU);
     payload[i++] = (uint8_t)((telemetryData[dockId].bmsData.u32EstimatedTime_s >> 8U) & 0xFFU);
@@ -210,6 +228,9 @@ static void Telemetry_SendBMS(uint8_t compartmentId, uint8_t dockId)
     payload[i++] = (uint8_t)((telemetryData[dockId].bmsData.u32BMSFaultCode >> 8U) & 0xFFU);
     payload[i++] = (uint8_t)(telemetryData[dockId].bmsData.u32BMSFaultCode & 0xFFU);
 
+    payload[i++] = telemetryData[dockId].bmsData.u8CurrentSoc;
+    payload[i++] = telemetryData[dockId].bmsData.u8InitialSoc;
+    payload[i++] = telemetryData[dockId].bmsData.u8BMSTemperature;
     payload[i++] = telemetryData[dockId].bmsData.u8BMSStatus;
 
     Telemetry_SendFrame(TELEMETRY_CMD_BMS_DATA, compartmentId, dockId, payload, i);
@@ -220,12 +241,12 @@ static void Telemetry_SendBMS(uint8_t compartmentId, uint8_t dockId)
  */
 static void Telemetry_SendTemperature(uint8_t compartmentId, uint8_t dockId)
 {
-    uint8_t payload[4U];
+    uint8_t payload[MAX_DOCKS] = {0U};
 
-    payload[0] = telemetryData[dockId].tempData.u8CompartmentTemperature;
-    payload[1] = telemetryData[dockId].tempData.u8DockTemperature;
-    payload[2] = telemetryData[dockId].tempData.u8DockTemperature;
-    payload[3] = telemetryData[dockId].tempData.u8DockTemperature;
+    payload[0] = telemetryData[DOCK_1].tempData.u8CompartmentTemperature;
+    payload[1] = telemetryData[DOCK_1].tempData.u8DockTemperature;
+    payload[2] = telemetryData[DOCK_2].tempData.u8DockTemperature;
+    payload[3] = telemetryData[DOCK_3].tempData.u8DockTemperature;
 
     Telemetry_SendFrame(TELEMETRY_CMD_TEMP_DATA, compartmentId, dockId, payload, 4U);
 }
@@ -291,7 +312,7 @@ void Telemetry_Task(void *pvParameters)
                 Telemetry_SendPM(TELEMETRY_COMPARTMENT_ID, u8DockNo);
                 vTaskDelay(pdMS_TO_TICKS(1U)); /* Small delay between sends */
             }
-            Telemetry_SendTemperature(TELEMETRY_COMPARTMENT_ID, 0xFFU); /* Broadcast dock ID for temperature */
+            Telemetry_SendTemperature(TELEMETRY_COMPARTMENT_ID, 0x00U); /* Broadcast dock ID for temperature */
         }
         vTaskDelay(pdMS_TO_TICKS(TELEMETRY_TASK_DELAY_MS)); /* 1-second interval */
     }
