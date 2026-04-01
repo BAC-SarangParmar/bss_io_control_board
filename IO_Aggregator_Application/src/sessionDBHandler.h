@@ -41,6 +41,9 @@ extern "C" {
 #define FACTOR_10 10U
 #define FACTOR_100 100U
 #define FACTOR_1000 1000U
+#define FACTOR_10_F 10.0f
+#define FACTOR_100_F 100.0f
+#define FACTOR_1000_F 1000.0f
 #define FACTOR_0_1 0.1f
 #define FACTOR_0_01 0.01f
 #define FACTOR_0_001 0.001f
@@ -96,6 +99,32 @@ typedef enum
     CHARGING_SESSION_STOPPED = 0x00U,
 } SessionEvent_e;
 
+typedef enum
+{
+    SYSTEM_FAULT_NONE = 0,
+
+    SYSTEM_FAULT_BMS_ERROR,
+    SYSTEM_FAULT_PM_ERROR,
+
+    SYSTEM_FAULT_BMS_COMMUNICATION_FAILURE,
+    SYSTEM_FAULT_PM_COMMUNICATION_FAILURE,
+
+    SYSTEM_FAULT_PM_ZERO_CURRENT,
+
+    SYSTEM_FAULT_BMS_OVER_TEMPERATURE,
+    SYSTEM_FAULT_PM_OVER_TEMPERATURE,
+
+    SYSTEM_FAULT_ESTOP_TRIGGERED,
+    SYSTEM_FAULT_PRECHARGE_FAILURE
+} system_fault_t;
+
+typedef enum
+{
+    STOP_REASON_NONE = 0,
+    STOP_REASON_MCU_REQUEST,
+    STOP_REASON_FAULT,
+    STOP_REASON_TIMEOUT
+} charging_stop_reason_t;
 /**
  * @brief Session data structure
  */
@@ -114,8 +143,10 @@ typedef struct
     uint8_t u8BMSTemperature;
     uint8_t u8PMTemperature;
     uint8_t u8BMSFaultCode;
-    uint8_t u8PMFaultCode;
+    uint16_t u16PMFaultCode;
     uint16_t u16OutputPower;
+    uint16_t u16SessionFaultCode;
+    uint16_t u16EstimatedChargingTime;
     float fPmOutputVoltage;
     float fPmOutputCurrent;
     float fPmSetVoltage;
@@ -123,6 +154,8 @@ typedef struct
     float fBMSDemandVoltage;
     float fBMSDemandCurrent;
     uint32_t u32EnergyDelivered;
+    volatile uint32_t u32PMLastRxTime;
+    volatile uint32_t u32BMSLastRxTime;
 } SESSION_Data_t;
 extern SESSION_Data_t sessionDB[MAX_DOCKS]; /* Global session database */
 
@@ -134,8 +167,8 @@ extern SESSION_Data_t sessionDB[MAX_DOCKS]; /* Global session database */
 #define SESSION_SetChargingState(idx, val)          (sessionDB[(idx)].eChargingState = (val))
 #define SESSION_GetChargingState(idx)               (sessionDB[(idx)].eChargingState)
 
-#define SESSION_SetPMState(idx, val)          (sessionDB[(idx)].bPMOnOffStatus = (val))
-#define SESSION_GetPMState(idx)               (sessionDB[(idx)].bPMOnOffStatus)
+#define SESSION_SetPMState(idx, val)        (sessionDB[(idx)].bPMOnOffStatus = (val))
+#define SESSION_GetPMState(idx)             (sessionDB[(idx)].bPMOnOffStatus)
 
 #define SESSION_SetStartChargingComm(idx, val)          (sessionDB[(idx)].bStartChargingComm = (val))
 #define SESSION_GetStartChargingComm(idx)               (sessionDB[(idx)].bStartChargingComm)
@@ -171,8 +204,8 @@ extern SESSION_Data_t sessionDB[MAX_DOCKS]; /* Global session database */
 #define SESSION_SetBMSFaultCode(idx,val)    (sessionDB[(idx)].u8BMSFaultCode = (val))
 #define SESSION_GetBMSFaultCode(idx)        (sessionDB[(idx)].u8BMSFaultCode)
 
-#define SESSION_SetPMFaultCode(idx,val)     (sessionDB[(idx)].u8PMFaultCode = (val))
-#define SESSION_GetPMFaultCode(idx)         (sessionDB[(idx)].u8PMFaultCode)
+#define SESSION_SetPMFaultCode(idx,val)     (sessionDB[(idx)].u16PMFaultCode = (val))
+#define SESSION_GetPMFaultCode(idx)         (sessionDB[(idx)].u16PMFaultCode)
 
 /* 16-bit variables */
 #define SESSION_SetPmOutputVoltage(idx,val) (sessionDB[(idx)].fPmOutputVoltage = (val))
@@ -193,17 +226,31 @@ extern SESSION_Data_t sessionDB[MAX_DOCKS]; /* Global session database */
 #define SESSION_SetPmSetCurrent(idx,val) (sessionDB[(idx)].fPmSetCurrent = (val))
 #define SESSION_GetPmSetCurrent(idx)     (sessionDB[(idx)].fPmSetCurrent)
 
-#define SESSION_SetOutputPower(idx,val)      (sessionDB[(idx)].u16OutputPower = (val))
-#define SESSION_GetOutputPower(idx)          (sessionDB[(idx)].u16OutputPower)
+#define SESSION_SetOutputPower(idx,val)  (sessionDB[(idx)].u16OutputPower = (val))
+#define SESSION_GetOutputPower(idx)      (sessionDB[(idx)].u16OutputPower)
 
+#define SESSION_SetFaultCode(idx,val) (sessionDB[(idx)].u16SessionFaultCode = (val))
+#define SESSION_GetFaultCode(idx)     (sessionDB[(idx)].u16SessionFaultCode)
+
+#define SESSION_SetEstimatedChargingTime(idx,val)      (sessionDB[(idx)].u16EstimatedChargingTime = (val))
+#define SESSION_GetEstimatedChargingTime(idx)          (sessionDB[(idx)].u16EstimatedChargingTime)
 /* 32-bit variable */
 #define SESSION_SetEnergyDelivered(idx,val)  (sessionDB[(idx)].u32EnergyDelivered = (val))
 #define SESSION_GetEnergyDelivered(idx)      (sessionDB[(idx)].u32EnergyDelivered)
 
+#define SESSION_SetPMLastRxTime(idx,val)    (sessionDB[(idx)].u32PMLastRxTime = (val))
+#define SESSION_GetPMLastRxTime(idx)        (sessionDB[(idx)].u32PMLastRxTime)
+
+#define SESSION_SetBMSLastRxTime(idx,val)   (sessionDB[(idx)].u32BMSLastRxTime = (val))
+#define SESSION_GetBMSLastRxTime(idx)       (sessionDB[(idx)].u32BMSLastRxTime)
 /* ************************************************************************** */
 /* Section: Interface Functions                                               */
 /* ************************************************************************** */
-
+void SESSION_ResetAll(void);
+void SESSION_ResetSession(uint8_t idx);
+void SESSION_ResetBMSData(uint8_t idx);
+void SESSION_ResetPMData(uint8_t idx);
+void SESSION_ResetTempData(uint8_t idx);
 /* Provide C++ Compatibility */
 #ifdef __cplusplus
 }

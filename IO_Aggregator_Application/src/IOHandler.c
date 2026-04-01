@@ -149,8 +149,10 @@ const Board_gpio_st Gpio_conf = {
     .G_LED_Pin = {76,77,78},
     .B_LED_Pin = {79,80,81},
     .Dock_Fan_Pin = {86,87,88},
-    .Compartment_Fan_Pin = {85}
-};
+    .Compartment_Fan_Pin = {85},
+    .DoorLock_Pin = {1,2,3},
+    .SolenoidLock_Pin = {4,5,6},
+    .EStop_Pin = {7}};
 /*  A brief description of a section can be given directly below the section
     banner.
  */
@@ -1762,68 +1764,96 @@ void ChargingControl(uint8_t u8DockNo, uint8_t action)
     }
 }
 
-void vDO_Operation(GPIOOperation_e eGPIOType, uint8_t u8DockNo)
+bool bGPIO_Operation(GPIOOperation_e eGPIOType, uint8_t u8DockNo)
 {
+    bool bRet = true;
     uint8_t outbErrorCode = errorNoError;
     switch (eGPIOType)
     {
-    case GPIO_AC_RELAY_ON:
+    case DO_AC_RELAY_ON:
         GPIO_Write(Gpio_conf.AC_Relay_Pin[u8DockNo], true, &outbErrorCode);
+        bRet = true;
         break;
-    case GPIO_AC_RELAY_OFF:
+    case DO_AC_RELAY_OFF:
         GPIO_Write(Gpio_conf.AC_Relay_Pin[u8DockNo], false, &outbErrorCode);
+        bRet = true;
         break;
-    case GPIO_DC_RELAY_ON:
+    case DO_DC_RELAY_ON:
         GPIO_Write(Gpio_conf.DC_Relay_Pin[u8DockNo], true, &outbErrorCode);
+        bRet = true;
         break;
-    case GPIO_DC_RELAY_OFF:
+    case DO_DC_RELAY_OFF:
         GPIO_Write(Gpio_conf.DC_Relay_Pin[u8DockNo], false, &outbErrorCode);
+        bRet = true;
         break;
-    case GPIO_SOLENOID_HIGH:
+    case DO_SOLENOID_HIGH:
         GPIO_Write(Gpio_conf.Solenoid_PinHi[u8DockNo], true, &outbErrorCode);
         vTaskDelay(100); // Add delay if solenoid needs time to actuate
         GPIO_Write(Gpio_conf.Solenoid_PinHi[u8DockNo], false, &outbErrorCode);
+        bRet = true;
         break;
-    case GPIO_SOLENOID_LOW:
+    case DO_SOLENOID_LOW:
         GPIO_Write(Gpio_conf.Solenoid_PinLo[u8DockNo], true, &outbErrorCode);
         vTaskDelay(100); // Add delay if solenoid needs time to actuate
         GPIO_Write(Gpio_conf.Solenoid_PinLo[u8DockNo], false, &outbErrorCode);
+        bRet = true;
         break;
-    case GPIO_R_LED_HIGH:
+    case DO_R_LED_HIGH:
         GPIO_Write(Gpio_conf.R_LED_Pin[u8DockNo], true, &outbErrorCode);
+        bRet = true;
         break;
-    case GPIO_R_LED_LOW:
+    case DO_R_LED_LOW:
         GPIO_Write(Gpio_conf.R_LED_Pin[u8DockNo], false, &outbErrorCode);
+        bRet = true;
         break;
-    case GPIO_G_LED_HIGH:
+    case DO_G_LED_HIGH:
         GPIO_Write(Gpio_conf.G_LED_Pin[u8DockNo], true, &outbErrorCode);
+        bRet = true;
         break;
-    case GPIO_G_LED_LOW:
+    case DO_G_LED_LOW:
         GPIO_Write(Gpio_conf.G_LED_Pin[u8DockNo], false, &outbErrorCode);
+        bRet = true;
         break;
-    case GPIO_B_LED_HIGH:
+    case DO_B_LED_HIGH:
         GPIO_Write(Gpio_conf.B_LED_Pin[u8DockNo], true, &outbErrorCode);
+        bRet = true;
         break;
-    case GPIO_B_LED_LOW:
+    case DO_B_LED_LOW:
         GPIO_Write(Gpio_conf.B_LED_Pin[u8DockNo], false, &outbErrorCode);
+        bRet = true;
         break;
-    case GPIO_DOCK_FAN_HIGH:
+    case DO_DOCK_FAN_HIGH:
         GPIO_Write(Gpio_conf.Dock_Fan_Pin[u8DockNo], true, &outbErrorCode);
+        bRet = true;
         break;
-    case GPIO_DOCK_FAN_LOW:
+    case DO_DOCK_FAN_LOW:
         GPIO_Write(Gpio_conf.Dock_Fan_Pin[u8DockNo], false, &outbErrorCode);
+        bRet = true;
         break;
-    case GPIO_COMPARTMENT_FAN_HIGH:
+    case DO_COMPARTMENT_FAN_HIGH:
         GPIO_Write(Gpio_conf.Compartment_Fan_Pin, true, &outbErrorCode);
+        bRet = true;
         break;
-    case GPIO_COMPARTMENT_FAN_LOW:
+    case DO_COMPARTMENT_FAN_LOW:
         GPIO_Write(Gpio_conf.Compartment_Fan_Pin, false, &outbErrorCode);
+        bRet = true;
+        break;
+    case DI_E_STOP_STATUS:
+        bRet = GPIO_Read(Gpio_conf.EStop_Pin, &outbErrorCode);
+        break;
+    case DI_DOOR_LOCK_STATUS:
+        bRet = GPIO_Read(Gpio_conf.DoorLock_Pin[u8DockNo], &outbErrorCode);
+        break;
+    case DI_SOLENOID_LOCK_STATUS:
+        bRet = GPIO_Read(Gpio_conf.SolenoidLock_Pin[u8DockNo], &outbErrorCode);
         break;
     default:
         SYS_CONSOLE_PRINT("[GPIO] Unknown GPIO Operation\r\n");
+        bRet = false;
         break;
     }
 }
+
 /* *****************************************************************************
  End of File
  */

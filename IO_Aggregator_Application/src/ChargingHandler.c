@@ -20,7 +20,8 @@
 #include "definitions.h"                // SYS function prototypes
 #include "configuration.h"
 #include "device.h"
-#include "timers.h"
+#include "ChargingCommunicationHandler.h"
+// #include "timers.h"
 /******************************************************************************
  * Private Macros
  ******************************************************************************/
@@ -37,10 +38,10 @@
 /* Task Queue Length (if needed later) */
 #define CHARGING_TASK_QUEUE_LENGTH        (5U)
 /* Task Delay */
-#define CHARGING_TASK_DELAY_MS            (100U)
+#define CHARGING_TASK_DELAY_MS            (1000U)
 /* LEVDC Shutoff Delay */
 #define LEVDC_SHUTOFF_DELAY_MS 2000U
-#define CAN_COMMUNICATION_TX_INTERVAL_MS 100U
+
 /* Number of PMs per group for TONHE modules */
 #define LEVDC_POWER_RESOLUTION    50U   /* Power resolution in watts */
 #define LEVDC_MAX_VOLTAGE         120U  /* As per Standard: 120 volt requirement */
@@ -55,26 +56,49 @@
  ******************************************************************************/
 static TaskHandle_t xCHARGING_TASK = NULL;
 ChargingMsgFrameInfo_t Charging_LiveInfo[MAX_DOCKS];
-TimerHandle_t xTimerCanCommunicationTx = NULL;
 /******************************************************************************
  * Private Function Prototypes
  ******************************************************************************/
 static void CHARGING_TASK(void *pvParameters);
 
 static void Charging_StateMachine(uint8_t u8DockNo);
-void vChargingCanCommunicationTxTimerCallback(TimerHandle_t xTimer);
+
+/* Charging Process Handler */
+static void vChargingProcessHandler(uint8_t u8DockNo);
+/* Vehicle & Power Module */
+static void vUpdateVehiclePMInfo(uint8_t u8DockNo);
+static void vEnergyTimeCalculation(uint8_t u8DockNo);
+static void updateSystemState(uint8_t u8DockNo);
+
+/* LED */
+void vSetLedState(uint8_t u8GunNo, uint8_t ledColor, uint8_t ledState);
+
+/* Stop & Fault Handling */
+static bool bCheckStopCondition(uint8_t u8DockNo);
+static bool bCheckFaultCondition(uint8_t u8DockNo);
+
+/* Individual Fault Checks */
+static bool bCheckEStopFault(uint8_t u8DockNo);
+static bool bCheckBMSFault(uint8_t u8DockNo);
+static bool bCheckPMFault(uint8_t u8DockNo);
+static bool bCheckBMSStatus(uint8_t u8DockNo);
+static bool bCheckPMStatus(uint8_t u8DockNo);
+static bool bCheckZeroCurrentFault(uint8_t u8DockNo);
+
+/* Fault Status Helpers */
+static bool bGetBMSFaultStatus(uint8_t u8DockNo);
+static bool bGetPMFaultStatus(uint8_t u8DockNo);
 /******************************************************************************
  * Global Function Definitions
  ******************************************************************************/
-void vProcessBMSCanMessage(CAN_RX_BUFFER *rxBuf, uint8_t canBus);
-void vProcessPMCanMessage(CAN_RX_BUFFER *rxBuf, uint8_t canBus);
+
 /******************************************************************************
  * @brief  Initialize CHARGING Task
  *
  * @return true  - Task created successfully
  * @return false - Task creation failed
 //  ******************************************************************************/
-bool CHARGING_Task_Initialize(void)
+bool ChargingTask_Init(void)
 {
     bool bStatus = false;
 
@@ -95,8 +119,10 @@ bool CHARGING_Task_Initialize(void)
     }
     else
     {
-        LOG_E("CHARGING_TASK Creation Failed\r\n");
+        SYS_CONSOLE_PRINT("CHARGING_TASK Creation Failed\r\n");
     }
+    
+    
 
     return bStatus;
 }
@@ -152,7 +178,7 @@ static bool bIsEvReadyForCharging(uint8_t u8DockNo)
              sChargingLiveInfo.LevdcRX_500ID_Info.u8WaitReqToEngTransfer ||
              sChargingLiveInfo.LevdcRX_500ID_Info.u8EnergyTransferError)
     {
-        LOG_E("MAIN: Energy Transfer Error/EV Connection/Position/Wait Request Issue for G%d\r\n", (int)u8DockNo);
+        SYS_CONSOLE_PRINT("MAIN: Energy Transfer Error/EV Connection/Position/Wait Request Issue for G%d\r\n", (int)u8DockNo);
         bRet = false;
     }
     SYS_CONSOLE_PRINT("MAIN: bIsEvReadyForCharging(G%d) = %d\r\n", (int)u8DockNo, (int)bRet);
@@ -169,6 +195,7 @@ static void CHARGING_TASK(void *pvParameters)
     {
         for (uint8_t u8DockNo = DOCK_1; u8DockNo < MAX_DOCKS; u8DockNo++)
         {
+            vChargingProcessHandler(u8DockNo);
             Charging_StateMachine(u8DockNo);
         }
 
@@ -289,8 +316,8 @@ static void v17017_StartCharging(uint8_t u8DockNo)
 
     sChargingLiveInfo.LevdcTX_509ID_Info.u16EVSEoutputVoltage = (uint16_t)(SESSION_GetPmOutputVoltage(u8DockNo) * FACTOR_10);
     sChargingLiveInfo.LevdcTX_509ID_Info.u16EVSEoutputCurrent = (uint16_t)(SESSION_GetPmOutputCurrent(u8DockNo) * FACTOR_10);
-    vDO_Operation(GPIO_AC_RELAY_ON, u8DockNo);
-    vDO_Operation(GPIO_DC_RELAY_ON, u8DockNo);
+    bGPIO_Operation(DO_AC_RELAY_ON, u8DockNo);
+    bGPIO_Operation(DO_DC_RELAY_ON, u8DockNo);
 
     (void)u8GetSetBMSData(u8DockNo, &sChargingLiveInfo, SET_PARA);
 
@@ -303,8 +330,8 @@ static void v17017_StartCharging(uint8_t u8DockNo)
 
 static void v17017_Shutdown(uint8_t u8DockNo)
 {
-    vDO_Operation(GPIO_AC_RELAY_OFF, u8DockNo);
-    vDO_Operation(GPIO_DC_RELAY_OFF, u8DockNo);
+    bGPIO_Operation(DO_AC_RELAY_OFF, u8DockNo);
+    bGPIO_Operation(DO_DC_RELAY_OFF, u8DockNo);
     SESSION_SetPMState(u8DockNo, RECTIFIER_OFF);
 
     ChargingMsgFrameInfo_t sChargingLiveInfo = {0};
@@ -328,262 +355,621 @@ static void v17017_Shutdown(uint8_t u8DockNo)
 
 static void v17017_SessionComplete(uint8_t u8DockNo)
 {
-    SESSION_SetChargingState(u8DockNo, CH_STATE_INIT);
+    if (SESSION_GetFaultCode(u8DockNo) != SYSTEM_FAULT_NONE)
+    {
+        SESSION_SetChargingState(u8DockNo, CH_STATE_ERROR);
+    }
+    else
+    {
+        SESSION_SetChargingState(u8DockNo, CH_STATE_INIT);
+    }
 }
-
-void Charging_StateMachine(uint8_t u8DockNo)
+static void v17017_SessionError(uint8_t u8DockNo)
+{
+    if (SESSION_GetFaultCode(u8DockNo) == SYSTEM_FAULT_NONE)
+    {
+        SESSION_SetChargingState(u8DockNo, CH_STATE_INIT);
+    }
+}
+static void Charging_StateMachine(uint8_t u8DockNo)
 {
     switch (SESSION_GetChargingState(u8DockNo))
     {
-    case CH_STATE_INIT:
-    {
-        v17017_SendInitReq(u8DockNo);
+    case CH_STATE_INIT: v17017_SendInitReq(u8DockNo); break;
+    case CH_STATE_AUTH_SUCCESS: v17017_AuthSuccess(u8DockNo); break;
+    case CH_STATE_PARAM_VALIDATE: v17017_ValidateParameters(u8DockNo); break;
+    case CH_STATE_CONNECTION_CONFIRMED: v17017_ConnectionConfirmed(u8DockNo); break;
+    case CH_STATE_INITIALIZE: v17017_InitializeState(u8DockNo); break;
+    case CH_STATE_PRECHARGE: v17017_PreChargingState(u8DockNo); break;
+    case CH_STATE_CHARGING: v17017_StartCharging(u8DockNo); break;
+    case CH_STATE_SHUTDOWN: v17017_Shutdown(u8DockNo); break;
+    case CH_STATE_SESSION_COMPLETE: v17017_SessionComplete(u8DockNo); break;
+    case CH_STATE_ERROR: v17017_SessionError(u8DockNo); break;
+    default: SESSION_SetChargingState(u8DockNo, CH_STATE_INIT); break;
     }
-    break;
+}
 
-    case CH_STATE_AUTH_SUCCESS:
+/*===============================================================
+ * 
+ ================================================================*/
+static void vChargingProcessHandler(uint8_t u8DockNo)
+{
+    updateSystemState(u8DockNo);
+    vUpdateVehiclePMInfo(u8DockNo);
+    vEnergyTimeCalculation(u8DockNo);
+    CH_State_e eState = SESSION_GetChargingState(u8DockNo);
+    bool bStop = bCheckStopCondition(u8DockNo);
+    if (bStop == true)
     {
-        v17017_AuthSuccess(u8DockNo);
+        if ((eState == CH_STATE_CHARGING) || (eState == CH_STATE_PRECHARGE))
+        {
+            SYS_CONSOLE_PRINT("[GUN %d] Fault Stop, fault Code: %d .\r\n", u8DockNo, SESSION_GetFaultCode(u8DockNo));
+            SESSION_SetChargingState(u8DockNo, CH_STATE_SHUTDOWN);
+        }
+        else
+        {
+            SESSION_SetChargingState(u8DockNo, CH_STATE_ERROR);
+        }
     }
-    break;
+}
+/* -----------------------
+ * Vehicle & Power Module Update
+ * ----------------------- */
+static void vUpdateVehiclePMInfo(uint8_t u8DockNo)
+{
+    float fDemandVoltage = 0U;
+    float fDemandCurrent = 0U;
+    uint16_t u16EstChrgTime = 0U;
+    uint16_t u16CurrentSoc = 0U;
+    /* Check if charging is active */
+    CH_State_e eLiveStage = SESSION_GetChargingState(u8DockNo);
+    if (eLiveStage != CH_STATE_CHARGING)
+        return;
 
-    case CH_STATE_PARAM_VALIDATE:
-    {
-        v17017_ValidateParameters(u8DockNo);
-    }
-    break;
+    ChargingMsgFrameInfo_t sChargingLiveInfo = {0};
+    (void)u8GetSetBMSData(u8DockNo, &sChargingLiveInfo, GET_PARA);
 
-    case CH_STATE_CONNECTION_CONFIRMED:
-    {
-        v17017_ConnectionConfirmed(u8DockNo);
-    }
-    break;
+    fDemandVoltage = (sChargingLiveInfo.LevdcRX_500ID_Info.u16DcOutputVolTarget * FACTOR_0_1);
+    fDemandCurrent = (sChargingLiveInfo.LevdcRX_500ID_Info.u16ReqDcCurrent * FACTOR_0_1);
+    u16EstChrgTime = sChargingLiveInfo.LevdcRX_501ID_Info.u16EstimatedChargingTime;
+    u16CurrentSoc = sChargingLiveInfo.LevdcRX_501ID_Info.u8ChargingRate;
 
-    case CH_STATE_INITIALIZE:
-    {
-        v17017_InitializeState(u8DockNo);
-    }
-    break;
+    SESSION_SetBMSDemandVoltage(u8DockNo, fDemandVoltage);
+    SESSION_SetBMSDemandCurrent(u8DockNo, fDemandCurrent);
 
-    case CH_STATE_PRECHARGE:
-    {
-        v17017_PreChargingState(u8DockNo);
-    }
-    break;
+    /* Common updates */
+    SESSION_SetEstimatedChargingTime(u8DockNo, u16EstChrgTime);
+    SESSION_SetCurrentSoc(u8DockNo, u16CurrentSoc);
 
-    case CH_STATE_CHARGING:
+    /* Initialize initial SOC if not set */
+    if (SESSION_GetInitialSoc(u8DockNo) == 0U && u16CurrentSoc != 0)
     {
-        v17017_StartCharging(u8DockNo);
-    }
-    break;
-
-    case CH_STATE_SHUTDOWN:
-    {
-        v17017_Shutdown(u8DockNo);
-    }
-    break;
-
-    case CH_STATE_SESSION_COMPLETE:
-    {
-        v17017_SessionComplete(u8DockNo);
-    }
-    break;
-
-    default:
-    {
-        /* Safety fallback */
-        SESSION_SetChargingState(u8DockNo, CH_STATE_INIT);
-    }
-    break;
+        SESSION_SetInitialSoc(u8DockNo, u16CurrentSoc);
+        SYS_CONSOLE_PRINT("GunNo: %d Initial SOC: %d", u8DockNo, u16CurrentSoc);
     }
 }
 
 /**
- * @brief Get TONHE CAN ID based on dock number and index of rectifier
+ * @brief Perform manual energy and time calculation for charging session
+ *
+ * @details
+ * This function calculates energy using V * I over time (1-second interval).
+ * It updates session energy, total energy, and charging time.
+ *
+ * @param u8DockNo Gun index
  */
-static inline uint32_t u32GetTonheCANID(uint8_t u8DockNo)
+static void vEnergyTimeCalculation(uint8_t u8DockNo)
 {
-    return TONHE_MOD_BASE_ID + ((u8DockNo - 1) * 0x100U); // IDs are offset by 0x100 each
-}
+    static uint32_t u32PreviousTick[MAX_DOCKS] = {0};
+    const float fMinValidVoltage = 5.0f;
+    const float fMinValidCurrent = 1.0f;
+    
+    CH_State_e eLiveStage = SESSION_GetChargingState(u8DockNo);
 
-static void TonhePmExecuteCommand(uint8_t u8DockNo)
-{
-    tonhe_pm_Tx_t tonhe_liveinfo_tx;
-    uint16_t u16PmVoltage = (uint16_t)(SESSION_GetPmSetVoltage(u8DockNo) * FACTOR_10);
-    uint16_t u16PmCurrent = (uint16_t)(SESSION_GetPmSetCurrent(u8DockNo) * FACTOR_100);
-
-    tonhe_liveinfo_tx.u16chargingVoltage = u16PmVoltage;
-    tonhe_liveinfo_tx.u16chargingCurrent = u16PmCurrent;
-
-    if (SESSION_GetPMState(u8DockNo))
+    /* ======================= CHARGING ACTIVE ======================= */
+    if (eLiveStage == CH_STATE_CHARGING)
     {
-        tonhe_liveinfo_tx.u8ChargingMode = 1;
-        tonhe_liveinfo_tx.u8ModuleStartStop = TONHE_MODULE_START;
+        uint32_t u32CurrentTick = xTaskGetTickCount();
+
+        /* Execute every 1 second */
+        if ((u32PreviousTick[u8DockNo] + pdMS_TO_TICKS(1000U)) <= u32CurrentTick)
+        {
+            u32PreviousTick[u8DockNo] = u32CurrentTick;
+
+            float fVoltage = SESSION_GetPmOutputVoltage (u8DockNo);
+            float fCurrent = SESSION_GetPmOutputCurrent(u8DockNo);
+
+            if ((fVoltage > fMinValidVoltage) && (fCurrent > fMinValidCurrent))
+            {
+                /* Power (W) = V * I */
+                float fPowerWatt = fVoltage * fCurrent;
+                /* Energy for 1 second: Wh = W / 3600 */
+                float fDeltaWh = fPowerWatt / 3600.0f;
+                /* Convert Wh → kWh */
+                float fDeltaKwh = fDeltaWh / FACTOR_1000_F;
+                float fTotalEnergy = SESSION_GetEnergyDelivered(u8DockNo);
+                float fNewEnergy = fTotalEnergy + fDeltaKwh;
+
+                SESSION_SetEnergyDelivered(u8DockNo, fNewEnergy);
+            }
+            else
+            {
+                SYS_CONSOLE_PRINT("[Gun %d] Invalid V/I (V=%d, I=%d)", u8DockNo, fVoltage, fCurrent);
+            }
+        }
+    }
+
+    /* ======================= SESSION START ======================= */
+    else if (eLiveStage == CH_STATE_PRECHARGE)
+    {
+        float fStartEnergy = 0.0f;
+        SESSION_SetEnergyDelivered(u8DockNo, fStartEnergy);
+        u32PreviousTick[u8DockNo] = 0U;
+        SYS_CONSOLE_PRINT("[Gun %d] Session started", u8DockNo);
+    }
+
+    /* ======================= SESSION END ======================= */
+    else if (eLiveStage == CH_STATE_SESSION_COMPLETE)
+    {
+        float fFinalEnergy = SESSION_GetEnergyDelivered(u8DockNo);
+        SYS_CONSOLE_PRINT("[Gun %d] Session ended. Energy = %.3f kWh", u8DockNo, fFinalEnergy);
+        u32PreviousTick[u8DockNo] = 0U;
     }
     else
     {
-        memset(&tonhe_liveinfo_tx, 0, sizeof(tonhe_pm_Tx_t));
-        tonhe_liveinfo_tx.u8ModuleStartStop = TONHE_MODULE_STOP;
+        // Do nothing 
     }
+}
+/**
+ * @brief Update system state based on charging state machine
+ *
+ * @param u8DockNo Dock/Gun index
+ */
+static void updateSystemState(uint8_t u8DockNo)
+{
+    static uint8_t bSessionActive[MAX_DOCKS] = {0};
+    static uint8_t u8PrvLiveState[MAX_DOCKS] = {CH_STATE_INIT};
+    CH_State_e eState = SESSION_GetChargingState(u8DockNo);
 
-    CAN_TX_BUFFER canTxBuffer = {0};
-    canTxBuffer.id = u32GetTonheCANID(u8DockNo);
-    canTxBuffer.dlc = CAN_DATA_SIZE;
-    canTxBuffer.xtd = EXT_CAN_MSG;
-    memcpy(canTxBuffer.data, &tonhe_liveinfo_tx, CAN_DATA_SIZE);
-    vSendCanTxMsgToQueue(&canTxBuffer, u8DockNo);
+    if (eState != u8PrvLiveState[u8DockNo])
+    {
+        switch (eState)
+        {
+        /* ================= INIT ================= */
+        case CH_STATE_INIT:
+            vSetLedState(u8DockNo, LED_BLUE, LED_STATE_BLINK);
+            SESSION_ResetBMSData(u8DockNo);
+            break;
+
+        /* ================= PRE-CHARGING FLOW ================= */
+        case CH_STATE_AUTH_SUCCESS:
+        case CH_STATE_PARAM_VALIDATE:
+        case CH_STATE_CONNECTION_CONFIRMED:
+        case CH_STATE_INITIALIZE:
+            vSetLedState(u8DockNo, LED_BLUE, LED_STATE_STEADY);
+            bSessionActive[u8DockNo] = 1U;
+            break;
+
+        case CH_STATE_PRECHARGE:
+            vSetLedState(u8DockNo, LED_BLUE, LED_STATE_BLINK);
+            bSessionActive[u8DockNo] = 1U;
+            break;
+
+        /* ================= ACTIVE CHARGING ================= */
+        case CH_STATE_CHARGING:
+            vSetLedState(u8DockNo, LED_GREEN, LED_STATE_STEADY);
+            bSessionActive[u8DockNo] = 1U;
+            break;
+
+        /* ================= SHUTDOWN / COMPLETE ================= */
+        case CH_STATE_SHUTDOWN:
+        case CH_STATE_SESSION_COMPLETE:
+            vSetLedState(u8DockNo, LED_GREEN, LED_STATE_BLINK);
+            break;
+
+        /* ================= ERROR ================= */
+        case CH_STATE_ERROR:
+            vSetLedState(u8DockNo, LED_RED, LED_STATE_STEADY);
+            break;
+
+        /* ================= DEFAULT ================= */
+        default:
+            SYS_CONSOLE_PRINT("Unknown state for Gun %d: %d\r\n", u8DockNo, eState);
+            vSetLedState(u8DockNo, LED_RED, LED_STATE_BLINK);
+            break;
+        }
+
+        /* ================= SESSION CLEANUP ================= */
+        if ((eState != CH_STATE_AUTH_SUCCESS) &&
+            (eState != CH_STATE_PARAM_VALIDATE) &&
+            (eState != CH_STATE_CONNECTION_CONFIRMED) &&
+            (eState != CH_STATE_INITIALIZE) &&
+            (eState != CH_STATE_PRECHARGE) &&
+            (eState != CH_STATE_CHARGING) &&
+            bSessionActive[u8DockNo])
+        {
+            SYS_CONSOLE_PRINT("Session cleanup for Gun %d\r\n", u8DockNo);
+
+            bSessionActive[u8DockNo] = 0U;
+            SESSION_ResetSession(u8DockNo);
+        }
+    }
 }
 
-void vProcessBMSMessage(uint8_t u8DockNo)
+
+void vSetLedState(uint8_t u8GunNo, uint8_t ledColor, uint8_t ledState)
 {
-    CAN_TX_BUFFER canTxBuffer = {0};
+    switch (ledColor)
+    {
+    case LED_RED:
+        break;
+    case LED_GREEN:
+        break;
+    case LED_BLUE:
+        break;
+    default:
+        // Invalid LED color
+        break;
+    }
+}
+
+static bool bCheckStopCondition(uint8_t u8DockNo)
+{
+    CH_State_e eState = SESSION_GetChargingState(u8DockNo);
+    // 1. User stop
+    if ((eState == CH_STATE_CHARGING) && (SESSION_GetAuthenticationCommand(u8DockNo) == 0U))
+    {
+        SESSION_SetSessionEndReason(u8DockNo, STOP_REASON_MCU_REQUEST);
+        return true;
+    }
+    // 2. Fault Condition
+
+    if (bCheckFaultCondition(u8DockNo) == true)
+    {
+        SESSION_SetSessionEndReason(u8DockNo, STOP_REASON_FAULT);
+        return true;
+    }
+
+    return false;
+}
+
+static bool bCheckFaultCondition(uint8_t u8DockNo) {
+    if (bCheckEStopFault(u8DockNo) == true)
+    {
+        SESSION_SetFaultCode(u8DockNo, SYSTEM_FAULT_ESTOP_TRIGGERED);
+        return true;
+    }
+
+    if (bCheckBMSFault(u8DockNo) == true)
+    {
+        SESSION_SetFaultCode(u8DockNo, SYSTEM_FAULT_BMS_ERROR);
+        return true;
+    }
+
+    if (bCheckPMFault(u8DockNo) == true)
+    {
+        SESSION_SetFaultCode(u8DockNo, SYSTEM_FAULT_PM_ERROR);
+        return true;
+    }
+
+    if (bCheckBMSStatus(u8DockNo) == true)
+    {
+        SESSION_SetFaultCode(u8DockNo, SYSTEM_FAULT_BMS_COMMUNICATION_FAILURE);
+        return true;
+    }
+
+    if (bCheckPMStatus(u8DockNo) == true)
+    {
+        SESSION_SetFaultCode(u8DockNo, SYSTEM_FAULT_PM_COMMUNICATION_FAILURE);
+        return true;
+    }
+
+    if (bCheckZeroCurrentFault(u8DockNo) == true)
+    {
+        SESSION_SetFaultCode(u8DockNo, SYSTEM_FAULT_PM_ZERO_CURRENT);
+        return true;
+    }
+    return false;
+}
+
+static bool bCheckEStopFault(uint8_t u8DockNo)
+{
+    if (bGPIO_Operation(DI_E_STOP_STATUS, u8DockNo) == true)
+    {
+        return true;
+    }
+    return false;
+}
+
+
+
+static bool bCheckBMSFault(uint8_t u8DockNo)
+{
+    static uint32_t u32BMSFaultTicks[MAX_DOCKS] = {0};
+    const uint32_t u32FaultThresholdMs = 2000U; // 2 second threshold
+    CH_State_e eState = SESSION_GetChargingState(u8DockNo);
+    if ((eState == CH_STATE_CHARGING) && (bGetBMSFaultStatus(u8DockNo) == true))
+    {
+        if (u32BMSFaultTicks[u8DockNo] == 0U)
+        {
+            u32BMSFaultTicks[u8DockNo] = xTaskGetTickCount();
+        }
+        
+        uint32_t u32ElapsedMs = (xTaskGetTickCount() - u32BMSFaultTicks[u8DockNo]) * portTICK_PERIOD_MS;
+        if (u32ElapsedMs >= u32FaultThresholdMs)
+        {
+            SYS_CONSOLE_PRINT("BMS fault triggered for Gun %d after %lu ms", u8DockNo, u32ElapsedMs);
+            u32BMSFaultTicks[u8DockNo] = 0U;
+            return true;
+        }
+    }
+    else
+    {
+        u32BMSFaultTicks[u8DockNo] = 0U;
+    }
+    return false;
+}
+
+/* Dependent function for BMS fault status */
+static bool bGetBMSFaultStatus(uint8_t u8DockNo)
+{
     ChargingMsgFrameInfo_t sChargingLiveInfo = {0};
-    (void)u8GetSetBMSData(u8DockNo, &sChargingLiveInfo, GET_PARA);
-    /* Process BMS message and update Charging_LiveInfo as needed */
-    /* For example, update SOC, voltage, current, etc. based on received BMS data */
-    /* This is a placeholder for actual BMS message processing logic */
-    if (SESSION_GetStartChargingComm(u8DockNo))
+    if (u8GetSetBMSData(u8DockNo, &sChargingLiveInfo, GET_PARA) != 0)
     {
-        canTxBuffer.dlc = CAN_DATA_SIZE;
-        canTxBuffer.xtd = STD_CAN_MSG;
-
-        canTxBuffer.id = WRITE_ID(LEVDC_CAN_ID_EVSE_STATUS);
-        memcpy(canTxBuffer.data, &sChargingLiveInfo.LevdcTX_508ID_Info, sizeof(LEVDC_Tx508_t));
-        vSendCanTxMsgToQueue(&canTxBuffer, u8DockNo);
-
-        canTxBuffer.id = WRITE_ID(LEVDC_CAN_ID_EVSE_OUTPUT_INFO);
-        memcpy(canTxBuffer.data, &sChargingLiveInfo.LevdcTX_509ID_Info, sizeof(LEVDC_Tx509_t));
-        vSendCanTxMsgToQueue(&canTxBuffer, u8DockNo);
-
-        canTxBuffer.id = WRITE_ID(LEVDC_CAN_ID_EVSE_CAPABILITY);
-        memcpy(canTxBuffer.data, &sChargingLiveInfo.LevdcTX_510ID_Info, sizeof(LEVDC_Tx510_t));
-        vSendCanTxMsgToQueue(&canTxBuffer, u8DockNo);
+        SYS_CONSOLE_PRINT("MAIN: [Dock %d] BMS data read failed", u8DockNo);
+        return true;
     }
-}
-void vProcessPMMessage(uint8_t u8DockNo)
-{
-    TonhePmExecuteCommand(u8DockNo);
-}
-void vChargingCanCommunicationTxTimerCallback(TimerHandle_t xTimer)
-{
-    /* This callback can be used to trigger periodic CAN communication tasks related to charging */
-    /* For example, it could set a flag or send a message to the CHARGING_TASK to perform certain actions */
-    /* Implementation depends on specific requirements for CAN communication during charging */
-    /* Placeholder for future CAN communication logic */
-    (void)xTimer; // Unused parameter
 
-    for (uint8_t u8DockNo = DOCK_1; u8DockNo < MAX_DOCKS; u8DockNo++)
+    /* Check critical faults */
+    if (sChargingLiveInfo.LevdcRX_500ID_Info.u8EnergyTransferError)
     {
-       vProcessBMSMessage(u8DockNo); // Process BMS messages for each dock, which may involve CAN communication
-       vProcessPMMessage(u8DockNo);  // Process PM messages for each dock, which may involve CAN communication
+        SYS_CONSOLE_PRINT("MAIN: [Dock %d] BMS Critical Fault: EnergyTransferError", u8DockNo);
+        return true;
     }
+
+    if (sChargingLiveInfo.LevdcRX_500ID_Info.u8EvConStatus)
+    {
+        SYS_CONSOLE_PRINT("MAIN: [Dock %d] BMS Critical Fault: EvConStatus", u8DockNo);
+        return true;
+    }
+
+    if (sChargingLiveInfo.LevdcRX_500ID_Info.u8EvChargingStopControl)
+    {
+        SYS_CONSOLE_PRINT("MAIN: [Dock %d] BMS Critical Fault: ChargingStopControl", u8DockNo);
+        return true;
+    }
+
+    if (sChargingLiveInfo.LevdcRX_500ID_Info.u8BatteryOverVol)
+    {
+        SYS_CONSOLE_PRINT("MAIN: [Dock %d] BMS Critical Fault: BatteryOverVoltage", u8DockNo);
+        return true;
+    }
+
+    /* Check warnings (log but don't treat as faults) */
+    if (sChargingLiveInfo.LevdcRX_500ID_Info.u8HighBatteryTemp)
+    {
+        SYS_CONSOLE_PRINT("MAIN: [Dock %d] BMS Warning: HighBatteryTemp", u8DockNo);
+    }
+
+    if (sChargingLiveInfo.LevdcRX_500ID_Info.u8BatterVoltageDeviError)
+    {
+        SYS_CONSOLE_PRINT("MAIN: [Dock %d] BMS Warning: VoltageDeviation", u8DockNo);
+    }
+
+    return false;
 }
 
-void vChargingCommunicationInit(void)
+static bool bCheckPMFault(uint8_t u8DockNo)
 {
-    if (xTimerCanCommunicationTx == NULL)
+    static uint32_t u32PMFaultTicks[MAX_DOCKS] = {0};
+    const uint32_t u32FaultThresholdMs = 2000U; // 2 second threshold
+    CH_State_e eState = SESSION_GetChargingState(u8DockNo);
+    if ((eState == CH_STATE_CHARGING) && (bGetPMFaultStatus(u8DockNo) == true))
     {
-        int32_t tickIdComm = 0;
-        xTimerCanCommunicationTx = xTimerCreate("CanCommTxTimer",
-                                               pdMS_TO_TICKS(CAN_COMMUNICATION_TX_INTERVAL_MS),
-                                               pdTRUE,
-                                               (void *)&tickIdComm,
-                                               vChargingCanCommunicationTxTimerCallback);
-        if (xTimerCanCommunicationTx != NULL)
+        if (u32PMFaultTicks[u8DockNo] == 0U)
         {
-            xTimerStart(xTimerCanCommunicationTx, 0);
+            u32PMFaultTicks[u8DockNo] = xTaskGetTickCount();
         }
-        else
+        
+        uint32_t u32ElapsedMs = (xTaskGetTickCount() - u32PMFaultTicks[u8DockNo]) * portTICK_PERIOD_MS;
+        if (u32ElapsedMs >= u32FaultThresholdMs)
         {
-            LOG_E("Failed to create CAN Communication Tx Timer\r\n");
+            SYS_CONSOLE_PRINT("PM fault triggered for Gun %d after %lu ms", u8DockNo, u32ElapsedMs);
+            u32PMFaultTicks[u8DockNo] = 0U;
+            return true;
         }
     }
+    else
+    {
+        u32PMFaultTicks[u8DockNo] = 0U;
+    }
+    return false;
 }
 
-void vProcessPMCanMessage(CAN_RX_BUFFER *rxBuf, uint8_t canBus)
+/* Dependent function for PM fault status */
+static bool bGetPMFaultStatus(uint8_t u8DockNo)
 {
-    // Process PM message based on CAN bus and message content
-    SYS_CONSOLE_PRINT("Processing PM CAN message from CAN%d\r\n", canBus);
-    // Add specific processing logic here based on message ID and data
+    uint16_t u16FaultCode = (uint16_t)SESSION_GetPMFaultCode(u8DockNo);
+    bool bHasFault = false;
+    /* Check critical faults (bits 0-11) */
+    if (u16FaultCode & (1U << 0))
+    {
+        SYS_CONSOLE_PRINT("MAIN: [Dock %d] PM Critical Fault: Module input undervoltage", u8DockNo);
+        bHasFault = true;
+    }
+    if (u16FaultCode & (1U << 1))
+    {
+        SYS_CONSOLE_PRINT("MAIN: [Dock %d] PM Critical Fault: Module input phase loss", u8DockNo);
+        bHasFault = true;
+    }
+    if (u16FaultCode & (1U << 2))
+    {
+        SYS_CONSOLE_PRINT("MAIN: [Dock %d] PM Critical Fault: Module input overvoltage", u8DockNo);
+        bHasFault = true;
+    }
+    if (u16FaultCode & (1U << 3))
+    {
+        SYS_CONSOLE_PRINT("MAIN: [Dock %d] PM Critical Fault: Module output overvoltage", u8DockNo);
+        bHasFault = true;
+    }
+    if (u16FaultCode & (1U << 4))
+    {
+        SYS_CONSOLE_PRINT("MAIN: [Dock %d] PM Critical Fault: Module output overcurrent", u8DockNo);
+        bHasFault = true;
+    }
+    if (u16FaultCode & (1U << 5))
+    {
+        SYS_CONSOLE_PRINT("MAIN: [Dock %d] PM Critical Fault: Module temperature high", u8DockNo);
+        bHasFault = true;
+    }
+    if (u16FaultCode & (1U << 6))
+    {
+        SYS_CONSOLE_PRINT("MAIN: [Dock %d] PM Critical Fault: Module fan fault", u8DockNo);
+        bHasFault = true;
+    }
+    if (u16FaultCode & (1U << 7))
+    {
+        SYS_CONSOLE_PRINT("MAIN: [Dock %d] PM Critical Fault: Module hardware fault", u8DockNo);
+        bHasFault = true;
+    }
+    if (u16FaultCode & (1U << 8))
+    {
+        SYS_CONSOLE_PRINT("MAIN: [Dock %d] PM Critical Fault: Bus exception", u8DockNo);
+        bHasFault = true;
+    }
+    if (u16FaultCode & (1U << 9))
+    {
+        SYS_CONSOLE_PRINT("MAIN: [Dock %d] PM Critical Fault: SCI communication exception", u8DockNo);
+        bHasFault = true;
+    }
+    if (u16FaultCode & (1U << 10))
+    {
+        SYS_CONSOLE_PRINT("MAIN: [Dock %d] PM Critical Fault: Discharge fault", u8DockNo);
+        bHasFault = true;
+    }
+    if (u16FaultCode & (1U << 11))
+    {
+        SYS_CONSOLE_PRINT("MAIN: [Dock %d] PM Critical Fault: PFC shutdown due to exception", u8DockNo);
+        bHasFault = true;
+    }
+
+    /* Check warnings (bits 12-14) */
+    if (u16FaultCode & (1U << 12))
+    {
+        SYS_CONSOLE_PRINT("MAIN: [Dock %d] PM Warning: Output undervoltage", u8DockNo);
+    }
+    if (u16FaultCode & (1U << 13))
+    {
+        SYS_CONSOLE_PRINT("MAIN: [Dock %d] PM Warning: Output overvoltage", u8DockNo);
+    }
+    if (u16FaultCode & (1U << 14))
+    {
+        SYS_CONSOLE_PRINT("MAIN: [Dock %d] PM Warning: Power limit due to high", u8DockNo);
+    }
+
+    return bHasFault;
 }
-bool bIsValidCanID(uint32_t canId)
+
+static bool bCheckBMSStatus(uint8_t u8DockNo)
 {
     bool bRet = false;
-    if(canId == LEVDC_CAN_ID_EV_REQUEST ||
-       canId == LEVDC_CAN_ID_EV_CHARGING_INFO ||
-       canId == LEVDC_CAN_ID_EV_CONTROL_OPTION)
+    const uint32_t u32FaultThresholdMs = 10000U; // 10 second threshold
+    uint32_t u32CurrentTick = xTaskGetTickCount();
+    uint32_t u32LastBMSRxTick = SESSION_GetBMSLastRxTime(u8DockNo);
+    CH_State_e eState = SESSION_GetChargingState(u8DockNo);
+    uint32_t u32ElapsedMs = (u32CurrentTick - u32LastBMSRxTick);
+
+    if (u32ElapsedMs >= u32FaultThresholdMs)
     {
-        bRet = true;
+        if (SESSION_GetBMSRxStatus(u8DockNo) == true)
+        {
+            SESSION_SetBMSRxStatus(u8DockNo, false);
+            SYS_CONSOLE_PRINT("BMS communication timeout for Gun %d: Last Rx %lu ms ago", u8DockNo, u32ElapsedMs);
+        }
+        if (eState == CH_STATE_CHARGING)
+        {
+            bRet = true;
+        }
+    }
+    else 
+    {
+        if (u32LastBMSRxTick == 0)
+        {
+            SESSION_SetBMSRxStatus(u8DockNo, false);
+        }
+        else if (SESSION_GetBMSRxStatus(u8DockNo) == false)
+        {
+            SESSION_SetBMSRxStatus(u8DockNo, true);
+            SYS_CONSOLE_PRINT("BMS communication restored for Gun %d: Last Rx %lu ms ago", u8DockNo, u32ElapsedMs);
+        }
     }
     return bRet;
 }
-void vProcessBMSCanMessage(CAN_RX_BUFFER *rxBuf, uint8_t canBus)
+
+static bool bCheckPMStatus(uint8_t u8DockNo)
 {
-    if (rxBuf == NULL)
+    bool bRet = false;
+    const uint32_t u32FaultThresholdMs = 10000U; // 10 second threshold
+    uint32_t u32CurrentTick = xTaskGetTickCount();
+    uint32_t u32LastPMRxTick = SESSION_GetPMLastRxTime(u8DockNo);
+    CH_State_e eState = SESSION_GetChargingState(u8DockNo);
+    uint32_t u32ElapsedMs = (u32CurrentTick - u32LastPMRxTick);
+
+    if (u32ElapsedMs >= u32FaultThresholdMs)
     {
-        SYS_CONSOLE_PRINT("BMS: NULL RX buffer\r\n");
-        return;
+        if (SESSION_GetPMRxStatus(u8DockNo) == true)
+        {
+            SESSION_SetPMRxStatus(u8DockNo, false);
+            SYS_CONSOLE_PRINT("PM communication timeout for Gun %d: Last Rx %lu ms ago", u8DockNo, u32ElapsedMs);
+        }
+        if (eState == CH_STATE_CHARGING)
+        {
+            bRet = true;
+        }
     }
-
-    SYS_CONSOLE_PRINT("Processing BMS CAN message from CAN%d\r\n", canBus);
-
-    uint32_t u32CanId = READ_ID(rxBuf->id);
-
-    if (!bIsValidCanID(u32CanId))
+    else 
     {
-        return;
+        if (u32LastPMRxTick == 0)
+        {
+            SESSION_SetPMRxStatus(u8DockNo, false);
+        }
+        else if (SESSION_GetPMRxStatus(u8DockNo) == false)
+        {
+            SESSION_SetPMRxStatus(u8DockNo, true);
+            SYS_CONSOLE_PRINT("PM communication restored for Gun %d: Last Rx %lu ms ago", u8DockNo, u32ElapsedMs);
+        }
     }
-
-    // Map CAN bus → Dock
-    uint8_t u8DockNo = DOCK_1; // Default to DOCK_1, will be overridden by switch-case
-    switch (canBus)
-    {
-        case CANBUS_0: u8DockNo = DOCK_1; break;
-        case CANBUS_1: u8DockNo = DOCK_2; break;
-        case CANBUS_2: u8DockNo = DOCK_3; break;
-        default:
-            SYS_CONSOLE_PRINT("Invalid CAN bus\r\n");
-            return;
-    }
-
-    ChargingMsgFrameInfo_t sChargingLiveInfo = {0};
-
-    (void)u8GetSetBMSData(u8DockNo, &sChargingLiveInfo, GET_PARA);
-
-    switch (u32CanId)
-    {
-        case LEVDC_CAN_ID_EV_REQUEST:
-            if (rxBuf->dlc >= sizeof(LEVDC_Rx500_t))
-            {
-                memcpy(&sChargingLiveInfo.LevdcRX_500ID_Info,
-                       rxBuf->data,
-                       sizeof(LEVDC_Rx500_t));
-            }
-            break;
-
-        case LEVDC_CAN_ID_EV_CHARGING_INFO:
-            if (rxBuf->dlc >= sizeof(LEVDC_Rx501_t))
-            {
-                memcpy(&sChargingLiveInfo.LevdcRX_501ID_Info,
-                       rxBuf->data,
-                       sizeof(LEVDC_Rx501_t));
-            }
-            break;
-
-        case LEVDC_CAN_ID_EV_CONTROL_OPTION:
-            if (rxBuf->dlc >= sizeof(LEVDC_Rx502_t))
-            {
-                memcpy(&sChargingLiveInfo.LevdcRX_502ID_Info,
-                       rxBuf->data,
-                       sizeof(LEVDC_Rx502_t));
-            }
-            break;
-
-        default:
-            SYS_CONSOLE_PRINT("Unhandled CAN ID: 0x%X on CAN%d\r\n",
-                              (unsigned int)u32CanId, canBus);
-            break;
-    }
-
-    (void)u8GetSetBMSData(u8DockNo, &sChargingLiveInfo, SET_PARA);
+    return bRet;
 }
+
+static bool bCheckZeroCurrentFault(uint8_t u8DockNo)
+{
+    static uint32_t u32ZeroCurrentTicks[MAX_DOCKS] = {0};
+    const uint32_t u32FaultThresholdMs = 30000U; // 30 second threshold
+    const float fZeroCurrentThreshold = 0.5f; // Threshold to consider as zero current
+    float fCurrent = SESSION_GetPmOutputCurrent(u8DockNo);
+    CH_State_e eState = SESSION_GetChargingState(u8DockNo);
+    
+    if ((eState == CH_STATE_CHARGING) && (fCurrent < fZeroCurrentThreshold)) // Threshold for zero current fault
+    {
+        if (u32ZeroCurrentTicks[u8DockNo] == 0U)
+        {
+            u32ZeroCurrentTicks[u8DockNo] = xTaskGetTickCount();
+        }
+        
+        uint32_t u32ElapsedMs = (xTaskGetTickCount() - u32ZeroCurrentTicks[u8DockNo]) * portTICK_PERIOD_MS;
+        if (u32ElapsedMs >= u32FaultThresholdMs)
+        {
+            SYS_CONSOLE_PRINT("Zero current fault detected for Gun %d after %lu ms: Current = %.2f A", u8DockNo, u32ElapsedMs, fCurrent);
+            u32ZeroCurrentTicks[u8DockNo] = 0U;
+            return true;
+        }
+    }
+    else
+    {
+        u32ZeroCurrentTicks[u8DockNo] = 0U;
+    }
+    return false;
+}
+
+//////////////////////////////////////////////////////////////////////////////////

@@ -81,7 +81,7 @@ void SESSION_ResetTempData(uint8_t idx)
  */
 void SESSION_ResetSession(uint8_t idx)
 {
-    SESSION_SetState(idx, 0U);
+    // SESSION_SetChargingState(idx, 0U);
     SESSION_SetSessionEndReason(idx, 0U);
     SESSION_SetAuthenticationCommand(idx, 0U);
     SESSION_SetEnergyDelivered(idx, 0UL);
