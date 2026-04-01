@@ -226,7 +226,7 @@ void SYS_Tasks ( void )
     /* Start RTOS Scheduler. */
     vIOHandler();
     Telemetry_Init();
-    // ChargingTask_Init();
+    ChargingTask_Init();
     // vRS485HandlerInit();
     vCanHandlerInit();
     vCommonTaskHandler();

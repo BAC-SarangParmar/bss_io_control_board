@@ -661,6 +661,7 @@
       <itemPath>../src/ChargingHandler.h</itemPath>
       <itemPath>../src/TelemetryHandler.h</itemPath>
       <itemPath>../src/sessionDBHandler.h</itemPath>
+      <itemPath>../src/ChargingCommunicationHandler.h</itemPath>
     </logicalFolder>
     <logicalFolder name="ExternalFiles"
                    displayName="Important Files"
@@ -1068,6 +1069,7 @@
       <itemPath>../src/ChargingHandler.c</itemPath>
       <itemPath>../src/TelemetryHandler.c</itemPath>
       <itemPath>../src/sessionDBHandler.c</itemPath>
+      <itemPath>../src/ChargingCommunicationHandler.c</itemPath>
     </logicalFolder>
   </logicalFolder>
   <sourceRootList>

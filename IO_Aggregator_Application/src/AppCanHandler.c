@@ -36,108 +36,113 @@ Bacancy Systems LLP or any third party.
 // Section: Included Files
 // *****************************************************************************
 // *****************************************************************************
-#include <stddef.h>                     // Defines NULL
-#include <stdbool.h>                    // Defines true
-#include <stdlib.h>                     // Defines EXIT_FAILURE
-#include "definitions.h"                // SYS function prototypes
+#include <stddef.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include "definitions.h"
 #include "AppCanHandler.h"
 
-// ********** CAN Message RAM Allocation **********
-uint8_t CACHE_ALIGN __attribute__((space(data), section (".can0_message_ram"))) Can0MessageRAM[CAN0_MESSAGE_RAM_CONFIG_SIZE];
-uint8_t CACHE_ALIGN __attribute__((space(data), section (".can1_message_ram"))) Can1MessageRAM[CAN1_MESSAGE_RAM_CONFIG_SIZE];
-uint8_t CACHE_ALIGN __attribute__((space(data), section (".can2_message_ram"))) Can2MessageRAM[CAN2_MESSAGE_RAM_CONFIG_SIZE];
-uint8_t CACHE_ALIGN __attribute__((space(data), section (".can3_message_ram"))) Can3MessageRAM[CAN3_MESSAGE_RAM_CONFIG_SIZE];
-uint8_t CACHE_ALIGN __attribute__((space(data), section (".can4_message_ram"))) Can4MessageRAM[CAN4_MESSAGE_RAM_CONFIG_SIZE];
-uint8_t CACHE_ALIGN __attribute__((space(data), section (".can5_message_ram"))) Can5MessageRAM[CAN5_MESSAGE_RAM_CONFIG_SIZE];
+/* ================= DEBUG CONTROL ================= */
 
-uint8_t CanMessageRAM[CAN3_MESSAGE_RAM_CONFIG_SIZE];
+/* Set to 1 → Enable debug prints */
+/* Set to 0 → Disable debug prints */
+#define CAN_DEBUG_ENABLE    1
 
+#if CAN_DEBUG_ENABLE
+    #define CAN_DEBUG_EXEC(x)           do { x; } while(0)
+#else
+    #define CAN_DEBUG_EXEC(x)
+#endif
+/* ================= CONFIGURATION ================= */
 #define CAN_TX_PAYLOAD_SIZE 8
 #define CAN_TASK_DELAY 10U
-static uint32_t status = 0;// ********** CAN Data Buffers **********
-// ********** CAN Data Buffers **********
-static uint8_t u8CAN0buffer[256];
-static uint8_t u8CAN1buffer[256];
-static uint8_t u8CAN2buffer[256];
 
-// Declare the mutex handle globally
-SemaphoreHandle_t xCan0RXQueueMutex;
-SemaphoreHandle_t xCan0TXQueueMutex;
-SemaphoreHandle_t xCan1RXQueueMutex;
-SemaphoreHandle_t xCan1TXQueueMutex;
-SemaphoreHandle_t xCan2RXQueueMutex;
-SemaphoreHandle_t xCan2TXQueueMutex;
+/* ================= MESSAGE RAM ================= */
+uint8_t CACHE_ALIGN __attribute__((space(data), section(".can0_message_ram"))) Can0MessageRAM[CAN0_MESSAGE_RAM_CONFIG_SIZE];
+uint8_t CACHE_ALIGN __attribute__((space(data), section(".can1_message_ram"))) Can1MessageRAM[CAN1_MESSAGE_RAM_CONFIG_SIZE];
+uint8_t CACHE_ALIGN __attribute__((space(data), section(".can2_message_ram"))) Can2MessageRAM[CAN2_MESSAGE_RAM_CONFIG_SIZE];
 
-// ********** FreeRTOS Queue Handlers **********
+/* ================= QUEUES ================= */
 QueueHandle_t xCAN0RXQueueHandler;
 QueueHandle_t xCAN1RXQueueHandler;
 QueueHandle_t xCAN2RXQueueHandler;
+
 QueueHandle_t xCAN0TXQueueHandler;
 QueueHandle_t xCAN1TXQueueHandler;
 QueueHandle_t xCAN2TXQueueHandler;
 
-/* ========================================================
-    FUNCTION PROTOTYPES
-     ============================================================ */
+/* ================= STATIC BUFFERS ================= */
+static CAN_RX_BUFFER can0RxBuffer[CAN0_RX_FIFO0_SIZE];
+static CAN_RX_BUFFER can1RxBuffer[CAN1_RX_FIFO0_SIZE];
+static CAN_RX_BUFFER can2RxBuffer[CAN2_RX_FIFO0_SIZE];
+
+/* ================= EXTERNAL ================= */
 extern void vProcessBMSCanMessage(CAN_RX_BUFFER *rxBuf, uint8_t canBus);
 extern void vProcessPMCanMessage(CAN_RX_BUFFER *rxBuf, uint8_t canBus);
 
 /**
- * @brief Swaps the endianness of a 32-bit unsigned integer.
+ * @brief Swap byte order of a 32-bit unsigned integer.
  *
- * This function reverses the byte order of a 32-bit value, converting 
- * between little-endian and big-endian formats.
+ * This function converts a 32-bit value between little-endian and big-endian
+ * formats by reversing the byte order.
  *
- * @param value The 32-bit unsigned integer to swap.
- * @return The 32-bit unsigned integer with reversed byte order.
+ * @param[in] value 32-bit input value
  *
- * Example:
- *  Input:  0xAABBCCDD  (stored as DD CC BB AA in memory)
- *  Output: 0xDDCCBBAA  (stored as AA BB CC DD in memory)
+ * @return uint32_t Byte-swapped value
+ *
+ * @note Useful when handling CAN data from different endianness systems.
  */
-uint32_t swap_endian_32(uint32_t value) {
+uint32_t swap_endian_32(uint32_t value)
+{
     return ((value >> 24) & 0x000000FF) |
            ((value >>  8) & 0x0000FF00) |
            ((value <<  8) & 0x00FF0000) |
            ((value << 24) & 0xFF000000);
 }
 
+/* ================= CAN WRITE ================= */
 /**
- * @brief Transmits a CAN message on the specified CAN interface.
+ * @brief Transmit CAN frame using raw byte buffer.
  *
- * This function sends a CAN frame using one of the available CAN channels.
- * It extracts the 29-bit CAN ID from the first 4 bytes of the input data,
- * sets up the transmission buffer, and sends the payload.
+ * This function extracts a 29-bit extended CAN ID from the first 4 bytes
+ * of the input buffer and sends the remaining 8 bytes as payload.
  *
- * @param u8data   Pointer to the data buffer containing the CAN ID (4 bytes) 
- *                 followed by the payload.
- * @param i8len    Length of the data (not directly used, as payload size is fixed).
- * @return True if the message was successfully transmitted, false otherwise.
+ * Expected data format:
+ * ----------------------------------------
+ * | Byte 0-3 | CAN ID (Big Endian)        |
+ * | Byte 4-11| Payload (8 bytes max)      |
+ * ----------------------------------------
  *
- * Example Usage:
- *  uint8_t message[12] = { 0x1A, 0x2B, 0x3C, 0x4D,  // CAN ID: 0x1A2B3C4D
- *                          0x11, 0x22, 0x33, 0x44,  // Data Payload
- *                          0x55, 0x66, 0x77, 0x88 };
- *  bool status = CAN0_Write( message, 12);
+ * @param[in] canIndex  CAN controller index (0, 1, 2)
+ * @param[in] u8data    Pointer to input buffer (min 12 bytes required)
+ * @param[in] i8len     Length of input buffer
+ *
+ * @return true  Transmission successful
+ * @return false Transmission failed / invalid input
  */
-
-// Generalized CAN write function
 bool CAN_Write(uint8_t canIndex, uint8_t *u8data, char i8len)
 {
-    static CAN_TX_BUFFER txBuffer; // Use static buffer to avoid excessive stack usage
+    if (u8data == NULL || i8len < (CAN_TX_PAYLOAD_SIZE + 4))
+    {
+        SYS_CONSOLE_PRINT("Invalid CAN write input\r\n");
+        return false;
+    }
+
+    static CAN_TX_BUFFER txBuffer;
     memset(&txBuffer, 0, sizeof(CAN_TX_BUFFER));
 
-    // Extract 29-bit CAN ID from the first 4 bytes
+    /* Extract 29-bit CAN ID */
     uint32_t canId = ((uint32_t)u8data[0] << 24) |
                      ((uint32_t)u8data[1] << 16) |
                      ((uint32_t)u8data[2] << 8)  |
                      ((uint32_t)u8data[3]);
 
-    txBuffer.id  = canId & 0x1FFFFFFF;  // 29-bit Extended ID
-    txBuffer.xtd = 1;                  // Mark as extended frame
+    txBuffer.id  = canId & 0x1FFFFFFF;
+    txBuffer.xtd = 1;
     txBuffer.dlc = CAN_TX_PAYLOAD_SIZE;
 
     SYS_CONSOLE_PRINT("Writing Data on CAN%d, ID: %08X, Payload: ", canIndex, canId);
+
     for (uint8_t i = 0; i < CAN_TX_PAYLOAD_SIZE; i++)
     {
         txBuffer.data[i] = u8data[i + 4];
@@ -150,14 +155,23 @@ bool CAN_Write(uint8_t canIndex, uint8_t *u8data, char i8len)
         case 0: return CAN0_MessageTransmitFifo(1, &txBuffer);
         case 1: return CAN1_MessageTransmitFifo(1, &txBuffer);
         case 2: return CAN2_MessageTransmitFifo(1, &txBuffer);
-        // case 3: return CAN3_MessageTransmitFifo(1, &txBuffer);
-        // case 4: return CAN4_MessageTransmitFifo(1, &txBuffer);
-        // case 5: return CAN5_MessageTransmitFifo(1, &txBuffer);
         default:
-            SYS_CONSOLE_PRINT("Invalid CAN index.\r\n");
+            SYS_CONSOLE_PRINT("Invalid CAN index\r\n");
             return false;
     }
 }
+
+/**
+ * @brief Transmit CAN message on CAN0 interface.
+ *
+ * This function sends a CAN frame using CAN0 transmit FIFO.
+ * It validates the input buffer and DLC before transmission.
+ *
+ * @param[in] tx_buffer Pointer to CAN TX buffer structure
+ *
+ * @return true  Transmission successful
+ * @return false Transmission failed / invalid input
+ */
 bool CAN0_Write(const CAN_TX_BUFFER *const tx_buffer)
 {
     if (tx_buffer == NULL)
@@ -166,14 +180,12 @@ bool CAN0_Write(const CAN_TX_BUFFER *const tx_buffer)
         return false;
     }
 
-    // Validate DLC
-    if (tx_buffer->dlc > 8)
+    if (tx_buffer->dlc > CAN_TX_PAYLOAD_SIZE)
     {
         SYS_CONSOLE_PRINT("CAN0: Invalid DLC\r\n");
         return false;
     }
 
-    // Try transmit
     if (!CAN0_MessageTransmitFifo(1U, tx_buffer))
     {
         SYS_CONSOLE_PRINT("CAN0: TX failed\r\n");
@@ -182,6 +194,18 @@ bool CAN0_Write(const CAN_TX_BUFFER *const tx_buffer)
 
     return true;
 }
+
+/**
+ * @brief Transmit CAN message on CAN1 interface.
+ *
+ * This function sends a CAN frame using CAN1 transmit FIFO.
+ * It validates the input buffer and DLC before transmission.
+ *
+ * @param[in] tx_buffer Pointer to CAN TX buffer structure
+ *
+ * @return true  Transmission successful
+ * @return false Transmission failed / invalid input
+ */
 bool CAN1_Write(const CAN_TX_BUFFER *const tx_buffer)
 {
     if (tx_buffer == NULL)
@@ -190,15 +214,13 @@ bool CAN1_Write(const CAN_TX_BUFFER *const tx_buffer)
         return false;
     }
 
-    // Validate DLC
-    if (tx_buffer->dlc > 8)
+    if (tx_buffer->dlc > CAN_TX_PAYLOAD_SIZE)
     {
         SYS_CONSOLE_PRINT("CAN1: Invalid DLC\r\n");
         return false;
     }
 
-    // Attempt transmit using FIFO 0
-    if (!CAN1_MessageTransmitFifo(0, tx_buffer))
+    if (!CAN1_MessageTransmitFifo(1U, tx_buffer))
     {
         SYS_CONSOLE_PRINT("CAN1: TX failed\r\n");
         return false;
@@ -207,6 +229,17 @@ bool CAN1_Write(const CAN_TX_BUFFER *const tx_buffer)
     return true;
 }
 
+/**
+ * @brief Transmit CAN message on CAN2 interface.
+ *
+ * This function sends a CAN frame using CAN2 transmit FIFO.
+ * It validates the input buffer and DLC before transmission.
+ *
+ * @param[in] tx_buffer Pointer to CAN TX buffer structure
+ *
+ * @return true  Transmission successful
+ * @return false Transmission failed / invalid input
+ */
 bool CAN2_Write(const CAN_TX_BUFFER *const tx_buffer)
 {
     if (tx_buffer == NULL)
@@ -215,15 +248,13 @@ bool CAN2_Write(const CAN_TX_BUFFER *const tx_buffer)
         return false;
     }
 
-    // Validate DLC
-    if (tx_buffer->dlc > 8)
+    if (tx_buffer->dlc > CAN_TX_PAYLOAD_SIZE)
     {
         SYS_CONSOLE_PRINT("CAN2: Invalid DLC\r\n");
         return false;
     }
 
-    // Attempt transmit using FIFO 0
-    if (!CAN2_MessageTransmitFifo(0, tx_buffer))
+    if (!CAN2_MessageTransmitFifo(1U, tx_buffer))
     {
         SYS_CONSOLE_PRINT("CAN2: TX failed\r\n");
         return false;
@@ -231,6 +262,19 @@ bool CAN2_Write(const CAN_TX_BUFFER *const tx_buffer)
 
     return true;
 }
+/**
+ * @brief Process received CAN message based on frame type.
+ *
+ * This function routes the received CAN message to the appropriate
+ * processing handler based on whether the frame is extended or standard.
+ *
+ * @param[in] rxBuf Pointer to received CAN buffer
+ * @param[in] canBus CAN bus identifier
+ *
+ * @note
+ * - Extended ID → Power Module processing
+ * - Standard ID → BMS processing
+ */
 void vProcessCanRxMessage(CAN_RX_BUFFER *rxBuf, uint8_t canBus)
 {
     if (rxBuf == NULL)
@@ -238,6 +282,7 @@ void vProcessCanRxMessage(CAN_RX_BUFFER *rxBuf, uint8_t canBus)
         SYS_CONSOLE_PRINT("Received NULL CAN RX buffer\r\n");
         return;
     }
+
     if (rxBuf->xtd)
     {
         vProcessPMCanMessage(rxBuf, canBus);
@@ -249,181 +294,144 @@ void vProcessCanRxMessage(CAN_RX_BUFFER *rxBuf, uint8_t canBus)
 }
 
 /**
- * @brief CAN0 Server Task
- * 
- * This FreeRTOS task handles TCP/UDP communication for CAN0.
- * It manages incoming connections, reads data from the socket,
- * transmits it to the CAN bus, and processes CAN queue messages
- * to send over the network. The task also ensures reconnection
- * if the socket is closed or disconnected.
- * 
- * @param[in] pvParameters Pointer to task parameters (unused).
+ * @brief Initialize CAN message RAM, queues, and tasks.
+ *
+ * This function performs:
+ * - CAN message RAM configuration
+ * - FreeRTOS queue creation for RX/TX
+ * - Task creation for CAN handling
+ *
+ * @note Must be called during system initialization.
  */
-
-void vCan0HandlerServerTask(void *pvParameters)
+void vCanHandlerInit(void)
 {
-    (void)pvParameters; // Unused parameter
-    SYS_CONSOLE_PRINT("In Function: %s\r\n", __FUNCTION__);
-    while (true)
+    CAN0_MessageRAMConfigSet(Can0MessageRAM);
+    CAN1_MessageRAMConfigSet(Can1MessageRAM);
+    CAN2_MessageRAMConfigSet(Can2MessageRAM);
+
+
+    xCAN0RXQueueHandler = xQueueCreate(CAN_QUEUE_SIZE, sizeof(CAN_RX_BUFFER));
+    xCAN0TXQueueHandler = xQueueCreate(CAN_QUEUE_SIZE, sizeof(CAN_TX_BUFFER));
+    xCAN1RXQueueHandler = xQueueCreate(CAN_QUEUE_SIZE, sizeof(CAN_RX_BUFFER));
+    xCAN1TXQueueHandler = xQueueCreate(CAN_QUEUE_SIZE, sizeof(CAN_TX_BUFFER));
+    xCAN2RXQueueHandler = xQueueCreate(CAN_QUEUE_SIZE, sizeof(CAN_RX_BUFFER));
+    xCAN2TXQueueHandler = xQueueCreate(CAN_QUEUE_SIZE, sizeof(CAN_TX_BUFFER));
+
+    if (!xCAN0RXQueueHandler || !xCAN0TXQueueHandler ||
+        !xCAN1RXQueueHandler || !xCAN1TXQueueHandler ||
+        !xCAN2RXQueueHandler || !xCAN2TXQueueHandler)
     {
-        CAN_RX_BUFFER canRxBuffer = {0};
-        CAN_TX_BUFFER canTxBuffer = {0};
+        SYS_CONSOLE_PRINT("Error: Queue creation failed\r\n");
+        return;
+    }
 
-        // -----------------------------
-        // Handle CAN TX Queue
-        // -----------------------------
-        if (xSemaphoreTake(xCan0TXQueueMutex, pdMS_TO_TICKS(10)) == pdTRUE)
-        {
-            if (xQueueReceive(xCAN0TXQueueHandler, &canTxBuffer, 0) == pdPASS)
-            {
-                if (!CAN0_Write(&canTxBuffer))
-                {
-                    SYS_CONSOLE_PRINT("CAN0: Write failed\r\n");
-                }
-            }
+    SYS_CONSOLE_PRINT("Queue creation successful\r\n");
 
-            xSemaphoreGive(xCan0TXQueueMutex);
-        }
+    if (xTaskCreate(vCanRxHandlerTask, "CAN_RX", CAN_RX_HANDLER_HEAP_DEPTH, NULL,
+                    CAN_RX_HANDLER_TASK_PRIORITY, NULL) != pdPASS)
+    {
+        SYS_CONSOLE_PRINT("Error: RX Task create failed\r\n");
+    }
 
-        // -----------------------------
-        // 2. Handle CAN RX Queue
-        // -----------------------------
-        if (xSemaphoreTake(xCan0RXQueueMutex, pdMS_TO_TICKS(10)) == pdPASS)
-        {
-            if (xQueueReceive(xCAN0RXQueueHandler, &canRxBuffer, 0) == pdPASS)
-            {
-                vProcessCanRxMessage(&canRxBuffer, CANBUS_0); // Process received CAN message for CAN0
-            }
-            xSemaphoreGive(xCan0RXQueueMutex);
-        }
+    if (xTaskCreate(vCan0HandlerServerTask, "CAN0_SRV", CAN_SERVER_HANDLER_HEAP_DEPTH, NULL,
+                    CAN_SERVER_HANDLER_TASK_PRIORITY, NULL) != pdPASS)
+    {
+        SYS_CONSOLE_PRINT("Error: CAN0 Task failed\r\n");
+    }
 
-        // -----------------------------
-        // 3. Small delay to yield CPU
-        // -----------------------------
-        vTaskDelay(pdMS_TO_TICKS(CAN_TASK_DELAY));
+    if (xTaskCreate(vCan1HandlerServerTask, "CAN1_SRV", CAN_SERVER_HANDLER_HEAP_DEPTH, NULL,
+                    CAN_SERVER_HANDLER_TASK_PRIORITY, NULL) != pdPASS)
+    {
+        SYS_CONSOLE_PRINT("Error: CAN1 Task failed\r\n");
+    }
+
+    if (xTaskCreate(vCan2HandlerServerTask, "CAN2_SRV", CAN_SERVER_HANDLER_HEAP_DEPTH, NULL,
+                    CAN_SERVER_HANDLER_TASK_PRIORITY, NULL) != pdPASS)
+    {
+        SYS_CONSOLE_PRINT("Error: CAN2 Task failed\r\n");
     }
 }
 
-void vCan1HandlerServerTask(void *pvParameters)
+/**
+ * @brief Send CAN TX message to respective queue.
+ *
+ * This function routes the given CAN TX buffer to the correct
+ * CAN transmit queue based on dock number.
+ *
+ * @param[in] pCanTxBuffer Pointer to CAN TX buffer
+ * @param[in] u8DockNo     Dock identifier (DOCK_1, DOCK_2, DOCK_3)
+ *
+ * @note Non-blocking queue send with short timeout.
+ */
+void vSendCanTxMsgToQueue(const CAN_TX_BUFFER *const pCanTxBuffer, uint8_t u8DockNo)
 {
-    (void)pvParameters; // Unused parameter
-    SYS_CONSOLE_PRINT("In Function: %s\r\n", __FUNCTION__);
-
-    while (true)
+    if (pCanTxBuffer == NULL)
     {
-        CAN_RX_BUFFER canRxBuffer = {0};
-        CAN_TX_BUFFER canTxBuffer = {0};
+        SYS_CONSOLE_PRINT("NULL TX buffer\r\n");
+        return;
+    }
 
-        // -----------------------------
-        // Handle CAN TX Queue
-        // -----------------------------
-        if (xSemaphoreTake(xCan1TXQueueMutex, pdMS_TO_TICKS(10)) == pdTRUE)
+    QueueHandle_t tx_queue = NULL;
+
+    switch (u8DockNo)
+    {
+        case DOCK_1: tx_queue = xCAN0TXQueueHandler; break;
+        case DOCK_2: tx_queue = xCAN1TXQueueHandler; break;
+        case DOCK_3: tx_queue = xCAN2TXQueueHandler; break;
+        default:
+            SYS_CONSOLE_PRINT("Invalid dock number\r\n");
+            return;
+    }
+
+    if (tx_queue != NULL)
+    {
+        if (xQueueSend(tx_queue, pCanTxBuffer, pdMS_TO_TICKS(5)) != pdPASS)
         {
-            if (xQueueReceive(xCAN1TXQueueHandler, &canTxBuffer, 0) == pdPASS)
-            {
-                if (!CAN1_Write(&canTxBuffer))
-                {
-                    SYS_CONSOLE_PRINT("CAN1: Write failed\r\n");
-                }
-            }
-
-            xSemaphoreGive(xCan1TXQueueMutex);
+            SYS_CONSOLE_PRINT("Dock %u TX queue full\r\n", u8DockNo);
         }
-
-        // -----------------------------
-        // Handle CAN RX Queue
-        // -----------------------------
-        if (xSemaphoreTake(xCan1RXQueueMutex, pdMS_TO_TICKS(10)) == pdTRUE)
-        {
-            if (xQueueReceive(xCAN1RXQueueHandler, &canRxBuffer, 0) == pdPASS)
-            {
-                vProcessCanRxMessage(&canRxBuffer, CANBUS_1); // Process received CAN message for CAN1
-            }
-
-            xSemaphoreGive(xCan1RXQueueMutex);
-        }
-
-        // -----------------------------
-        // Small delay to yield CPU
-        // -----------------------------
-        vTaskDelay(pdMS_TO_TICKS(CAN_TASK_DELAY));
     }
 }
-
-void vCan2HandlerServerTask(void *pvParameters)
+/**
+ * @brief Check if CAN RX status is valid.
+ *
+ * This function evaluates the Last Error Code (LEC) field
+ * from the CAN protocol status register to determine whether
+ * the received frame is valid.
+ *
+ * @param[in] status CAN error/status register value
+ *
+ * @return true  No critical RX error
+ * @return false RX error detected
+ */
+static inline bool CAN_IsRxOK(uint32_t status)
 {
-    (void)pvParameters; // Unused parameter
-    SYS_CONSOLE_PRINT("In Function: %s\r\n", __FUNCTION__);
+    uint32_t lec = status & CAN_PSR_LEC_Msk;
 
-    while (true)
-    {
-        CAN_RX_BUFFER canRxBuffer = {0};
-        CAN_TX_BUFFER canTxBuffer = {0};
-
-        // -----------------------------
-        // Handle CAN TX Queue
-        // -----------------------------
-        if (xSemaphoreTake(xCan2TXQueueMutex, pdMS_TO_TICKS(10)) == pdTRUE)
-        {
-            if (xQueueReceive(xCAN2TXQueueHandler, &canTxBuffer, 0) == pdPASS)
-            {
-                if (!CAN2_Write(&canTxBuffer))
-                {
-                    SYS_CONSOLE_PRINT("CAN2: Write failed\r\n");
-                }
-            }
-
-            xSemaphoreGive(xCan2TXQueueMutex);
-        }
-
-        // -----------------------------
-        // Handle CAN RX Queue
-        // -----------------------------
-        if (xSemaphoreTake(xCan2RXQueueMutex, pdMS_TO_TICKS(10)) == pdTRUE)
-        {
-            if (xQueueReceive(xCAN2RXQueueHandler, &canRxBuffer, 0) == pdPASS)
-            {
-                vProcessCanRxMessage(&canRxBuffer, CANBUS_2); // Process received CAN message for CAN2
-            }
-
-            xSemaphoreGive(xCan2RXQueueMutex);
-        }
-
-        // -----------------------------
-        // Small delay to yield CPU
-        // -----------------------------
-        vTaskDelay(pdMS_TO_TICKS(CAN_TASK_DELAY));
-    }
+    return (lec == CAN_ERROR_NONE) || (lec == CAN_ERROR_LEC_NC);
 }
-static void vDisplayCanRxMessage(CAN_RX_BUFFER *rxBuf, uint8_t rxBufLen)
-{
-    uint8_t length = 0;
-    uint8_t msgLength = 0;
-    uint32_t id = 0;
-    id = rxBuf->xtd ? rxBuf->id : READ_ID(rxBuf->id);
-    msgLength = rxBuf->dlc;
-    length = msgLength;
-    SYS_CONSOLE_PRINT(" Message - ID : 0x%x Length : 0x%x ", (unsigned int)id, (unsigned int)msgLength);
-    SYS_CONSOLE_PRINT("Message : ");
-    while (length)
-    {
-        SYS_CONSOLE_PRINT("0x%x ", rxBuf->data[msgLength - length--]);
-    }
-    SYS_CONSOLE_PRINT("\r\n");
-}
+
+/**
+ * @brief Display CAN error status.
+ *
+ * This function decodes and prints the CAN error status
+ * based on the Protocol Status Register (PSR).
+ *
+ * @param[in] status  CAN error/status register value
+ * @param[in] canName Name of CAN module (e.g., "CAN0")
+ */
 static void vDisplayCanErrorStatus(uint32_t status, const char *canName)
 {
     SYS_CONSOLE_PRINT("%s status: 0x%08lX\r\n", canName, (unsigned long)status);
 
     switch (status & CAN_PSR_LEC_Msk)
     {
-        case 1: SYS_CONSOLE_PRINT("%s: Stuff error\n", canName); break;
-        case 2: SYS_CONSOLE_PRINT("%s: Form error\n", canName); break;
-        case 3: SYS_CONSOLE_PRINT("%s: ACK error\n", canName); break;
-        case 4: SYS_CONSOLE_PRINT("%s: Bit-1 error\n", canName); break;
-        case 5: SYS_CONSOLE_PRINT("%s: Bit-0 error\n", canName); break;
-        case 6: SYS_CONSOLE_PRINT("%s: CRC error\n", canName); break;
-        case 7: SYS_CONSOLE_PRINT("%s: LEC unchanged\n", canName); break;
+        case 1: SYS_CONSOLE_PRINT("%s: Stuff error\r\n", canName); break;
+        case 2: SYS_CONSOLE_PRINT("%s: Form error\r\n", canName); break;
+        case 3: SYS_CONSOLE_PRINT("%s: ACK error\r\n", canName); break;
+        case 4: SYS_CONSOLE_PRINT("%s: Bit-1 error\r\n", canName); break;
+        case 5: SYS_CONSOLE_PRINT("%s: Bit-0 error\r\n", canName); break;
+        case 6: SYS_CONSOLE_PRINT("%s: CRC error\r\n", canName); break;
+        case 7: SYS_CONSOLE_PRINT("%s: LEC unchanged\r\n", canName); break;
         default: break;
     }
 
@@ -432,260 +440,261 @@ static void vDisplayCanErrorStatus(uint32_t status, const char *canName)
         SYS_CONSOLE_PRINT("%s: Bus-Off state detected\r\n", canName);
     }
 }
-
-static inline bool CAN_IsRxOK(uint32_t status)
+/**
+ * @brief Display received CAN message.
+ *
+ * This function prints the CAN ID, DLC, and payload data
+ * for debugging purposes.
+ *
+ * @param[in] rxBuf   Pointer to received CAN buffer
+ * @param[in] rxBufLen Length of buffer (not used internally)
+ */
+static void vDisplayCanRxMessage(CAN_RX_BUFFER *rxBuf, uint8_t rxBufLen)
 {
-    uint32_t lec = status & CAN_PSR_LEC_Msk;
-    return (lec == CAN_ERROR_NONE) || (lec == CAN_ERROR_LEC_NC);
-}
+    if (rxBuf == NULL)
+    {
+        SYS_CONSOLE_PRINT("RX buffer is NULL\r\n");
+        return;
+    }
 
+    uint8_t length = rxBuf->dlc;
+    uint32_t id = rxBuf->xtd ? rxBuf->id : READ_ID(rxBuf->id);
+
+    SYS_CONSOLE_PRINT("Message - ID: 0x%lx Length: %u Data: ",
+                      (unsigned long)id, length);
+
+    for (uint8_t i = 0; i < length; i++)
+    {
+        SYS_CONSOLE_PRINT("0x%02X ", rxBuf->data[i]);
+    }
+
+    SYS_CONSOLE_PRINT("\r\n");
+}
+/**
+ * @brief CAN RX handler FreeRTOS task.
+ *
+ * This task continuously monitors CAN interrupt flags,
+ * reads messages from RX FIFO, and pushes them into
+ * corresponding FreeRTOS queues.
+ *
+ * @param[in] pvParameters Unused task parameter
+ *
+ * @note
+ * - Handles CAN0, CAN1, CAN2
+ * - Runs in polling mode with small delay
+ */
 void vCanRxHandlerTask(void *pvParameters)
 {
+    (void)pvParameters;
+    SYS_CONSOLE_PRINT("CAN RX Handler Task started\r\n");
     while (true)
     {
+        /* ================= CAN0 ================= */
         if (CAN0_InterruptGet(CAN_INTERRUPT_RF0N_MASK))
         {
+            // SYS_CONSOLE_PRINT("CAN0 RX interrupt\r\n");
             CAN0_InterruptClear(CAN_INTERRUPT_RF0N_MASK);
 
             uint32_t status = CAN0_ErrorGet();
-            vDisplayCanErrorStatus(status, "CAN0");
+
+            CAN_DEBUG_EXEC(
+                vDisplayCanErrorStatus(status, "CAN0");
+            );
 
             if (CAN_IsRxOK(status))
             {
-                uint8_t u8NumberOfMessage = CAN0_RxFifoFillLevelGet(CAN_RX_FIFO_0);
+                uint8_t count = CAN0_RxFifoFillLevelGet(CAN_RX_FIFO_0);
 
-                if (u8NumberOfMessage > 0)
+                if (count > CAN0_RX_FIFO0_SIZE)
                 {
-                    if (u8NumberOfMessage > CAN0_RX_FIFO0_SIZE)
-                    {
-                        SYS_CONSOLE_PRINT("CAN0 RX FIFO overflow!\r\n");
-                        u8NumberOfMessage = CAN0_RX_FIFO0_SIZE;
-                    }
+                    SYS_CONSOLE_PRINT("CAN0 FIFO overflow\r\n");
+                    count = CAN0_RX_FIFO0_SIZE;
+                }
 
-                    CAN_RX_BUFFER canRxBuffer[CAN0_RX_FIFO0_SIZE] = {0};
-
-                    if (CAN0_MessageReceiveFifo(CAN_RX_FIFO_0, u8NumberOfMessage, canRxBuffer))
+                if (count > 0 && CAN0_MessageReceiveFifo(CAN_RX_FIFO_0, count, can0RxBuffer))
+                {
+                    for (uint8_t i = 0; i < count; i++)
                     {
-                        for (uint8_t u8Count = 0; u8Count < u8NumberOfMessage; u8Count++)
+                        CAN_DEBUG_EXEC(
+                            vDisplayCanRxMessage(&can0RxBuffer[i], CAN0_RX_FIFO0_ELEMENT_SIZE);
+                        );
+
+                        if (xQueueSend(xCAN0RXQueueHandler, &can0RxBuffer[i], pdMS_TO_TICKS(5)) != pdPASS)
                         {
-                            vDisplayCanRxMessage(&canRxBuffer[u8Count], CAN0_RX_FIFO0_ELEMENT_SIZE);
-
-                            if (xSemaphoreTake(xCan0RXQueueMutex, pdMS_TO_TICKS(10)) == pdTRUE)
-                            {
-                                if (xQueueSend(xCAN0RXQueueHandler, &canRxBuffer[u8Count], 0) != pdPASS)
-                                {
-                                    SYS_CONSOLE_PRINT("CAN0 queue full\r\n");
-                                }
-                                xSemaphoreGive(xCan0RXQueueMutex);
-                            }
-                            else
-                            {
-                                SYS_CONSOLE_PRINT("CAN0 mutex timeout\r\n");
-                            }
+                            SYS_CONSOLE_PRINT("CAN0 queue full\r\n");
                         }
                     }
-                    else
-                    {
-                        SYS_CONSOLE_PRINT("Error receiving CAN0 message\r\n");
-                    }
+                }
+                else
+                {
+                    SYS_CONSOLE_PRINT("CAN0 receive failed\r\n");
                 }
             }
         }
 
+        /* ================= CAN1 ================= */
         if (CAN1_InterruptGet(CAN_INTERRUPT_RF0N_MASK))
         {
             CAN1_InterruptClear(CAN_INTERRUPT_RF0N_MASK);
 
             uint32_t status = CAN1_ErrorGet();
-            vDisplayCanErrorStatus(status, "CAN1");
+
+            CAN_DEBUG_EXEC(
+                vDisplayCanErrorStatus(status, "CAN1");
+            );
 
             if (CAN_IsRxOK(status))
             {
-              uint8_t u8NumberOfMessage = CAN1_RxFifoFillLevelGet(CAN_RX_FIFO_0);
+                uint8_t count = CAN1_RxFifoFillLevelGet(CAN_RX_FIFO_0);
 
-                if (u8NumberOfMessage > 0)
+                if (count > CAN1_RX_FIFO0_SIZE)
                 {
-                    if (u8NumberOfMessage > CAN1_RX_FIFO0_SIZE)
-                    {
-                        SYS_CONSOLE_PRINT("CAN1 RX FIFO overflow!\r\n");
-                        u8NumberOfMessage = CAN1_RX_FIFO0_SIZE;
-                    }
+                    SYS_CONSOLE_PRINT("CAN1 FIFO overflow\r\n");
+                    count = CAN1_RX_FIFO0_SIZE;
+                }
 
-                    CAN_RX_BUFFER canRxBuffer[CAN1_RX_FIFO0_SIZE] = {0};
-
-                    if (CAN1_MessageReceiveFifo(CAN_RX_FIFO_0, u8NumberOfMessage, canRxBuffer))
+                if (count > 0 && CAN1_MessageReceiveFifo(CAN_RX_FIFO_0, count, can1RxBuffer))
+                {
+                    for (uint8_t i = 0; i < count; i++)
                     {
-                        for (uint8_t i = 0; i < u8NumberOfMessage; i++)
+                        CAN_DEBUG_EXEC(
+                            vDisplayCanRxMessage(&can1RxBuffer[i], CAN1_RX_FIFO0_ELEMENT_SIZE);
+                        );
+
+                        if (xQueueSend(xCAN1RXQueueHandler, &can1RxBuffer[i], pdMS_TO_TICKS(5)) != pdPASS)
                         {
-                            vDisplayCanRxMessage(&canRxBuffer[i], CAN1_RX_FIFO0_ELEMENT_SIZE);
-
-                            if (xSemaphoreTake(xCan1RXQueueMutex, pdMS_TO_TICKS(10)) == pdTRUE)
-                            {
-                                if (xQueueSend(xCAN1RXQueueHandler, &canRxBuffer[i], 0) != pdPASS)
-                                {
-                                    SYS_CONSOLE_PRINT("CAN1 queue full\r\n");
-                                }
-                                xSemaphoreGive(xCan1RXQueueMutex);
-                            }
-                            else
-                            {
-                                SYS_CONSOLE_PRINT("CAN1 mutex timeout\r\n");
-                            }
+                            SYS_CONSOLE_PRINT("CAN1 queue full\r\n");
                         }
                     }
-                    else
-                    {
-                        SYS_CONSOLE_PRINT("Error receiving CAN1 message\r\n");
-                    }
+                }
+                else
+                {
+                    SYS_CONSOLE_PRINT("CAN1 receive failed\r\n");
                 }
             }
         }
 
+        /* ================= CAN2 ================= */
         if (CAN2_InterruptGet(CAN_INTERRUPT_RF0N_MASK))
         {
             CAN2_InterruptClear(CAN_INTERRUPT_RF0N_MASK);
 
             uint32_t status = CAN2_ErrorGet();
-            vDisplayCanErrorStatus(status, "CAN2");
+
+            CAN_DEBUG_EXEC(
+                vDisplayCanErrorStatus(status, "CAN2");
+            );
 
             if (CAN_IsRxOK(status))
             {
-               uint8_t u8NumberOfMessage = CAN2_RxFifoFillLevelGet(CAN_RX_FIFO_0);
+                uint8_t count = CAN2_RxFifoFillLevelGet(CAN_RX_FIFO_0);
 
-                if (u8NumberOfMessage > 0)
+                if (count > CAN2_RX_FIFO0_SIZE)
                 {
-                    if (u8NumberOfMessage > CAN2_RX_FIFO0_SIZE)
-                    {
-                        SYS_CONSOLE_PRINT("CAN2 RX FIFO overflow!\r\n");
-                        u8NumberOfMessage = CAN2_RX_FIFO0_SIZE;
-                    }
+                    SYS_CONSOLE_PRINT("CAN2 FIFO overflow\r\n");
+                    count = CAN2_RX_FIFO0_SIZE;
+                }
 
-                    CAN_RX_BUFFER canRxBuffer[CAN2_RX_FIFO0_SIZE] = {0};
-
-                    if (CAN2_MessageReceiveFifo(CAN_RX_FIFO_0, u8NumberOfMessage, canRxBuffer))
+                if (count > 0 && CAN2_MessageReceiveFifo(CAN_RX_FIFO_0, count, can2RxBuffer))
+                {
+                    for (uint8_t i = 0; i < count; i++)
                     {
-                        for (uint8_t i = 0; i < u8NumberOfMessage; i++)
+                        CAN_DEBUG_EXEC(
+                            vDisplayCanRxMessage(&can2RxBuffer[i], CAN2_RX_FIFO0_ELEMENT_SIZE);
+                        );
+
+                        if (xQueueSend(xCAN2RXQueueHandler, &can2RxBuffer[i], pdMS_TO_TICKS(5)) != pdPASS)
                         {
-                            vDisplayCanRxMessage(&canRxBuffer[i], CAN2_RX_FIFO0_ELEMENT_SIZE);
-
-                            if (xSemaphoreTake(xCan2RXQueueMutex, pdMS_TO_TICKS(10)) == pdTRUE)
-                            {
-                                if (xQueueSend(xCAN2RXQueueHandler, &canRxBuffer[i], 0) != pdPASS)
-                                {
-                                    SYS_CONSOLE_PRINT("CAN2 queue full\r\n");
-                                }
-                                xSemaphoreGive(xCan2RXQueueMutex);
-                            }
-                            else
-                            {
-                                SYS_CONSOLE_PRINT("CAN2 mutex timeout\r\n");
-                            }
+                            SYS_CONSOLE_PRINT("CAN2 queue full\r\n");
                         }
                     }
-                    else
-                    {
-                        SYS_CONSOLE_PRINT("Error receiving CAN2 message\r\n");
-                    }
+                }
+                else
+                {
+                    SYS_CONSOLE_PRINT("CAN2 receive failed\r\n");
                 }
             }
         }
+
         vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
 /**
- * @brief Initializes CAN handlers and message RAM configuration.
- * 
- * This function configures message RAM for all CAN instances and initializes
- * FreeRTOS queues for CAN message handling. It also creates the required 
- * FreeRTOS tasks for CAN reception and TCP/UDP server handling.
+ * @brief CAN0 server task for TX/RX processing.
+ *
+ * This task:
+ * - Sends messages from CAN0 TX queue
+ * - Processes messages from CAN0 RX queue
+ *
+ * @param[in] pvParameters Unused task parameter
  */
-void vCanHandlerInit(void)
+void vCan0HandlerServerTask(void *pvParameters)
 {
-    /* Set Message RAM Configuration */   
-    CAN0_MessageRAMConfigSet(Can0MessageRAM);
-    CAN1_MessageRAMConfigSet(Can1MessageRAM);
-    CAN2_MessageRAMConfigSet(Can2MessageRAM);
+    (void)pvParameters;
+    CAN_RX_BUFFER rx;
+    CAN_TX_BUFFER tx;
 
-    /* Create CAN Queues */
-    xCAN0RXQueueHandler = xQueueCreate(CAN_QUEUE_SIZE, CAN_QUEUE_ITEM_SIZE);
-    xCAN0TXQueueHandler = xQueueCreate(CAN_QUEUE_SIZE, CAN_QUEUE_ITEM_SIZE);
-    xCAN1RXQueueHandler = xQueueCreate(CAN_QUEUE_SIZE, CAN_QUEUE_ITEM_SIZE);
-    xCAN1TXQueueHandler = xQueueCreate(CAN_QUEUE_SIZE, CAN_QUEUE_ITEM_SIZE);
-    xCAN2RXQueueHandler = xQueueCreate(CAN_QUEUE_SIZE, CAN_QUEUE_ITEM_SIZE);
-    xCAN2TXQueueHandler = xQueueCreate(CAN_QUEUE_SIZE, CAN_QUEUE_ITEM_SIZE);
-
-    /* Check if all required queues were created successfully */
-    if (xCAN0RXQueueHandler == NULL || xCAN0TXQueueHandler == NULL || 
-        xCAN1RXQueueHandler == NULL || xCAN1TXQueueHandler == NULL || 
-        xCAN2RXQueueHandler == NULL || xCAN2TXQueueHandler == NULL) 
+    while (true)
     {
-        SYS_CONSOLE_PRINT("Error: CANRX Queue creation failed\r\n");
-        return;
-    }
-    SYS_CONSOLE_PRINT("CANRX Queue creation successful\r\n"); 
-    xCan0RXQueueMutex = xSemaphoreCreateMutex();
-    xCan0TXQueueMutex = xSemaphoreCreateMutex();
-    xCan1RXQueueMutex = xSemaphoreCreateMutex();
-    xCan1TXQueueMutex = xSemaphoreCreateMutex();
-    xCan2RXQueueMutex = xSemaphoreCreateMutex();
-    xCan2TXQueueMutex = xSemaphoreCreateMutex();
+        if (xQueueReceive(xCAN0TXQueueHandler, &tx, 0) == pdPASS)
+            CAN0_Write(&tx);
 
-    if (xCan0RXQueueMutex == NULL || xCan0TXQueueMutex == NULL ||
-        xCan1RXQueueMutex == NULL || xCan1TXQueueMutex == NULL ||
-        xCan2RXQueueMutex == NULL || xCan2TXQueueMutex == NULL)
-    {
-        // Handle error: At least one mutex creation failed
-         SYS_CONSOLE_PRINT("Error: Mutex creation failed\r\n");
-    }
+        if (xQueueReceive(xCAN0RXQueueHandler, &rx, 0) == pdPASS)
+            vProcessCanRxMessage(&rx, CANBUS_0);
 
-    /* Create Tasks */
-    xTaskCreate(vCanRxHandlerTask, "vCanRxHandlerTask", CAN_RX_HANDLER_HEAP_DEPTH, NULL, CAN_RX_HANDLER_TASK_PRIORITY, NULL);
-    xTaskCreate(vCan0HandlerServerTask, "vCan0HandlerServerTask", CAN_SERVER_HANDLER_HEAP_DEPTH, NULL, CAN_SERVER_HANDLER_TASK_PRIORITY, NULL);
-    xTaskCreate(vCan1HandlerServerTask, "vCan1HandlerServerTask", CAN_SERVER_HANDLER_HEAP_DEPTH, NULL, CAN_SERVER_HANDLER_TASK_PRIORITY, NULL);
-    xTaskCreate(vCan2HandlerServerTask, "vCan2HandlerServerTask", CAN_SERVER_HANDLER_HEAP_DEPTH, NULL, CAN_SERVER_HANDLER_TASK_PRIORITY, NULL);
+        vTaskDelay(pdMS_TO_TICKS(CAN_TASK_DELAY));
+    }
 }
-void vSendCanTxMsgToQueue(const CAN_TX_BUFFER *const pCanTxBuffer, uint8_t u8DockNo)
+
+/**
+ * @brief CAN1 server task for TX/RX processing.
+ *
+ * This task:
+ * - Sends messages from CAN1 TX queue
+ * - Processes messages from CAN1 RX queue
+ *
+ * @param[in] pvParameters Unused task parameter
+ */
+void vCan1HandlerServerTask(void *pvParameters)
 {
-    if (pCanTxBuffer == NULL)
-    {
-        SYS_CONSOLE_PRINT("vSendCanTxMsgToQueue: NULL CAN TX buffer\r\n");
-        return;
-    }
-    QueueHandle_t tx_queue = NULL;
-    SemaphoreHandle_t tx_mutex = NULL;
+    (void)pvParameters;
+    CAN_RX_BUFFER rx;
+    CAN_TX_BUFFER tx;
 
-    switch (u8DockNo)
+    while (true)
     {
-    case DOCK_1:
-        tx_queue = xCAN0TXQueueHandler;
-        tx_mutex = xCan0TXQueueMutex;
-        break;
-    case DOCK_2:
-        tx_queue = xCAN1TXQueueHandler;
-        tx_mutex = xCan1TXQueueMutex;
-        break;
-    case DOCK_3:
-        tx_queue = xCAN2TXQueueHandler;
-        tx_mutex = xCan2TXQueueMutex;
-        break;
-    default:
-        SYS_CONSOLE_PRINT("vSendCanTxMsgToQueue: Invalid dock number\r\n");
-        return;
-    }
+        if (xQueueReceive(xCAN1TXQueueHandler, &tx, 0) == pdPASS)
+            CAN1_Write(&tx);
 
-    if ((tx_queue != NULL) && (tx_mutex != NULL))
+        if (xQueueReceive(xCAN1RXQueueHandler, &rx, 0) == pdPASS)
+            vProcessCanRxMessage(&rx, CANBUS_1);
+
+        vTaskDelay(pdMS_TO_TICKS(CAN_TASK_DELAY));
+    }
+}
+/**
+ * @brief CAN2 server task for TX/RX processing.
+ *
+ * This task:
+ * - Sends messages from CAN2 TX queue
+ * - Processes messages from CAN2 RX queue
+ *
+ * @param[in] pvParameters Unused task parameter
+ */
+void vCan2HandlerServerTask(void *pvParameters)
+{
+    (void)pvParameters;
+    CAN_RX_BUFFER rx;
+    CAN_TX_BUFFER tx;
+
+    while (true)
     {
-        if (xSemaphoreTake(tx_mutex, pdMS_TO_TICKS(10)) == pdTRUE)
-        {
-            if (xQueueSend(tx_queue, pCanTxBuffer, 0) != pdPASS)
-            {
-                SYS_CONSOLE_PRINT("Dock %u TX queue full\r\n", u8DockNo);
-            }
-            xSemaphoreGive(tx_mutex);
-        }
-        else
-        {
-            SYS_CONSOLE_PRINT("Dock %u TX mutex timeout\r\n", u8DockNo);
-        }
+        if (xQueueReceive(xCAN2TXQueueHandler, &tx, 0) == pdPASS)
+            CAN2_Write(&tx);
+
+        if (xQueueReceive(xCAN2RXQueueHandler, &rx, 0) == pdPASS)
+            vProcessCanRxMessage(&rx, CANBUS_2);
+
+        vTaskDelay(pdMS_TO_TICKS(CAN_TASK_DELAY));
     }
 }

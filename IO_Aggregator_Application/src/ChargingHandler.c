@@ -190,7 +190,7 @@ static bool bIsEvReadyForCharging(uint8_t u8DockNo)
 static void CHARGING_TASK(void *pvParameters)
 {
     (void)pvParameters;
-
+SYS_CONSOLE_PRINT("In Function: %s\r\n", __FUNCTION__);
     for (;;)
     {
         for (uint8_t u8DockNo = DOCK_1; u8DockNo < MAX_DOCKS; u8DockNo++)
