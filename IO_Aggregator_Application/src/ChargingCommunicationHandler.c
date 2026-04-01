@@ -27,7 +27,7 @@
  *                              PRIVATE TYPEDEFS
  * ========================================================================== */
 
-TimerHandle_t xTimerCanCommunicationTx = NULL;
+ TimerHandle_t xTimerCanCommunicationTx = NULL;
 
 /* ============================================================================
  *                              PRIVATE VARIABLES
@@ -187,13 +187,13 @@ void vChargingCommunicationInit(void)
 {
     static int32_t timerId = 0;
 
-    // xTimerCanCommunicationTx = xTimerCreate(
-    //     "CanCommTxTimer",
-    //     pdMS_TO_TICKS(CAN_COMMUNICATION_TX_INTERVAL_MS),
-    //     pdTRUE,
-    //     (void *)&timerId,
-    //     vChargingCanCommunicationTxTimerCallback
-    // );
+    xTimerCanCommunicationTx = xTimerCreate(
+        "CanCommTxTimer",
+        pdMS_TO_TICKS(CAN_COMMUNICATION_TX_INTERVAL_MS),
+        pdTRUE,
+        (void *)&timerId,
+        vChargingCanCommunicationTxTimerCallback
+    );
 
     if (xTimerCanCommunicationTx != NULL)
     {
