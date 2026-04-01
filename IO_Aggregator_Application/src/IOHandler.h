@@ -156,6 +156,7 @@ typedef enum
 } CommandID_t;
 typedef struct
 {
+    /* DO Pins*/
     uint8_t AC_Relay_Pin[MAX_DOCKS];
     uint8_t DC_Relay_Pin[MAX_DOCKS];
     uint8_t Solenoid_PinHi[MAX_DOCKS];
@@ -165,68 +166,31 @@ typedef struct
     uint8_t B_LED_Pin[MAX_DOCKS];
     uint8_t Dock_Fan_Pin[MAX_DOCKS];
     uint8_t Compartment_Fan_Pin;
+    /* DI Pins*/
+    uint8_t DoorLock_Pin[MAX_DOCKS];
+    uint8_t SolenoidLock_Pin[MAX_DOCKS];
+    uint8_t EStop_Pin;
 } Board_gpio_st;
 typedef enum {
-    GPIO_AC_RELAY_ON = 0,
-    GPIO_AC_RELAY_OFF,
-    GPIO_DC_RELAY_ON,
-    GPIO_DC_RELAY_OFF,
-    GPIO_SOLENOID_HIGH,
-    GPIO_SOLENOID_LOW,
-    GPIO_R_LED_HIGH,
-    GPIO_R_LED_LOW,
-    GPIO_G_LED_HIGH,
-    GPIO_G_LED_LOW,
-    GPIO_B_LED_HIGH,
-    GPIO_B_LED_LOW,
-    GPIO_DOCK_FAN_HIGH,
-    GPIO_DOCK_FAN_LOW,
-    GPIO_COMPARTMENT_FAN_HIGH,
-    GPIO_COMPARTMENT_FAN_LOW,
-    // GPIO_DOCK1_AC_RELAY_ON = 0,
-    // GPIO_DOCK1_AC_RELAY_OFF,
-    // GPIO_DOCK2_AC_RELAY_ON,
-    // GPIO_DOCK2_AC_RELAY_OFF,
-    // GPIO_DOCK3_AC_RELAY_ON,
-    // GPIO_DOCK3_AC_RELAY_OFF,
-    // GPIO_DOCK1_DC_RELAY_ON,
-    // GPIO_DOCK1_DC_RELAY_OFF,
-    // GPIO_DOCK2_DC_RELAY_ON,
-    // GPIO_DOCK2_DC_RELAY_OFF,
-    // GPIO_DOCK3_DC_RELAY_ON,
-    // GPIO_DOCK3_DC_RELAY_OFF,
-    // GPIO_DOCK1_SOLENOID_HIGH,
-    // GPIO_DOCK1_SOLENOID_LOW,
-    // GPIO_DOCK2_SOLENOID_HIGH,
-    // GPIO_DOCK2_SOLENOID_LOW,
-    // GPIO_DOCK3_SOLENOID_HIGH,
-    // GPIO_DOCK3_SOLENOID_LOW,
-    // GPIO_DOCK1_R_LED_HIGH,
-    // GPIO_DOCK1_R_LED_LOW,
-    // GPIO_DOCK1_G_LED_HIGH,
-    // GPIO_DOCK1_G_LED_LOW,
-    // GPIO_DOCK1_B_LED_HIGH,
-    // GPIO_DOCK1_B_LED_LOW,
-    // GPIO_DOCK2_R_LED_HIGH,
-    // GPIO_DOCK2_R_LED_LOW,
-    // GPIO_DOCK2_G_LED_HIGH,
-    // GPIO_DOCK2_G_LED_LOW,
-    // GPIO_DOCK2_B_LED_HIGH,
-    // GPIO_DOCK2_B_LED_LOW,
-    // GPIO_DOCK3_R_LED_HIGH,
-    // GPIO_DOCK3_R_LED_LOW,
-    // GPIO_DOCK3_G_LED_HIGH,
-    // GPIO_DOCK3_G_LED_LOW,
-    // GPIO_DOCK3_B_LED_HIGH,
-    // GPIO_DOCK3_B_LED_LOW,
-    // GPIO_COMPARTMENT_FAN_HIGH,
-    // GPIO_COMPARTMENT_FAN_LOW,
-    // GPIO_DOCK1_FAN_HIGH,
-    // GPIO_DOCK1_FAN_LOW,
-    // GPIO_DOCK2_FAN_HIGH,
-    // GPIO_DOCK2_FAN_LOW,
-    // GPIO_DOCK3_FAN_HIGH,
-    // GPIO_DOCK3_FAN_LOW,
+    DO_AC_RELAY_ON = 0,
+    DO_AC_RELAY_OFF,
+    DO_DC_RELAY_ON,
+    DO_DC_RELAY_OFF,
+    DO_SOLENOID_HIGH,
+    DO_SOLENOID_LOW,
+    DO_R_LED_HIGH,
+    DO_R_LED_LOW,
+    DO_G_LED_HIGH,
+    DO_G_LED_LOW,
+    DO_B_LED_HIGH,
+    DO_B_LED_LOW,
+    DO_DOCK_FAN_HIGH,
+    DO_DOCK_FAN_LOW,
+    DO_COMPARTMENT_FAN_HIGH,
+    DO_COMPARTMENT_FAN_LOW,
+    DI_E_STOP_STATUS,
+    DI_DOOR_LOCK_STATUS,
+    DI_SOLENOID_LOCK_STATUS,
     GPIO_MAX
 }GPIOOperation_e;
 // Extern declaration
@@ -295,7 +259,7 @@ uint8_t TCA9539_ReadRegister(uint8_t reg);
 /**
  * 
  */
-void vDO_Operation(GPIOOperation_e eGPIOType, uint8_t u8DockNo);
+bool bGPIO_Operation(GPIOOperation_e eGPIOType, uint8_t u8DockNo);
 #endif /* _APP_IO_HANDLER_H */
 
 /*******************************************************************************

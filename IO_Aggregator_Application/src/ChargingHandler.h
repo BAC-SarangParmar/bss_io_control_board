@@ -37,9 +37,6 @@ extern "C" {
 #define LEVDC_CAN_ID_EVSE_CAPABILITY       0x510
 #define LEVDC_CAN_ID_EVSE_CHARGER_ID       0x584
 
-#define TONHE_MODULE_START (0xAA)
-#define TONHE_MODULE_STOP (0x55)
-#define TONHE_MOD_BASE_ID (0x080601A0U)
 #pragma pack(push,1)
 
 /* ============================================================
@@ -154,17 +151,7 @@ typedef struct
 } ChargingMsgFrameInfo_t;
 
 
-/**
- *  PM_TONHE Msg TX
- */
-typedef struct Tonhe_PM_Tx
-{
-    uint8_t u8ModuleStartStop;
-    uint8_t u8ChargingMode;
-    uint16_t u16chargingVoltage;
-    uint16_t u16chargingCurrent;
-    uint16_t u16StandBy;
-} tonhe_pm_Tx_t;
+
 #pragma pack(pop)
 
 extern ChargingMsgFrameInfo_t Charging_LiveInfo[MAX_DOCKS];
@@ -214,10 +201,29 @@ extern ChargingMsgFrameInfo_t Charging_LiveInfo[MAX_DOCKS];
         EVSE_READY_FOR_CHARGE = 1U
     } EvseReadyForCharge_e;
 
+    typedef enum
+    {
+        LED_RED = 1U,
+        LED_GREEN = 2U,
+        LED_BLUE = 3U,
+        LED_NAME_MAX,
+    } ledname_e;
+
+    typedef enum
+    {
+        LED_STATE_STEADY = 1U,
+        LED_STATE_BLINK
+    } ledStatus_e;
 /*=================================================================
    FUNCTION PROTOTYPES
     ============================================================ */
-
+/******************************************************************************
+ * @brief  Initialize CHARGING Task
+ *
+ * @return true  - Task created successfully
+ * @return false - Task creation failed
+//  ******************************************************************************/
+bool ChargingTask_Init(void);
 #ifdef __cplusplus
 }
 #endif
