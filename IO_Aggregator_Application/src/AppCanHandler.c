@@ -421,7 +421,7 @@ static inline bool CAN_IsRxOK(uint32_t status)
  */
 static void vDisplayCanErrorStatus(uint32_t status, const char *canName)
 {
-    SYS_CONSOLE_PRINT("%s status: 0x%08lX\r\n", canName, (unsigned long)status);
+    // SYS_CONSOLE_PRINT("%s status: 0x%08lX\r\n", canName, (unsigned long)status);
 
     switch (status & CAN_PSR_LEC_Msk)
     {

@@ -88,9 +88,6 @@ void vCanRxHandlerTask(void *pvParameters);
 void vCan0HandlerServerTask(void *pvParameters);
 void vCan1HandlerServerTask(void *pvParameters);
 void vCan2HandlerServerTask(void *pvParameters);
-void vCan3HandlerServerTask(void *pvParameters);
-void vCan4HandlerServerTask(void *pvParameters);
-void vCan5HandlerServerTask(void *pvParameters);
 
 /**
  * @brief Initializes the CAN handler module.

@@ -9,41 +9,9 @@ dependency:
   type: module
   version: ''
 - dependencyPackage: ''
-  name: CMSIS_5
-  type: package
-  version: 5.9.0
-- dependencyPackage: ''
-  name: FreeRTOS-Kernel
-  type: package
-  version: V11.2.0
-- dependencyPackage: ''
-  name: core
-  type: package
-  version: v3.15.1
-- dependencyPackage: ''
-  name: crypto
-  type: package
-  version: v3.8.2
-- dependencyPackage: ''
   name: csp
   type: package
   version: v3.22.1
-- dependencyPackage: ''
-  name: filex
-  type: package
-  version: v6.4.0_rel
-- dependencyPackage: ''
-  name: littlefs
-  type: package
-  version: v2.10.2
-- dependencyPackage: ''
-  name: net
-  type: package
-  version: v3.13.0
-- dependencyPackage: ''
-  name: wolfssl
-  type: package
-  version: v5.4.0
 customDataClassName: com.microchip.utils_mh3.utils.persistence.CustomModuleData
 data:
   attachments: {}
@@ -167,4 +135,53 @@ data:
           type: Dynamic
         type: Values
       type: String
+    CAN5_STD_FILTER1:
+      attributes:
+        id: CAN5_STD_FILTER1
+      children:
+      - children:
+        - attributes:
+            id: enabled
+          children:
+          - type: Value
+            value: 'true'
+          type: Boolean
+        - attributes:
+            id: visible
+          children:
+          - type: Value
+            value: 'true'
+          type: Boolean
+        type: Attributes
+      type: Menu
+    FILTERS_STD:
+      attributes:
+        id: FILTERS_STD
+      children:
+      - children:
+        - attributes:
+            value: '1'
+          type: User
+        type: Values
+      type: Integer
+    CAN5_STD_FILTER1_SFID1:
+      attributes:
+        id: CAN5_STD_FILTER1_SFID1
+      children:
+      - children:
+        - attributes:
+            value: '1280'
+          type: User
+        type: Values
+      type: Hex
+    CAN5_STD_FILTER1_SFID2:
+      attributes:
+        id: CAN5_STD_FILTER1_SFID2
+      children:
+      - children:
+        - attributes:
+            value: '1296'
+          type: User
+        type: Values
+      type: Hex
   userData: {}

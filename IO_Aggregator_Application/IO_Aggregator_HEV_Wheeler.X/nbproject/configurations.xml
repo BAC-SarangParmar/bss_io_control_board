@@ -360,24 +360,6 @@
         </logicalFolder>
       </logicalFolder>
       <logicalFolder name="packs" displayName="packs" projectFiles="true">
-        <logicalFolder name="CMSIS" displayName="CMSIS" projectFiles="true">
-          <logicalFolder name="CMSIS" displayName="CMSIS" projectFiles="true">
-            <logicalFolder name="Core" displayName="Core" projectFiles="true">
-              <logicalFolder name="Include" displayName="Include" projectFiles="true">
-                <itemPath>../src/packs/CMSIS/CMSIS/Core/Include/cmsis_version.h</itemPath>
-                <itemPath>../src/packs/CMSIS/CMSIS/Core/Include/mpu_armv7.h</itemPath>
-                <itemPath>../src/packs/CMSIS/CMSIS/Core/Include/cmsis_iccarm.h</itemPath>
-                <itemPath>../src/packs/CMSIS/CMSIS/Core/Include/cmsis_armclang_ltm.h</itemPath>
-                <itemPath>../src/packs/CMSIS/CMSIS/Core/Include/cmsis_armclang.h</itemPath>
-                <itemPath>../src/packs/CMSIS/CMSIS/Core/Include/cmsis_gcc.h</itemPath>
-                <itemPath>../src/packs/CMSIS/CMSIS/Core/Include/core_cm7.h</itemPath>
-                <itemPath>../src/packs/CMSIS/CMSIS/Core/Include/cmsis_armcc.h</itemPath>
-                <itemPath>../src/packs/CMSIS/CMSIS/Core/Include/cmsis_compiler.h</itemPath>
-                <itemPath>../src/packs/CMSIS/CMSIS/Core/Include/cachel1_armv7.h</itemPath>
-              </logicalFolder>
-            </logicalFolder>
-          </logicalFolder>
-        </logicalFolder>
         <logicalFolder name="PIC32CZ4010CA80208_DFP"
                        displayName="PIC32CZ4010CA80208_DFP"
                        projectFiles="true">
@@ -666,8 +648,129 @@
     <logicalFolder name="ExternalFiles"
                    displayName="Important Files"
                    projectFiles="true">
+      <logicalFolder name="IO_Aggregator_HEV_Wheeler_default"
+                     displayName="IO_Aggregator_HEV_Wheeler_default"
+                     projectFiles="true">
+        <logicalFolder name="components" displayName="components" projectFiles="true">
+          <logicalFolder name="TCP_forwardSlash_IP STACK"
+                         displayName="TCP_forwardSlash_IP STACK"
+                         projectFiles="true">
+            <logicalFolder name="components" displayName="components" projectFiles="true">
+              <logicalFolder name="APPLICATION LAYER"
+                             displayName="APPLICATION LAYER"
+                             projectFiles="true">
+                <logicalFolder name="components" displayName="components" projectFiles="true">
+                  <itemPath>IO_Aggregator_HEV_Wheeler_default/components/TCP_forwardSlash_IP STACK/components/APPLICATION LAYER/components/tcpipDhcp.yml</itemPath>
+                  <itemPath>IO_Aggregator_HEV_Wheeler_default/components/TCP_forwardSlash_IP STACK/components/APPLICATION LAYER/components/tcpipSntp.yml</itemPath>
+                  <itemPath>IO_Aggregator_HEV_Wheeler_default/components/TCP_forwardSlash_IP STACK/components/APPLICATION LAYER/components/tcpipNbns.yml</itemPath>
+                  <itemPath>IO_Aggregator_HEV_Wheeler_default/components/TCP_forwardSlash_IP STACK/components/APPLICATION LAYER/components/tcpipDns.yml</itemPath>
+                  <itemPath>IO_Aggregator_HEV_Wheeler_default/components/TCP_forwardSlash_IP STACK/components/APPLICATION LAYER/components/tcpipSmtpc.yml</itemPath>
+                  <itemPath>IO_Aggregator_HEV_Wheeler_default/components/TCP_forwardSlash_IP STACK/components/APPLICATION LAYER/components/tcpipHttpNet.yml</itemPath>
+                  <itemPath>IO_Aggregator_HEV_Wheeler_default/components/TCP_forwardSlash_IP STACK/components/APPLICATION LAYER/components/tcpipAnnounce.yml</itemPath>
+                </logicalFolder>
+                <itemPath>IO_Aggregator_HEV_Wheeler_default/components/TCP_forwardSlash_IP STACK/components/APPLICATION LAYER/APPLICATION LAYER.yml</itemPath>
+              </logicalFolder>
+              <logicalFolder name="BASIC CONFIGURATION"
+                             displayName="BASIC CONFIGURATION"
+                             projectFiles="true">
+                <logicalFolder name="components" displayName="components" projectFiles="true">
+                  <itemPath>IO_Aggregator_HEV_Wheeler_default/components/TCP_forwardSlash_IP STACK/components/BASIC CONFIGURATION/components/tcpipCmd.yml</itemPath>
+                  <itemPath>IO_Aggregator_HEV_Wheeler_default/components/TCP_forwardSlash_IP STACK/components/BASIC CONFIGURATION/components/tcpipStack.yml</itemPath>
+                </logicalFolder>
+                <itemPath>IO_Aggregator_HEV_Wheeler_default/components/TCP_forwardSlash_IP STACK/components/BASIC CONFIGURATION/BASIC CONFIGURATION.yml</itemPath>
+              </logicalFolder>
+              <logicalFolder name="DATA LINK LAYER"
+                             displayName="DATA LINK LAYER"
+                             projectFiles="true">
+                <logicalFolder name="components" displayName="components" projectFiles="true">
+                  <itemPath>IO_Aggregator_HEV_Wheeler_default/components/TCP_forwardSlash_IP STACK/components/DATA LINK LAYER/components/drvGmac.yml</itemPath>
+                  <itemPath>IO_Aggregator_HEV_Wheeler_default/components/TCP_forwardSlash_IP STACK/components/DATA LINK LAYER/components/drvExtPhyKsz8863.yml</itemPath>
+                  <itemPath>IO_Aggregator_HEV_Wheeler_default/components/TCP_forwardSlash_IP STACK/components/DATA LINK LAYER/components/tcpipNetConfig.yml</itemPath>
+                  <itemPath>IO_Aggregator_HEV_Wheeler_default/components/TCP_forwardSlash_IP STACK/components/DATA LINK LAYER/components/drvMiim.yml</itemPath>
+                </logicalFolder>
+                <itemPath>IO_Aggregator_HEV_Wheeler_default/components/TCP_forwardSlash_IP STACK/components/DATA LINK LAYER/DATA LINK LAYER.yml</itemPath>
+              </logicalFolder>
+              <logicalFolder name="NETWORK LAYER"
+                             displayName="NETWORK LAYER"
+                             projectFiles="true">
+                <logicalFolder name="components" displayName="components" projectFiles="true">
+                  <itemPath>IO_Aggregator_HEV_Wheeler_default/components/TCP_forwardSlash_IP STACK/components/NETWORK LAYER/components/tcpipIPv6.yml</itemPath>
+                  <itemPath>IO_Aggregator_HEV_Wheeler_default/components/TCP_forwardSlash_IP STACK/components/NETWORK LAYER/components/tcpipIcmp.yml</itemPath>
+                  <itemPath>IO_Aggregator_HEV_Wheeler_default/components/TCP_forwardSlash_IP STACK/components/NETWORK LAYER/components/tcpipIPv4.yml</itemPath>
+                  <itemPath>IO_Aggregator_HEV_Wheeler_default/components/TCP_forwardSlash_IP STACK/components/NETWORK LAYER/components/tcpipNdp.yml</itemPath>
+                  <itemPath>IO_Aggregator_HEV_Wheeler_default/components/TCP_forwardSlash_IP STACK/components/NETWORK LAYER/components/tcpipArp.yml</itemPath>
+                  <itemPath>IO_Aggregator_HEV_Wheeler_default/components/TCP_forwardSlash_IP STACK/components/NETWORK LAYER/components/tcpipIcmpv6.yml</itemPath>
+                </logicalFolder>
+                <itemPath>IO_Aggregator_HEV_Wheeler_default/components/TCP_forwardSlash_IP STACK/components/NETWORK LAYER/NETWORK LAYER.yml</itemPath>
+              </logicalFolder>
+              <logicalFolder name="PRESENTATION LAYER"
+                             displayName="PRESENTATION LAYER"
+                             projectFiles="true">
+                <logicalFolder name="components" displayName="components" projectFiles="true">
+                  <itemPath>IO_Aggregator_HEV_Wheeler_default/components/TCP_forwardSlash_IP STACK/components/PRESENTATION LAYER/components/net_Pres.yml</itemPath>
+                </logicalFolder>
+                <itemPath>IO_Aggregator_HEV_Wheeler_default/components/TCP_forwardSlash_IP STACK/components/PRESENTATION LAYER/PRESENTATION LAYER.yml</itemPath>
+              </logicalFolder>
+              <logicalFolder name="TRANSPORT LAYER"
+                             displayName="TRANSPORT LAYER"
+                             projectFiles="true">
+                <logicalFolder name="components" displayName="components" projectFiles="true">
+                  <itemPath>IO_Aggregator_HEV_Wheeler_default/components/TCP_forwardSlash_IP STACK/components/TRANSPORT LAYER/components/tcpipUdp.yml</itemPath>
+                  <itemPath>IO_Aggregator_HEV_Wheeler_default/components/TCP_forwardSlash_IP STACK/components/TRANSPORT LAYER/components/tcpipTcp.yml</itemPath>
+                </logicalFolder>
+                <itemPath>IO_Aggregator_HEV_Wheeler_default/components/TCP_forwardSlash_IP STACK/components/TRANSPORT LAYER/TRANSPORT LAYER.yml</itemPath>
+              </logicalFolder>
+            </logicalFolder>
+            <itemPath>IO_Aggregator_HEV_Wheeler_default/components/TCP_forwardSlash_IP STACK/TCP_forwardSlash_IP STACK.yml</itemPath>
+          </logicalFolder>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/sercom0.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/dfp.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/sys_debug.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/drv_usart_1.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/rtc.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/drv_usart.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/sys_console.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/sys_fs.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/sercom7.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/can4.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/drv_i2c_0.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/drv_memory.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/sys_time.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/sercom8.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/can5.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/sercom9.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/lib_wolfssl.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/sys_command.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/core.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/adc.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/can2.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/drv_i2c.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/tcpipNetConfig_0.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/HarmonyCore.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/drv_memory_0.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/can3.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/fcw.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/FreeRTOS.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/can0.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/tcc0.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/lib_crypto.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/sys_console_0.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/tcc1.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/evsys.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/lib_wolfcrypt.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/drv_usart_0.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/can1.yml</itemPath>
+          <itemPath>IO_Aggregator_HEV_Wheeler_default/components/cmsis.yml</itemPath>
+        </logicalFolder>
+        <itemPath>IO_Aggregator_HEV_Wheeler_default/mcc-config.mc4</itemPath>
+      </logicalFolder>
+      <logicalFolder name="wolfcrypt" displayName="wolfcrypt" projectFiles="true">
+      </logicalFolder>
       <itemPath>Makefile</itemPath>
-      <itemPath>IO_Aggregator_HEV_Wheeler.mc3</itemPath>
+    </logicalFolder>
+    <logicalFolder name="LibraryFiles"
+                   displayName="LibraryFiles"
+                   projectFiles="true">
     </logicalFolder>
     <logicalFolder name="LinkerScript"
                    displayName="Linker Files"
@@ -1138,6 +1241,7 @@
       <C32>
         <property key="additional-warnings" value="true"/>
         <property key="addresss-attribute-use" value="false"/>
+        <property key="appendMe" value=""/>
         <property key="cast-align" value="false"/>
         <property key="code-model" value="default"/>
         <property key="const-model" value="default"/>
@@ -1217,6 +1321,7 @@
         <property key="additional-options-use-response-files" value="false"/>
         <property key="additional-options-write-sla" value="false"/>
         <property key="allocate-dinit" value="false"/>
+        <property key="appendMe" value=""/>
         <property key="code-dinit" value="false"/>
         <property key="ebase-addr" value=""/>
         <property key="enable-check-sections" value="false"/>
@@ -1263,6 +1368,7 @@
       <C32CPP>
         <property key="additional-warnings" value="false"/>
         <property key="addresss-attribute-use" value="false"/>
+        <property key="appendMe" value=""/>
         <property key="check-new" value="false"/>
         <property key="eh-specs" value="true"/>
         <property key="enable-app-io" value="false"/>
@@ -1291,6 +1397,7 @@
         <property key="use-indirect-calls" value="false"/>
       </C32CPP>
       <C32Global>
+        <property key="appendMe" value=""/>
         <property key="combine-sourcefiles" value="false"/>
         <property key="common-include-directories" value=""/>
         <property key="common-macros" value=""/>
