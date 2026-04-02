@@ -52,6 +52,8 @@ data:
       - attributes:
           id: tcpipStack:Core_SysConsole_Dependency
           namespace: BASIC CONFIGURATION
+          targetAttachmentID: sys_console
+          targetComponentID: sys_console_0
         type: Attachment
       - attributes:
           id: net_Pres:Net_Pres_Crypto_Dependency

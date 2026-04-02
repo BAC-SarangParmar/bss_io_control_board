@@ -83,11 +83,12 @@
 #define CAN2_TX_FIFO_BUFFER_ELEMENT_SIZE 16U
 #define CAN2_TX_FIFO_BUFFER_SIZE         16U
 #define CAN2_TX_EVENT_FIFO_SIZE          8U
+#define CAN2_STD_MSG_ID_FILTER_SIZE      4U
 #define CAN2_EXT_MSG_ID_FILTER_SIZE      8U
 
 /* CAN2_MESSAGE_RAM_CONFIG_SIZE to be used by application or driver
    for allocating buffer from non-cached contiguous memory */
-#define CAN2_MESSAGE_RAM_CONFIG_SIZE     64U
+#define CAN2_MESSAGE_RAM_CONFIG_SIZE     68U
 
 // *****************************************************************************
 // *****************************************************************************
@@ -107,6 +108,8 @@ void CAN2_ErrorCountGet(uint8_t *txErrorCount, uint8_t *rxErrorCount);
 bool CAN2_InterruptGet(CAN_INTERRUPT_MASK interruptMask);
 void CAN2_InterruptClear(CAN_INTERRUPT_MASK interruptMask);
 void CAN2_MessageRAMConfigSet(uint8_t *msgRAMConfigBaseAddress);
+bool CAN2_StandardFilterElementSet(uint8_t filterNumber, can_sidfe_registers_t *stdMsgIDFilterElement);
+bool CAN2_StandardFilterElementGet(uint8_t filterNumber, can_sidfe_registers_t *stdMsgIDFilterElement);
 bool CAN2_ExtendedFilterElementSet(uint8_t filterNumber, can_xidfe_registers_t *extMsgIDFilterElement);
 bool CAN2_ExtendedFilterElementGet(uint8_t filterNumber, can_xidfe_registers_t *extMsgIDFilterElement);
 void CAN2_SleepModeEnter(void);
