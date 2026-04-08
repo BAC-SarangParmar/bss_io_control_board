@@ -61,7 +61,7 @@ void SESSION_ResetBMSData(uint8_t idx)
 {
     SESSION_SetBMSRxStatus(idx, 0U);
     SESSION_SetBMSTemperature(idx, 0U);
-    SESSION_SetBMSFaultCode(idx, 0U);
+    SESSION_SetBMSFaultBitmap(idx, 0U);
     SESSION_SetBMSDemandVoltage(idx, 0U);
     SESSION_SetBMSDemandCurrent(idx, 0U);
     SESSION_SetCurrentSoc(idx, 0U);

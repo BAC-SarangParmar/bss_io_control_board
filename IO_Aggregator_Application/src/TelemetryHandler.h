@@ -43,6 +43,8 @@ typedef struct __attribute__((packed))
     uint8_t  u8InitialSoc;            /**< Initial SOC (internal use) */
     uint8_t  u8BMSTemperature;        /**< Temperature (°C) */
     uint8_t  u8BMSStatus;             /**< Status */
+    uint8_t u8ChargingState;       /**< Charging State (internal use) */
+    uint32_t u32SystemFaultBitmap;       /**< System Fault Bitmap */
 } TELEMETRY_BMSData_t;
 
 typedef struct

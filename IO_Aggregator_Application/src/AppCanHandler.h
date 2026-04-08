@@ -35,7 +35,9 @@
 #define CAN_MSG_EID_MASK  0x1FFFFFFF  // 29-bit Extended Identifier Mask
 
 // Task configuration for CAN message reception and server handling
-#define CAN_RX_HANDLER_HEAP_DEPTH     1024
+#define CAN0_RX_HANDLER_HEAP_DEPTH     512
+#define CAN1_RX_HANDLER_HEAP_DEPTH     512
+#define CAN2_RX_HANDLER_HEAP_DEPTH     512
 #define CAN_RX_HANDLER_TASK_PRIORITY  4//6//(tskIDLE_PRIORITY + 4)  // Highest priority
 
 #define CAN_SERVER_HANDLER_HEAP_DEPTH 512
@@ -76,8 +78,9 @@
  *
  * @param pvParameters Task parameters (unused).
  */
-void vCanRxHandlerTask(void *pvParameters);
-
+void vCan0RxHandlerTask(void *pvParameters);
+void vCan1RxHandlerTask(void *pvParameters);
+void vCan2RxHandlerTask(void *pvParameters);
 /**
  * @brief Server tasks for handling CAN communication over TCP.
  *

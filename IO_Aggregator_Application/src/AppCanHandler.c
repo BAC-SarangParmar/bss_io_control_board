@@ -46,7 +46,7 @@ Bacancy Systems LLP or any third party.
 
 /* Set to 1 → Enable debug prints */
 /* Set to 0 → Disable debug prints */
-#define CAN_DEBUG_ENABLE    1
+#define CAN_DEBUG_ENABLE    0
 
 #if CAN_DEBUG_ENABLE
     #define CAN_DEBUG_EXEC(x)           do { x; } while(0)
@@ -282,8 +282,15 @@ void vProcessCanRxMessage(CAN_RX_BUFFER *rxBuf, uint8_t canBus)
         SYS_CONSOLE_PRINT("Received NULL CAN RX buffer\r\n");
         return;
     }
+    uint32_t u32CanId = rxBuf->id;
+    if (!rxBuf->xtd)
+    {
+        u32CanId = READ_ID(rxBuf->id) & 0x7FF; // Mask to 11 bits for standard ID
+    }
+    // SYS_CONSOLE_PRINT("Received CAN message on CAN%d, ID: %08X, Extended: %s\r\n",
+    //                   canBus, u32CanId, rxBuf->xtd ? "Yes" : "No");
 
-    if (rxBuf->xtd)
+     if (rxBuf->xtd)
     {
         vProcessPMCanMessage(rxBuf, canBus);
     }
@@ -327,10 +334,22 @@ void vCanHandlerInit(void)
 
     SYS_CONSOLE_PRINT("Queue creation successful\r\n");
 
-    if (xTaskCreate(vCanRxHandlerTask, "CAN_RX", CAN_RX_HANDLER_HEAP_DEPTH, NULL,
+    if (xTaskCreate(vCan0RxHandlerTask, "CAN0_RX", CAN0_RX_HANDLER_HEAP_DEPTH, NULL,
                     CAN_RX_HANDLER_TASK_PRIORITY, NULL) != pdPASS)
     {
-        SYS_CONSOLE_PRINT("Error: RX Task create failed\r\n");
+        SYS_CONSOLE_PRINT("Error:Can0 RX Task create failed\r\n");
+    }
+
+    if (xTaskCreate(vCan1RxHandlerTask, "CAN1_RX", CAN1_RX_HANDLER_HEAP_DEPTH, NULL,
+                    CAN_RX_HANDLER_TASK_PRIORITY, NULL) != pdPASS)
+    {
+        SYS_CONSOLE_PRINT("Error:Can1 RX Task create failed\r\n");
+    }
+
+    if (xTaskCreate(vCan2RxHandlerTask, "CAN2_RX", CAN2_RX_HANDLER_HEAP_DEPTH, NULL,
+                    CAN_RX_HANDLER_TASK_PRIORITY, NULL) != pdPASS)
+    {
+        SYS_CONSOLE_PRINT("Error:Can2 RX Task create failed\r\n");
     }
 
     if (xTaskCreate(vCan0HandlerServerTask, "CAN0_SRV", CAN_SERVER_HANDLER_HEAP_DEPTH, NULL,
@@ -431,7 +450,7 @@ static void vDisplayCanErrorStatus(uint32_t status, const char *canName)
         case 4: SYS_CONSOLE_PRINT("%s: Bit-1 error\r\n", canName); break;
         case 5: SYS_CONSOLE_PRINT("%s: Bit-0 error\r\n", canName); break;
         case 6: SYS_CONSOLE_PRINT("%s: CRC error\r\n", canName); break;
-        case 7: SYS_CONSOLE_PRINT("%s: LEC unchanged\r\n", canName); break;
+        // case 7: SYS_CONSOLE_PRINT("%s: LEC unchanged\r\n", canName); break;
         default: break;
     }
 
@@ -483,10 +502,11 @@ static void vDisplayCanRxMessage(CAN_RX_BUFFER *rxBuf, uint8_t rxBufLen)
  * - Handles CAN0, CAN1, CAN2
  * - Runs in polling mode with small delay
  */
-void vCanRxHandlerTask(void *pvParameters)
+
+void vCan0RxHandlerTask(void *pvParameters)
 {
     (void)pvParameters;
-    SYS_CONSOLE_PRINT("CAN RX Handler Task started\r\n");
+    SYS_CONSOLE_PRINT("CAN0 RX Handler Task started\r\n");
     while (true)
     {
         /* ================= CAN0 ================= */
@@ -494,44 +514,141 @@ void vCanRxHandlerTask(void *pvParameters)
         {
             // SYS_CONSOLE_PRINT("CAN0 RX interrupt\r\n");
             CAN0_InterruptClear(CAN_INTERRUPT_RF0N_MASK);
-
             uint32_t status = CAN0_ErrorGet();
-
             CAN_DEBUG_EXEC(
-                vDisplayCanErrorStatus(status, "CAN0");
-            );
+                vDisplayCanErrorStatus(status, "CAN0"););
 
             if (CAN_IsRxOK(status))
             {
                 uint8_t count = CAN0_RxFifoFillLevelGet(CAN_RX_FIFO_0);
-
-                if (count > CAN0_RX_FIFO0_SIZE)
+                if (count > 0)
                 {
-                    SYS_CONSOLE_PRINT("CAN0 FIFO overflow\r\n");
-                    count = CAN0_RX_FIFO0_SIZE;
-                }
-
-                if (count > 0 && CAN0_MessageReceiveFifo(CAN_RX_FIFO_0, count, can0RxBuffer))
-                {
-                    for (uint8_t i = 0; i < count; i++)
+                    // SYS_CONSOLE_PRINT("DEBUG: FIFO has %d messages\r\n", count);
+                    if (count > CAN0_RX_FIFO0_SIZE)
                     {
-                        CAN_DEBUG_EXEC(
-                            vDisplayCanRxMessage(&can0RxBuffer[i], CAN0_RX_FIFO0_ELEMENT_SIZE);
-                        );
+                        SYS_CONSOLE_PRINT("CAN0 FIFO overflow\r\n");
+                        count = CAN0_RX_FIFO0_SIZE;
+                    }
 
-                        if (xQueueSend(xCAN0RXQueueHandler, &can0RxBuffer[i], pdMS_TO_TICKS(5)) != pdPASS)
+                    if (CAN0_MessageReceiveFifo(CAN_RX_FIFO_0, count, can0RxBuffer))
+                    {
+                        for (uint8_t i = 0; i < count; i++)
                         {
-                            SYS_CONSOLE_PRINT("CAN0 queue full\r\n");
+                            CAN_DEBUG_EXEC(
+                                vDisplayCanRxMessage(&can0RxBuffer[i], CAN0_RX_FIFO0_ELEMENT_SIZE););
+                            if (xQueueSend(xCAN0RXQueueHandler, &can0RxBuffer[i], pdMS_TO_TICKS(5)) != pdPASS)
+                            {
+                                SYS_CONSOLE_PRINT("CAN0 queue full\r\n");
+                            }
                         }
                     }
-                }
-                else
-                {
-                    SYS_CONSOLE_PRINT("CAN0 receive failed\r\n");
+                    else
+                    {
+                        SYS_CONSOLE_PRINT("CAN0 receive failed\r\n");
+                    }
                 }
             }
         }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
 
+// void vCan0RxHandlerTask(void *pvParameters)
+// {
+//     (void)pvParameters;
+//     SYS_CONSOLE_PRINT("CAN0 RX Handler Task started\r\n");
+//     while (true)
+//     {
+//         if (CAN0_InterruptGet(CAN_INTERRUPT_RF0N_MASK))
+//         {
+//             CAN0_InterruptClear(CAN_INTERRUPT_RF0N_MASK);
+//             uint32_t status = CAN0_ErrorGet();
+
+//             if (CAN_IsRxOK(status))
+//             {
+//                 uint8_t count = CAN0_RxFifoFillLevelGet(CAN_RX_FIFO_0);
+//                 SYS_CONSOLE_PRINT("DEBUG: FIFO has %d messages\r\n", count);
+                
+//                 if (count > CAN0_RX_FIFO0_SIZE)
+//                 {
+//                     SYS_CONSOLE_PRINT("CAN0 FIFO overflow\r\n");
+//                     count = CAN0_RX_FIFO0_SIZE;
+//                 }
+
+//                 if (count > 0 && CAN0_MessageReceiveFifo(CAN_RX_FIFO_0, count, can0RxBuffer))
+//                 {
+//                     for (uint8_t i = 0; i < count; i++)
+//                     {
+//                         // Add this debug line
+//                         SYS_CONSOLE_PRINT("DEBUG: Message ID=0x%X, xtd=%d\r\n", 
+//                                         READ_ID(can0RxBuffer[i].id), can0RxBuffer[i].xtd);
+                        
+//                         if (xQueueSend(xCAN0RXQueueHandler, &can0RxBuffer[i], pdMS_TO_TICKS(5)) != pdPASS)
+//                         {
+//                             SYS_CONSOLE_PRINT("CAN0 queue full\r\n");
+//                         }
+//                     }
+//                 }
+//             }
+//         }
+//         vTaskDelay(pdMS_TO_TICKS(5));
+//     }
+// }
+
+// void vCan0RxHandlerTask(void *pvParameters)
+// {
+//     (void)pvParameters;
+//     SYS_CONSOLE_PRINT("CAN0 RX Handler Task started\r\n");
+//     while (true)
+//     {
+//         TickType_t xStartTimeout = xTaskGetTickCount() + pdMS_TO_TICKS(5);
+
+//         while (CAN0_InterruptGet(CAN_INTERRUPT_RF0N_MASK))
+//         {
+//             /* Timeout check */
+//             if ((xTaskGetTickCount() > xStartTimeout))
+//             {
+//                 SYS_CONSOLE_PRINT("CAN0 RX timeout (outer loop)\r\n");
+//                 break;
+//             }
+
+//             CAN0_InterruptClear(CAN_INTERRUPT_RF0N_MASK);
+
+//             while (CAN0_RxFifoFillLevelGet(CAN_RX_FIFO_0) > 0)
+//             {
+//                 /* Timeout check */
+//                 if ((xTaskGetTickCount() > xStartTimeout))
+//                 {
+//                     SYS_CONSOLE_PRINT("CAN0 RX timeout (inner loop)\r\n");
+//                     break;
+//                 }
+
+//                 if (CAN0_MessageReceiveFifo(CAN_RX_FIFO_0, 1, can0RxBuffer))
+//                 {
+//                     SYS_CONSOLE_PRINT("ID=0x%X\r\n", READ_ID(can0RxBuffer[0].id));
+
+//                     if (xQueueSend(xCAN0RXQueueHandler, &can0RxBuffer[0], 0) != pdPASS)
+//                     {
+//                         SYS_CONSOLE_PRINT("Queue full\r\n");
+//                     }
+//                 }
+//                 else
+//                 {
+//                     SYS_CONSOLE_PRINT("CAN0 receive failed\r\n");
+//                     break; // avoid infinite loop on failure
+//                 }
+//             }
+//         }
+//         vTaskDelay(pdMS_TO_TICKS(5));
+//     }
+// }
+
+void vCan1RxHandlerTask(void *pvParameters)
+{
+    (void)pvParameters;
+    SYS_CONSOLE_PRINT("CAN1 RX Handler Task started\r\n");
+    while (true)
+    {
         /* ================= CAN1 ================= */
         if (CAN1_InterruptGet(CAN_INTERRUPT_RF0N_MASK))
         {
@@ -540,8 +657,7 @@ void vCanRxHandlerTask(void *pvParameters)
             uint32_t status = CAN1_ErrorGet();
 
             CAN_DEBUG_EXEC(
-                vDisplayCanErrorStatus(status, "CAN1");
-            );
+                vDisplayCanErrorStatus(status, "CAN1"););
 
             if (CAN_IsRxOK(status))
             {
@@ -558,8 +674,7 @@ void vCanRxHandlerTask(void *pvParameters)
                     for (uint8_t i = 0; i < count; i++)
                     {
                         CAN_DEBUG_EXEC(
-                            vDisplayCanRxMessage(&can1RxBuffer[i], CAN1_RX_FIFO0_ELEMENT_SIZE);
-                        );
+                            vDisplayCanRxMessage(&can1RxBuffer[i], CAN1_RX_FIFO0_ELEMENT_SIZE););
 
                         if (xQueueSend(xCAN1RXQueueHandler, &can1RxBuffer[i], pdMS_TO_TICKS(5)) != pdPASS)
                         {
@@ -573,7 +688,16 @@ void vCanRxHandlerTask(void *pvParameters)
                 }
             }
         }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
 
+void vCan2RxHandlerTask(void *pvParameters)
+{
+    (void)pvParameters;
+    SYS_CONSOLE_PRINT("CAN2 RX Handler Task started\r\n");
+    while (true)
+    {
         /* ================= CAN2 ================= */
         if (CAN2_InterruptGet(CAN_INTERRUPT_RF0N_MASK))
         {
@@ -582,8 +706,7 @@ void vCanRxHandlerTask(void *pvParameters)
             uint32_t status = CAN2_ErrorGet();
 
             CAN_DEBUG_EXEC(
-                vDisplayCanErrorStatus(status, "CAN2");
-            );
+                vDisplayCanErrorStatus(status, "CAN2"););
 
             if (CAN_IsRxOK(status))
             {
@@ -600,8 +723,7 @@ void vCanRxHandlerTask(void *pvParameters)
                     for (uint8_t i = 0; i < count; i++)
                     {
                         CAN_DEBUG_EXEC(
-                            vDisplayCanRxMessage(&can2RxBuffer[i], CAN2_RX_FIFO0_ELEMENT_SIZE);
-                        );
+                            vDisplayCanRxMessage(&can2RxBuffer[i], CAN2_RX_FIFO0_ELEMENT_SIZE););
 
                         if (xQueueSend(xCAN2RXQueueHandler, &can2RxBuffer[i], pdMS_TO_TICKS(5)) != pdPASS)
                         {
@@ -615,10 +737,10 @@ void vCanRxHandlerTask(void *pvParameters)
                 }
             }
         }
-
         vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
+
 /**
  * @brief CAN0 server task for TX/RX processing.
  *
@@ -636,10 +758,10 @@ void vCan0HandlerServerTask(void *pvParameters)
 
     while (true)
     {
-        if (xQueueReceive(xCAN0TXQueueHandler, &tx, 0) == pdPASS)
+        if (xQueueReceive(xCAN0TXQueueHandler, &tx, pdMS_TO_TICKS(5)) == pdPASS)
             CAN0_Write(&tx);
 
-        if (xQueueReceive(xCAN0RXQueueHandler, &rx, 0) == pdPASS)
+        if (xQueueReceive(xCAN0RXQueueHandler, &rx, pdMS_TO_TICKS(5)) == pdPASS)
             vProcessCanRxMessage(&rx, CANBUS_0);
 
         vTaskDelay(pdMS_TO_TICKS(CAN_TASK_DELAY));
