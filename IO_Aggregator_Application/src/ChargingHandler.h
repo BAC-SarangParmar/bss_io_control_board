@@ -23,7 +23,7 @@ extern "C" {
 /*=================================================================
    MACRO DEFINITIONS
    ============================================================ */
-
+/*LEVDC 17017-25 CAN IDs*/
 #define LEVDC_CAN_ID_EV_REQUEST            0x500
 #define LEVDC_CAN_ID_EV_CHARGING_INFO      0x501
 #define LEVDC_CAN_ID_EV_CONTROL_OPTION     0x502
@@ -36,12 +36,21 @@ extern "C" {
 #define LEVDC_CAN_ID_EVSE_OUTPUT_INFO      0x509
 #define LEVDC_CAN_ID_EVSE_CAPABILITY       0x510
 #define LEVDC_CAN_ID_EVSE_CHARGER_ID       0x584
+//////////////////////////////////////////////////
 
-#pragma pack(push,1)
-
+/*TVS Propritry CAN IDs*/
+/*CHARGER CAN IDs*/
+#define TVS_CAN_ID_INFO                0x90
+#define TVS_CAN_ID_CHARGE_PROFILE      0x91
+#define TVS_CAN_ID_FM_VERSION_INFO     0x92
+/*BMS CAN IDs*/
+#define TVS_CAN_ID_STATUS              0x100
+#define TVS_CAN_ID_PROFILE             0x101
+//////////////////////////////////////////////////
 /* ============================================================
-   EV → EVSE MESSAGE (CAN ID 0x500)
-   EV Charging Request & Battery Status
+   LEVDC 17017-25 CAN Message Structures
+    - These structures represent the data format for CAN messages
+      defined in the LEVDC 17017-25 standard.
    ============================================================ */
 
 /* TX CAN Message Structures */
@@ -149,12 +158,82 @@ typedef struct
     LEVDC_Rx582_t LevdcRX_582ID_Info;
     LEVDC_Rx583_t LevdcRX_583ID_Info;
 } ChargingMsgFrameInfo_t;
-
-
-
-#pragma pack(pop)
-
 extern ChargingMsgFrameInfo_t Charging_LiveInfo[MAX_DOCKS];
+///////////////////////////////////////////////////////////////////
+/*==============================================================================
+ * TVS CAN Structures  — exact byte/bit layout per DBC spec
+ *============================================================================*/
+
+/* 0x90 - Charger Info TX (Charger -> BMS) 100ms */
+typedef struct
+{
+    uint8_t  u8ChargerType;           /* Byte 0     - CHARGER_Type          (res=1, off=0)   */
+    uint8_t  u8ACInput;               /* Byte 1     - CHARGER_ACInput       (res=1, off=50)  */
+    uint8_t  u8Temperature;           /* Byte 2     - CHARGER_Temperature   (res=1, off=-50) */
+    uint8_t  u8Counter;               /* Byte 3     - CHARGER_Counter       (res=1, off=0)   */
+    uint8_t  u8ErrorState   : 4;      /* Byte 4[0:3]- CHARGER_ErrorState    (4-bit)          */
+    uint8_t  u8Fan          : 1;      /* Byte 4[4]  - CHARGER_Fan           (1-bit)          */
+    uint8_t  u8Output       : 1;      /* Byte 4[5]  - CHARGER_Output        (1-bit)          */
+    uint8_t  u8Derating     : 1;      /* Byte 4[6]  - Charger_deratting     (1-bit)          */
+    uint8_t  u8Res          : 1;      /* Byte 4[7]  - Reserved                               */
+    uint8_t  u8Res1[3];               /* Byte 5-7   - Reserved                               */
+} TVS_Tx90_Info_t;
+
+/* 0x91 - Charger Charge Profile TX (Charger -> BMS) 100ms */
+typedef struct
+{
+    uint16_t u16ChargingCurrent;      /* Byte 0-1   - CHARGER_Current       (res=0.015625)   */
+    uint16_t u16ChargingVoltage;      /* Byte 2-3   - CHARGER_TerminalVoltage(res=0.015625)  */
+    uint8_t  u8Res[4];                /* Byte 4-7   - Reserved                               */
+} TVS_Tx91_ChargeProfile_t;
+
+/* 0x92 - Charger FM Version Info TX (Charger -> BMS) 1000ms */
+typedef struct
+{
+    uint8_t  u8FWVersionMajor;        /* Byte 0     - FW_version_major                       */
+    uint8_t  u8FWVersionMinor;        /* Byte 1     - FW_version_minor                       */
+    uint8_t  u8FWVersionIteration;    /* Byte 2     - FW_version_iteration                   */
+    uint8_t  u8FWChargerType;         /* Byte 3     - FW_CHARGER_type                        */
+    uint8_t  u8FWReleaseDateDD;       /* Byte 4     - FW_Realese_Date_DD                     */
+    uint8_t  u8FWReleaseDateMM;       /* Byte 5     - FW_Realese_Date_MM                     */
+    uint8_t  u8FWReleaseDateY1Y2;     /* Byte 6     - FW_Realese_Date_Y1Y2                   */
+    uint8_t  u8FWReleaseDateY3Y4;     /* Byte 7     - FW_Realese_Date_Y3Y4                   */
+} TVS_Tx92_FMVersionInfo_t;
+
+/* 0x100 - BMS Status RX (BMS -> Charger) 100ms */
+typedef struct
+{
+    uint16_t u16BMSCurrent;           /* Byte 0-1   - BMS_Current           (res=0.03125)    */
+    uint16_t u16BMSVoltage;           /* Byte 2-3   - BMS_Voltage [13:0]    (res=0.015625)   */
+    uint8_t  u8Counter;               /* Byte 4     - BMS_Counter                            */
+    uint8_t  u8SOC;                   /* Byte 5     - BMS_SOC                                */
+    uint8_t  u8ErrorState;            /* Byte 6     - BMS_ErrorState                         */
+    uint8_t  u8Temperature;           /* Byte 7     - BMS_Temperature       (off=-30)        */
+} TVS_Rx100_Status_t;
+
+/* 0x101 - BMS Profile RX (BMS -> Charger) 100ms */
+typedef struct
+{
+    uint16_t u16MaxChargeCurrent;     /* Byte 0-1   - BMS_MaxChargeCurrent  (res=0.001)      */
+    uint16_t u16MaxChargeVoltage;     /* Byte 2-3   - BMS_MaxChargeVoltage  (res=0.001)      */
+    uint16_t u16CutOffChargeCurrent;  /* Byte 4-5   - BMS_CutOffChargeCurrent(res=0.001)     */
+    uint16_t u16PreChargeCurrent;     /* Byte 6-7   - BMS_PreChargeCurrent  (res=0.001)      */
+} TVS_Rx101_Profile_t;
+
+/*==============================================================================
+ * TVS Aggregated Message Frame
+ *============================================================================*/
+typedef struct
+{
+    TVS_Tx90_Info_t          TVS_Tx90_ChargerInfo;
+    TVS_Tx91_ChargeProfile_t TVS_Tx91_ChargeProfile;
+    TVS_Tx92_FMVersionInfo_t TVS_Tx92_FMVersionInfo;
+    TVS_Rx100_Status_t       TVS_Rx100_BMSStatus;
+    TVS_Rx101_Profile_t      TVS_Rx101_BMSProfile;
+} TVS_MsgFrameInfo_t;
+///////////////////////////////////////////////////////////////////
+
+
     /*Evse Stop Control Bit Description*/
     typedef enum
     {
@@ -214,6 +293,93 @@ extern ChargingMsgFrameInfo_t Charging_LiveInfo[MAX_DOCKS];
         LED_STATE_STEADY = 1U,
         LED_STATE_BLINK
     } ledStatus_e;
+
+/*==============================================================================
+ * TVS Charger Type Definitions (0x90 - CHARGER_Type)
+ *============================================================================*/
+typedef enum
+{
+    TVS_CHARGER_TYPE_TVS650W_FRIWO      = 1,
+    TVS_CHARGER_TYPE_TVS950W_FRIWO      = 2,
+    TVS_CHARGER_TYPE_TVS500W_FRIWO      = 3,
+    TVS_CHARGER_TYPE_TVS650W_NAPINO     = 4,
+    TVS_CHARGER_TYPE_TVS650W_ANEVOLVE   = 5,
+    TVS_CHARGER_TYPE_TVS550W_FRIWO      = 8,
+    TVS_CHARGER_TYPE_TVS580W_FRIWO      = 9,
+    TVS_CHARGER_TYPE_TVS1350W           = 10,
+    TVS_CHARGER_TYPE_TVS1500W_DELTA     = 11,
+    TVS_CHARGER_TYPE_3KW_DELTA_OFFBOARD = 22
+
+} TVS_ChargerType_t;
+
+
+/*==============================================================================
+ * TVS Charger Error State (0x90 - CHARGER_ErrorState, Byte 4 bits 0-3)
+ *============================================================================*/
+typedef enum
+{
+    TVS_CHARGER_ERR_NONE              = 0,
+    TVS_CHARGER_ERR_BATT_SHORT        = 1,
+    TVS_CHARGER_ERR_BATT_REVERSE      = 2,
+    TVS_CHARGER_ERR_BATT_VOL_RANGE    = 3,
+    TVS_CHARGER_ERR_LOST_CAN          = 4,
+    TVS_CHARGER_ERR_BATT_REPORT       = 5,
+    TVS_CHARGER_ERR_BATT_DISCONNECTED = 6,
+    TVS_CHARGER_ERR_OVER_TEMP         = 7,
+    TVS_CHARGER_ERR_OVER_VOLTAGE      = 8,
+    TVS_CHARGER_ERR_OVER_CURRENT      = 9,
+    TVS_CHARGER_ERR_AC_INPUT_RANGE    = 10,
+    TVS_CHARGER_ERR_FAN               = 11,
+    TVS_CHARGER_ERR_INTERNAL          = 12,
+    TVS_CHARGER_ERR_TERMINAL_SHORT    = 13,
+    TVS_CHARGER_ERR_OVER_CHARGE_TIME  = 14
+
+} TVS_ChargerError_t;
+
+
+/*==============================================================================
+ * TVS Charger Fan State
+ *============================================================================*/
+typedef enum
+{
+    TVS_FAN_OFF = 0,
+    TVS_FAN_ON  = 1
+
+} TVS_FanState_t;
+
+
+/*==============================================================================
+ * TVS Charger Output State
+ *============================================================================*/
+typedef enum
+{
+    TVS_OUTPUT_OFF = 0,
+    TVS_OUTPUT_ON  = 1
+
+} TVS_OutputState_t;
+
+
+/*==============================================================================
+ * TVS Charger Derating State
+ *============================================================================*/
+typedef enum
+{
+    TVS_DERATING_NONE   = 0,
+    TVS_DERATING_ACTIVE = 1
+
+} TVS_DeratingState_t;
+
+/*==============================================================================
+ * TVS BMS Error State (0x100 - BMS_ErrorState)
+ *============================================================================*/
+typedef enum
+{
+    TVS_BMS_ERR_NONE          = 0,
+    TVS_BMS_ERR_STOP_CHARGING = 1
+
+} TVS_BmsError_t;
+
+
 /*=================================================================
    FUNCTION PROTOTYPES
     ============================================================ */
