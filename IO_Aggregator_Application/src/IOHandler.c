@@ -123,7 +123,7 @@ bool i2cTransferDone = false;
 void ReadAllAnalogInputPins();
 bool IOExpander1_Configure_Ports(void);
 bool IOExpander2_Configure_Ports(void);
-void ChargingControl(uint8_t u8DockNo, uint8_t action);
+uint8_t u8ChargingControl(uint8_t u8DockNo, uint8_t action);
 uint32_t Analog_Input_Get(uint8_t channel);
 void HandleGPIOCommand(void);
 void HandleAnalogRead(void);
@@ -746,6 +746,11 @@ void ReadAllAnalogInputPins(void)
             currentAIQueueBuffer[i - 16U] = value16;
         }
     }
+    
+    SESSION_SetDockTemperature(DOCK_1, currentTempAIQueueBuffer[0] / 100.0F);
+    SESSION_SetDockTemperature(DOCK_2, currentTempAIQueueBuffer[1] / 100.0F);
+    SESSION_SetDockTemperature(DOCK_3, currentTempAIQueueBuffer[2] / 100.0F);
+    SESSION_SetDockTemperature(COMPARTMENT, currentTempAIQueueBuffer[3] / 100.0F);
 }
 
 /**
@@ -1161,11 +1166,11 @@ void HandleChargingCommand(uint8_t u8DockNo)
 
     SYS_CONSOLE_PRINT("[CHARGING] Action: %s\r\n",
                       action ? "START" : "STOP");
-    ChargingControl(u8DockNo,action);
+    uint8_t u8ChargingControlStatus = u8ChargingControl(u8DockNo,action);
     uint8_t status = 01; // Assume success for now
 
     uint8_t payload[1];
-    payload[0] = status;
+    payload[0] = u8ChargingControlStatus;
 
     SendResponsePayload(payload,1);
 }
@@ -1752,7 +1757,7 @@ void ProcessInbPacket(uint8_t msgType,
     }
 }
 
-void ChargingControl(uint8_t u8DockNo, uint8_t action)
+uint8_t u8ChargingControl(uint8_t u8DockNo, uint8_t action)
 {
     // Placeholder for actual charging control logic
     //SYS_CONSOLE_PRINT("[CHARGING] Control for Dock %d, Action: %s\r\n", u8DockNo, action ? "START" : "STOP");
@@ -1762,6 +1767,7 @@ void ChargingControl(uint8_t u8DockNo, uint8_t action)
         SESSION_SetAuthenticationCommand(u8DockNo, action);
         u8PevChargingState[u8DockNo] = action;
     }
+    return true; // Assume success for now
 }
 
 bool bGPIO_Operation(GPIOOperation_e eGPIOType, uint8_t u8DockNo)
