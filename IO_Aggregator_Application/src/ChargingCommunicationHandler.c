@@ -152,7 +152,7 @@ void vProcessBMSMessage(uint8_t u8DockNo)
     CAN_TX_BUFFER tx = {0};
     ChargingMsgFrameInfo_t info = {0};
 
-    (void)bGetSetBMSData(u8DockNo, &info, GET_PARA);
+    (void)bGetSetLevdcBMSData(u8DockNo, &info, GET_PARA);
 
     tx.dlc = CAN_DATA_SIZE;
     tx.xtd = STD_CAN_MSG;
@@ -284,7 +284,7 @@ void vProcessBMSCanMessage(CAN_RX_BUFFER *rxBuf, uint8_t canBus)
 
     ChargingMsgFrameInfo_t info = {0};
 
-    (void)bGetSetBMSData(u8DockNo, &info, GET_PARA);
+    (void)bGetSetLevdcBMSData(u8DockNo, &info, GET_PARA);
 
     switch (canId)
     {
@@ -313,7 +313,7 @@ void vProcessBMSCanMessage(CAN_RX_BUFFER *rxBuf, uint8_t canBus)
         break;
     }
 
-    (void)bGetSetBMSData(u8DockNo, &info, SET_PARA);
+    (void)bGetSetLevdcBMSData(u8DockNo, &info, SET_PARA);
 }
 
 /* ============================================================================
