@@ -1,696 +1,770 @@
 /* ************************************************************************** */
-/** @file IOHandler.c
- *  @brief I/O status management and flash config storage for IO Aggregator board.
- *  @company BACANCY SYSTEMS PVT.LTD.
+/** @file    IOHandler.c
+ *  @brief   IO status management and flash config storage — implementation
+ *
+ *  @company BACANCY SYSTEMS PVT. LTD.
+ *
  *  @details
  *    Implements digital/analog pin management, flash I/O state storage,
- *    and port configurations for the IO Aggregator board.
- *    MISRA C:2023 compliant coding style and documentation.
+ *    TCP command parsing, and port configuration for the IO Aggregator board.
+ *
+ *  Version : 2.0
+ *
+ *  Changes from v1.0:
+ *    - Fixed: `bGPIO_Operation` had no `return` statement at the end of the
+ *      function — undefined behaviour; all paths now return explicitly.
+ *    - Fixed: `u8DockNo` used as direct array index into Gpio_conf arrays
+ *      without bounds check — index could be >= MAX_DOCKS causing buffer
+ *      overflow. All per-dock GPIO operations now guard the index.
+ *    - Fixed: `uint16_t relayStatus` and `uint32_t doStatus` re-declared as
+ *      local variables inside `readOutputsFromFlash`, shadowing the globals
+ *      — the save path used the wrong (local) values. Removed local shadows.
+ *    - Fixed: `uint16_t serialnum` declared twice (global + local in header).
+ *      Removed duplicate; now a single definition here.
+ *    - Fixed: `StoreRelay_DigitalOutputsFrame` used |= on persistent globals
+ *      (`doStatus`, `relayStatus`) without clearing first — bits that were
+ *      once set could never be cleared. Now assigns = not |=.
+ *    - Fixed: `Analog_Input_Get(channel)` uses `channel - 1` without guarding
+ *      against channel == 0 → underflow to 0xFF → OOB read. Added guard.
+ *    - Fixed: `MovingAverage_Update(channel, ...)` uses `channel` as index
+ *      into `ma[]` (size 20) without bounds check — OOB if channel >= 20.
+ *    - Fixed: `ADC busy-wait` in `ReadAllAnalogInputPins` has no timeout —
+ *      could block forever. Added timeout counter.
+ *    - Fixed: `SendResponsePayload` had no bounds check on `len` vs
+ *      `outbPacketBuf` size (256 bytes) — potential buffer overflow.
+ *    - Fixed: `PrepareDispatchOutbPacket` directly indexes
+ *      `Reqframe_St.payload[0/1/2]` without checking payloadLen >= 3 — OOB
+ *      read if payload is shorter.
+ *    - Fixed: `ParseAndProcessInbPacket` declares `uint8_t u8DockNo` inside
+ *      a `case` statement without a compound statement — C99 violation.
+ *    - Fixed: `vTaskDelay(100)` in solenoid path — raw number, should be
+ *      `pdMS_TO_TICKS(100U)`.
+ *    - Fixed: `vTaskDelay(RECONNECT_DELAY_MS)` — macro is milliseconds but
+ *      vTaskDelay takes ticks. Wrapped in pdMS_TO_TICKS.
+ *    - Fixed: `vTaskDelay(10)` in main task loop — raw number, should be
+ *      `pdMS_TO_TICKS(10U)`.
+ *    - Fixed: `inbPortNo`, `inbPortVal`, `inbCrc` declared as `short`/`int`
+ *      — signed types for port numbers invite negative-index bugs.
+ *      Changed to appropriate unsigned types.
+ *    - Fixed: `CalculateCRC` comment claims polynomial 0x8005 but uses 0x1021
+ *      — corrected comment to CRC-16/CCITT.
+ *    - Fixed: `GetPortFromSerialNumber` checks 4 non-overlapping ranges that
+ *      together cover 1–110 and always return `serialNumber` unmodified —
+ *      function is pure dead code / identity function. Replaced with inline
+ *      range check.
+ *    - Fixed: `ResetInbOutbData` uses two separate for-loops of 256 to zero
+ *      packet buffers — replaced with memset.
+ *    - Fixed: `HandleGPIOCommand` validates portVal != 0 && != 1 but only
+ *      for write operations — read operations still set errorCode on portVal
+ *      that defaults to 0 (valid). Moved portVal check inside write-only path.
+ *    - Fixed: `saveOutputsToFlash` blocks on `while(FCW_IsBusy())` without
+ *      timeout — could hang forever if flash controller locks up.
+ *    - Fixed: NTC sensor `TempCalcNTC` has division by (VREF - in_volt) with
+ *      no guard against in_volt >= VREF — divide-by-zero (or negative
+ *      resistance). Added guard.
+ *    - Improved: `TCA9539_CONFIG_PORT0/1` macro values corrected in .c
+ *      (were 0x06/0x07 — those are the configuration registers, consistent
+ *      with the TCA9539 datasheet).
+ *    - Improved: `Board_gpio_st Gpio_conf` array indices now start at
+ *      DOCK_1 (1) not 0 — index 0 is COMPARTMENT which has no dock GPIO.
+ *      Added comment warning.
+ *    - Improved: Magic numbers in `SaveResponsePayload` / `PrepareDispatch`
+ *      for response type (0x00, 0x02) replaced with MSG_TYPE_RESPONSE.
  */
 /* ************************************************************************** */
-/* ************************************************************************** */
-/* Section: Included Files                                                    */
-/* ************************************************************************** */
-/* ************************************************************************** */
-#include "definitions.h"                // SYS function prototypes
+
+/* ============================================================================
+ * Includes
+ * ========================================================================== */
+#include "IOHandler.h"
+#include "definitions.h"
 #include "configuration.h"
 #include "device.h"
 #include "tcpip_manager_control.h"
 #include "library/tcpip/tcpip_helpers.h"
 #include <math.h>
+#include <string.h>
 #include "sessionDBHandler.h"
-/* ************************************************************************** */
-/* ************************************************************************** */
-/* Section: Macro Definitions                                                 */
-/* ************************************************************************** */
-#define NUM_DIGITAL_PINS            60U         /**< Total number of digital input pins */
-#define RELAY_COUNT                 6U          /**< Total number of relays */
-#define DIGITAL_OUTPUT              24U         /**< Total number of digital output pins */
 
-#define TCA9539_REG_OUTPUT_PORT0    0x06U       /**< IO Expander Port 0 output register address */
-#define TCA9539_REG_OUTPUT_PORT1    0x07U       /**< IO Expander Port 1 output register address */
+/* ============================================================================
+ * Internal Configuration
+ * ========================================================================== */
+#define NUM_DI_PINS             (60U)   /**< Total digital inputs                */
+#define NUM_DO_PINS             (24U)   /**< Total digital outputs               */
+#define NUM_RELAY_PINS          (6U)    /**< Total relay / eFuse outputs         */
 
-#define FLASH_MAGIC                 0xDEADBEEFU /**< Magic number to verify flash data validity */
-#define FLASH_ADDRESS               0x0C0F0000U /**< Start address in flash for storing config */
+#define TCA9539_REG_OUT_PORT0   (0x02U) /**< TCA9539 output register port 0     */
+#define TCA9539_REG_OUT_PORT1   (0x03U) /**< TCA9539 output register port 1     */
 
-#define ADC_TIMEOUT                 (10000U)    /**< Timeout for ADC operations in microseconds */
+#define ADC_TIMEOUT_CYCLES      (100000U) /**< Max spin cycles waiting for ADC  */
 
-#define TCP_MIN_FRAME_SIZE       12U          /**< Minimum valid TCP frame size (header only) */
-//---------------- ADC and Circuit Parameters ----------------
+/** TCP frame layout constants */
+#define FRAME_HEADER_SIZE       (10U)   /**< UniqueID(4)+MsgType(2)+Cmp(1)+Dock(1)+Cmd(1)+PayLen(1) */
+#define FRAME_CRC_SIZE          (2U)
+#define RESPONSE_MSG_TYPE_HI    (0x00U)
+#define RESPONSE_MSG_TYPE_LO    (0x02U)
+
+/** Packet buffer sizes */
+#define PKT_BUF_SIZE            (256U)
+
+/** Solenoid actuation pulse width */
+#define SOLENOID_PULSE_MS       (100U)
+
+/** Task loop delay */
+#define IO_TASK_LOOP_DELAY_MS   (10U)
+
+/** Moving average sample count and channel count */
+#define MA_SAMPLE_LEN           (50U)
+#define MA_CHANNEL_COUNT        (20U)   /**< Must match ALL_ANALOG_PINS        */
+
+#define MSG_TYPE_REQUEST        (0x01)
+#define MSG_TYPE_RESPONSE       (0x02)
+/* ============================================================================
+ * Sensor Calibration Constants (file-scope only — not exported)
+ * ========================================================================== */
 #if PT100_Sensor
-static const float VREF_L          = 4.9500F;
-static const float ADC_MAX_VAL     = 4095.0F;
-static const float VREF            = 3.290F;
-static const float GAIN            = 10.9F;
-static const float RREF            = 3300.0F;
-static const float TEMP_COEFF_PT100= 0.00385F;
+static const float k_VrefL          = 4.9500F;
+static const float k_AdcMaxVal      = 4095.0F;
+static const float k_Vref           = 3.290F;
+static const float k_Gain           = 10.9F;
+static const float k_Rref           = 3300.0F;
+static const float k_TempCoeffPT100 = 0.00385F;
 #endif
 
 #if NTC_Sensor
-static const float COEFF_A         = 0.0011279F;
-static const float COEFF_B         = 0.00023429F;
-static const float COEFF_C         = 0.000000087298F;
-static const uint32_t REF_RESISTOR = 4700U;
+static const float    k_CoeffA      = 0.0011279F;
+static const float    k_CoeffB      = 0.00023429F;
+static const float    k_CoeffC      = 0.000000087298F;
+static const uint32_t k_RefResistor = 4700U;
+static const float    k_VrefNTC     = 3.3F;
 #endif
 
-#define MAX_BATCH_SIZE              16
-#define TUPLE_SIZE                  6
-#define HEADER_SIZE                 4
-#define CRC_SIZE                    2
-#define MESSAGE_MAX_SIZE            (HEADER_SIZE + (MAX_BATCH_SIZE * TUPLE_SIZE) + CRC_SIZE)
+/* ============================================================================
+ * Global Variables
+ * ========================================================================== */
 
-#define MSG_TYPE_REQUEST            0x01
-#define MSG_TYPE_RESPONSE           0x02
+/** Digital / relay output state bitmaps */
+uint32_t doStatus    = 0U;
+uint16_t relayStatus = 0U;
+uint16_t serialnum   = 0U;
 
-volatile bool Two_Wheeler_IO_Aggregator1 = false;             /**< Flag for board version selection */
-volatile bool Board_Selection = false;                        /**< General board configuration selector */
+/** ADC / temperature buffers */
+volatile uint16_t currentTempAIQueueBuffer[NUM_TEMPERATURE_ANALOG_PINS];
+volatile uint16_t currentAIQueueBuffer[NUM_ANALOG_PINS];
+volatile uint8_t  currentDIQueueBuffer[NUM_DI_PINS];
 
-// Command types
-const char msgSubTypeDigitalRead  = 0x00;
-const char msgSubTypeDigitalWrite = 0x01;
-const char msgSubTypeAnalogRead   = 0x03;
-
-// Error types
-const char errorNoError           = 0x00;
-const char errorInvalidMsg        = 0x01;
-const char errorInvalidCrc        = 0x02;
-const char errorInvalidTuples     = 0x04;
-const char errorInvalidPort       = 0x08;
-const char errorInvalidValue      = 0x10;
-const char errorSafety            = 0x20;
-const char errorInternalFailure   = 0x40;
-const char errorSecurityIntrusion = 0x80;
-
-// Incoming Command for HEV
-char inbMsgSubType = 0x00;
-int inbNumTuples = 0; // Allow only  max of 1 for now
-short inbPortNo = -1;
-int inbPortVal = -1;
-short inbCrc = -1;
-char inbPacketBuf[256] = { 0x00 };
-int inbPacketSz = 0;
-
-// Outgoing Command for HEV
-char outbErrorCode = errorNoError;
-char outbMsgSubType = 0x00;
-int outbNumTuples = 0; // Allow only  max of 1 for now
-short outbPortNo = -1;
-int outbPortVal = -1;
-short outbCrc = -1;
-char outbPacketBuf[256] = { 0x00 };
-int outbPacketSz = 0;
-short outbRemotePort = 0;
-
-uint32_t doStatus = 0U;               /**< Current digital output status */
-uint16_t relayStatus = 0U;            /**< Current relay output status */
-uint16_t serialnum = 0U;              /**< Device serial number stored in flash */
-
-// Default output states
-uint32_t digitalOutputs;     // All outputs off
-uint16_t relayOutputs;           // All relays off
-uint16_t serialnum;
-// Function prototypes
-void saveOutputsToFlash(uint32_t digital, uint16_t relay, uint16_t serialnum);
-void readOutputsFromFlash(void);
-static TCP_SOCKET sIOServerSocket = INVALID_SOCKET;
-char IOreceiveBuffer[128] = {0};
-
-//I2C flag and buffer
-uint8_t i2cTxBuf[2];
-uint8_t i2cRxBuf[2];
-bool i2cTransferDone = false;
-
-void ReadAllAnalogInputPins();
-bool IOExpander1_Configure_Ports(void);
-bool IOExpander2_Configure_Ports(void);
-uint8_t u8ChargingControl(uint8_t u8DockNo, uint8_t action);
-uint32_t Analog_Input_Get(uint8_t channel);
-void HandleGPIOCommand(void);
-void HandleAnalogRead(void);
-void HandleChargingCommand(uint8_t u8DockNo);
-void HandleBootloaderCommand(void);
-void SendResponsePayload(uint8_t *payload, uint8_t len);
-volatile  uint16_t currentTempAIQueueBuffer[NUM_TEMPERATURE_ANALOG_PINS];
-volatile  uint16_t currentAIQueueBuffer[NUM_ANALOG_PINS];
-char messageAnalog[MESSAGE_BUFFER_SIZE];
+/** Analog message buffer */
+char     messageAnalog[MESSAGE_BUFFER_SIZE];
 uint32_t total_length = 0U;
-volatile  uint8_t currentDIQueueBuffer[NUM_DIGITAL_PINS];
-uint16_t CalculateCRC(uint8_t *data, uint16_t length);
-static void SetStaticIPAddress(const char* ipStr);
-volatile bool bIOOperation = false;
+
+/** I2C shared buffers */
+uint8_t i2cTxBuf[2]      = {0U};
+uint8_t i2cRxBuf[2]      = {0U};
+bool    i2cTransferDone   = false;
+
+/** Bootloader trigger RAM pointer */
 uint32_t *ramStart = (uint32_t *)BTL_TRIGGER_RAM_START;
-TCP_RequestFrame_t Reqframe_St;
-const Board_gpio_st Gpio_conf = {
-    .AC_Relay_Pin = {61,62,63},
-    .DC_Relay_Pin = {64,65,66},
-    .Solenoid_PinHi = {67,68,69},
-    .Solenoid_PinLo = {70,71,72},
-    .R_LED_Pin = {73,74,75},
-    .G_LED_Pin = {76,77,78},
-    .B_LED_Pin = {79,80,81},
-    .Dock_Fan_Pin = {86,87,88},
-    .Compartment_Fan_Pin = {85},
-    .DoorLock_Pin = {1,2,3},
-    .SolenoidLock_Pin = {4,5,6},
-    .EStop_Pin = {7}};
-/*  A brief description of a section can be given directly below the section
-    banner.
+
+/** ADC result array (used by some external callers) */
+volatile uint32_t adc_data[NUM_ANALOG_PINS];
+
+/* ============================================================================
+ * Private Variables
+ * ========================================================================== */
+
+/** TCP server socket */
+static TCP_SOCKET s_ioSocket = INVALID_SOCKET;
+
+/** Parsed request frame (valid between parse and reset) */
+static TCP_RequestFrame_t s_reqFrame;
+
+/** Response packet buffer */
+static uint8_t s_outbuf[PKT_BUF_SIZE];
+
+/** Legacy inbound state (kept for PrepareDispatchOutbPacket compatibility) */
+static char     s_inbMsgSubType  = 0x00;
+static int32_t  s_inbPortVal     = -1;
+static char     s_outbErrorCode;
+static int32_t  s_outbPortVal    = -1;
+
+/** Board selection flag (set once after first DI read) */
+static volatile bool s_boardSelectionDone = false;
+
+/** IO operation busy flag */
+volatile bool bIOOperation = false;
+
+/* ============================================================================
+ * GPIO Pin Configuration Table
+ *
+ * BUG FIX: Gpio_conf arrays are indexed with u8DockNo directly.
+ * u8DockNo comes from sessionDB Dock_e where DOCK_1=1, DOCK_2=2, DOCK_3=3.
+ * Index 0 (COMPARTMENT) is unused for per-dock GPIO — arrays sized to
+ * MAX_DOCKS with index 0 left as 0.
+ * ========================================================================== */
+static const Board_gpio_st k_GpioConf = {
+    .AC_Relay_Pin       = {0,  61, 62, 63},  /* [0]=unused, [1]=DOCK_1, ... */
+    .DC_Relay_Pin       = {0,  64, 65, 66},
+    .Solenoid_PinHi     = {0,  67, 68, 69},
+    .Solenoid_PinLo     = {0,  70, 71, 72},
+    .R_LED_Pin          = {0,  73, 74, 75},
+    .G_LED_Pin          = {0,  76, 77, 78},
+    .B_LED_Pin          = {0,  79, 80, 81},
+    .Dock_Fan_Pin       = {0,  86, 87, 88},
+    .Compartment_Fan_Pin = 85,
+    .DoorLock_Pin       = {0,  1,  2,  3},
+    .SolenoidLock_Pin   = {0,  4,  5,  6},
+    .EStop_Pin          = 7
+};
+
+/* ============================================================================
+ * Error Code Constants
+ * ========================================================================== */
+static const uint8_t k_ErrNone          = 0x00U;
+static const uint8_t k_ErrInvalidMsg    = 0x01U;
+static const uint8_t k_ErrInvalidCrc    = 0x02U;
+static const uint8_t k_ErrInvalidPort   = 0x08U;
+static const uint8_t k_ErrInvalidValue  = 0x10U;
+
+/* ============================================================================
+ * Message Sub-type Constants
+ * ========================================================================== */
+static const uint8_t k_MsgDigitalRead   = 0x00U;
+static const uint8_t k_MsgDigitalWrite  = 0x01U;
+
+/* ============================================================================
+ * Private Function Prototypes
+ * ========================================================================== */
+static void     prv_SaveOutputsToFlash_Raw(uint32_t u32Digital,
+                                           uint16_t u16Relay,
+                                           uint16_t u16Serial);
+static void     prv_ReadOutputsFromFlash(void);
+static void     prv_StoreRelay_DigitalOutputsFrame(void);
+static void     prv_ReadDigitalInputs(void);
+static void     prv_SetStaticIPAddress(const char *pcIpStr);
+static uint16_t prv_CalculateCRC16(const uint8_t *pu8Data, uint16_t u16Len);
+static void     prv_ParseAndProcessInbPacket(uint8_t *pu8Buf, uint16_t u16Len);
+static void     prv_HandleGPIOCommand(void);
+static void     prv_HandleAnalogRead(void);
+static void     prv_HandleChargingCommand(uint8_t u8DockNo);
+static void     prv_HandleBootloaderCommand(void);
+static void     prv_SendResponsePayload(const uint8_t *pu8Payload, uint8_t u8Len);
+static void     prv_PrepareDispatchOutbPacket(void);
+static void     prv_ResetFrameState(void);
+static uint8_t  prv_GPIO_Read(uint16_t u16PortNo, uint8_t *pu8ErrorCode);
+static void     prv_GPIO_Write(uint16_t u16PortNo, bool bVal, uint8_t *pu8ErrorCode);
+static uint8_t  prv_ChargingControl(uint8_t u8DockNo, uint8_t u8Action);
+static uint32_t prv_AnalogInputGet(uint8_t u8Channel);
+static void     prv_vConfigureIOexpanders(void);
+
+#if PT100_Sensor
+static inline float prv_TempCalcPT100(float fVoltage);
+#endif
+#if NTC_Sensor
+static inline float prv_TempCalcNTC(float fVoltage);
+#endif
+
+/* ============================================================================
+ * Moving Average Filter
+ * ========================================================================== */
+
+typedef struct
+{
+    uint16_t au16Buffer[MA_SAMPLE_LEN];
+    uint32_t u32Sum;
+    uint8_t  u8Index;
+} MovingAverage_t;
+
+static MovingAverage_t s_ma[MA_CHANNEL_COUNT];
+
+/**
+ * @brief  Initialise all moving average filter instances to zero.
  */
-void printSavedFlashData(void)
+static void prv_MovingAverage_Init_All(void)
+{
+    (void)memset(s_ma, 0, sizeof(s_ma));
+}
+
+/**
+ * @brief  Update moving average for one channel and return the new average.
+ *
+ *         BUG FIX: original function had no bounds check on channel — if
+ *         channel >= MA_CHANNEL_COUNT (20), it wrote past the end of s_ma[].
+ *
+ * @param  u8Channel  ADC channel index (0 to MA_CHANNEL_COUNT-1)
+ * @param  u16New     New raw ADC sample
+ * @return uint16_t   Running average
+ */
+uint16_t MovingAverage_Update(uint8_t u8Channel, uint16_t u16New)
+{
+    if (u8Channel >= (uint8_t)MA_CHANNEL_COUNT)
+    {
+        SYS_CONSOLE_PRINT("[MA] Invalid channel %u\r\n", (unsigned)u8Channel);
+        return 0U;
+    }
+
+    MovingAverage_t *pMA = &s_ma[u8Channel];
+    pMA->u32Sum -= (uint32_t)pMA->au16Buffer[pMA->u8Index];
+    pMA->au16Buffer[pMA->u8Index] = u16New;
+    pMA->u32Sum += (uint32_t)u16New;
+    pMA->u8Index = (uint8_t)((pMA->u8Index + 1U) % MA_SAMPLE_LEN);
+    return (uint16_t)(pMA->u32Sum / MA_SAMPLE_LEN);
+}
+
+/* ============================================================================
+ * Temperature Calculation Helpers
+ * ========================================================================== */
+
+#if PT100_Sensor
+/**
+ * @brief  Convert ADC voltage to PT100 temperature (°C).
+ * @param  fVoltage  Voltage at ADC input (V)
+ * @return float     Temperature in °C
+ */
+static inline float prv_TempCalcPT100(float fVoltage)
+{
+    float fDenom = (k_Gain * k_VrefL) - fVoltage;
+    if (fDenom <= 0.0F)
+    {
+        return -273.15F; /* Return absolute-zero sentinel on invalid input */
+    }
+    float fResistance   = (k_Rref * fVoltage) / fDenom;
+    float fTemperature  = ((fResistance / 100.0F) - 1.0F) / k_TempCoeffPT100;
+    return fTemperature;
+}
+#endif
+
+#if NTC_Sensor
+/**
+ * @brief  Convert ADC voltage to NTC thermistor temperature (°C).
+ *
+ *         BUG FIX: original had no guard on (VREF - in_volt) <= 0, which
+ *         causes divide-by-zero or negative resistance when in_volt >= VREF.
+ *
+ * @param  fVoltage  Voltage at ADC input (V)
+ * @return float     Temperature in °C (returns -273.15 on invalid input)
+ */
+static inline float prv_TempCalcNTC(float fVoltage)
+{
+    float fDenom = k_VrefNTC - fVoltage;
+    if (fDenom <= 0.0F)
+    {
+        return -273.15F; /* Guard against divide-by-zero */
+    }
+    float fResistance = (float)k_RefResistor * (fVoltage / fDenom);
+    if (fResistance <= 0.0F)
+    {
+        return -273.15F;
+    }
+    float fLnRes  = logf(fResistance);
+    float fInvT   = k_CoeffA + (k_CoeffB * fLnRes) +
+                    (k_CoeffC * (fLnRes * fLnRes * fLnRes));
+    if (fInvT <= 0.0F)
+    {
+        return -273.15F;
+    }
+    return (1.0F / fInvT) - 273.15F;
+}
+#endif
+
+/* ============================================================================
+ * Flash Operations
+ * ========================================================================== */
+
+/**
+ * @brief  Print the current flash configuration to console.
+ */
+static void prv_PrintSavedFlashData(void)
 {
     flash_data_t savedData;
     FCW_Read((uint32_t *)&savedData, sizeof(savedData), FLASH_ADDRESS);
 
-    if (savedData.magic != FLASH_MAGIC) {
-        SYS_CONSOLE_PRINT("Flash is empty or invalid. Magic: 0x%08X\n", savedData.magic);
+    if (savedData.magic != FLASH_MAGIC)
+    {
+        SYS_CONSOLE_PRINT("[Flash] Invalid or empty (magic=0x%08lX)\r\n",
+                          (unsigned long)savedData.magic);
         return;
     }
 
-    SYS_CONSOLE_PRINT("---- SAVED FLASH DATA ----\n");
-    SYS_CONSOLE_PRINT("Digital Outputs: 0x%08X\n", savedData.digitalOutputs);
-    SYS_CONSOLE_PRINT("Relay Outputs  : 0x%04X\n", savedData.relayOutputs);
+    SYS_CONSOLE_PRINT("---- SAVED FLASH DATA ----\r\n");
+    SYS_CONSOLE_PRINT("Digital: 0x%08lX  Relay: 0x%04X\r\n",
+                      (unsigned long)savedData.digitalOutputs,
+                      (unsigned)savedData.relayOutputs);
 
-    for (int i = 0; i < 6; i++) {
-        SYS_CONSOLE_PRINT("CAN%d: Port=%u, Baud=%lu\n", 
-            i + 1, savedData.canPorts[i], savedData.canBaudRates[i]);
+    for (uint8_t i = 0U; i < 6U; i++)
+    {
+        SYS_CONSOLE_PRINT("CAN%u: Port=%u Baud=%lu\r\n",
+                          (unsigned)(i + 1U),
+                          (unsigned)savedData.canPorts[i],
+                          (unsigned long)savedData.canBaudRates[i]);
     }
-
-    for (int i = 0; i < 2; i++) {
-        SYS_CONSOLE_PRINT("RS485%d: Port=%u, Baud=%lu, DataBits=%u, Parity=%c, StopBits=%u\n",
-            i + 1,
-            savedData.rs485Ports[i],
-            savedData.rs485Config[i].baudRate,
-            savedData.rs485Config[i].dataBits,
-            savedData.rs485Config[i].parity,
-            savedData.rs485Config[i].stopBits);
+    for (uint8_t i = 0U; i < 2U; i++)
+    {
+        SYS_CONSOLE_PRINT("RS485%u: Port=%u Baud=%lu Data=%u Parity=%c Stop=%u\r\n",
+                          (unsigned)(i + 1U),
+                          (unsigned)savedData.rs485Ports[i],
+                          (unsigned long)savedData.rs485Config[i].baudRate,
+                          (unsigned)savedData.rs485Config[i].dataBits,
+                          savedData.rs485Config[i].parity,
+                          (unsigned)savedData.rs485Config[i].stopBits);
     }
-
-    SYS_CONSOLE_PRINT("--------------------------\n");
+    SYS_CONSOLE_PRINT("--------------------------\r\n");
 }
 
-/*******************************************************************************
- *  \brief     Saves digital and relay output states to flash memory.
- *  \param[in] digital - 32-bit digital output data.
- *  \param[in] relay   - 16-bit relay output data.
- *  \details   This function writes the provided output states into non-volatile  
- *             flash memory after ensuring data cache coherence.
- *  \return    None (void function).
- *******************************************************************************/
-void saveOutputsToFlash(uint32_t digital, uint16_t relay, uint16_t serialnum)
+/**
+ * @brief  Write flash with busy-wait and timeout.
+ *
+ *         BUG FIX: original `while (FCW_IsBusy())` had no timeout and could
+ *         block indefinitely. Added a maximum iteration count.
+ *
+ * @param  u32Digital   Digital output bitmap to save
+ * @param  u16Relay     Relay output bitmap to save
+ * @param  u16Serial    Serial number to save
+ */
+static void prv_SaveOutputsToFlash_Raw(uint32_t u32Digital,
+                                       uint16_t u16Relay,
+                                       uint16_t u16Serial)
 {
-    writeData.magic = FLASH_MAGIC;
-    writeData.digitalOutputs = digital;
-    writeData.relayOutputs = relay;
-    writeData.serialNumber = serialnum;
-    
-    uint8_t writeBuffer[sizeof(flash_data_t)];
-    memcpy(writeBuffer, &writeData, sizeof(flash_data_t));
+    uint32_t u32Timeout;
+    uint8_t  au8WriteBuffer[sizeof(flash_data_t)];
 
-    DCACHE_CLEAN_BY_ADDR((uint32_t *)writeBuffer, sizeof(writeBuffer));
+    writeData.magic          = FLASH_MAGIC;
+    writeData.digitalOutputs = u32Digital;
+    writeData.relayOutputs   = u16Relay;
+    writeData.serialNumber   = u16Serial;
+
+    (void)memcpy(au8WriteBuffer, &writeData, sizeof(flash_data_t));
+    DCACHE_CLEAN_BY_ADDR((uint32_t *)au8WriteBuffer, sizeof(au8WriteBuffer));
+
     FCW_PageErase(FLASH_ADDRESS);
-    while (FCW_IsBusy());
-
-    FCW_RowWrite((uint32_t *)writeBuffer, FLASH_ADDRESS);
-    while (FCW_IsBusy());
-    SYS_CONSOLE_MESSAGE("Configuration saved to flash.\r\n");
-}
-void PrintLoadedConfig(void)
-{
-    SYS_CONSOLE_PRINT("=== Loaded Configuration ===\r\n");
-
-    for (int i = 0; i < 6; i++)
+    u32Timeout = ADC_TIMEOUT_CYCLES;
+    while (FCW_IsBusy() && (u32Timeout > 0U)) { u32Timeout--; }
+    if (u32Timeout == 0U)
     {
-        SYS_CONSOLE_PRINT("CAN Port %d -> TCP Port: %d\r\n", i + 1, writeData.canPorts[i]);
+        SYS_CONSOLE_PRINT("[Flash] Erase timeout!\r\n");
+        return;
     }
 
-    for (int i = 0; i < 2; i++)
+    FCW_RowWrite((uint32_t *)au8WriteBuffer, FLASH_ADDRESS);
+    u32Timeout = ADC_TIMEOUT_CYCLES;
+    while (FCW_IsBusy() && (u32Timeout > 0U)) { u32Timeout--; }
+    if (u32Timeout == 0U)
     {
-        SYS_CONSOLE_PRINT("RS485 Port %d -> TCP Port: %d\r\n", i + 1, writeData.rs485Ports[i]);
+        SYS_CONSOLE_PRINT("[Flash] Write timeout!\r\n");
+        return;
     }
 
-    for (int i = 0; i < 6; i++)
-    {
-        SYS_CONSOLE_PRINT("CAN Speed_%d: %d\r\n", i + 1, writeData.canBaudRates[i]);
-    }
-    for (int i = 0; i < 2; i++)
-    {
-        SYS_CONSOLE_PRINT("RS485_%d Config -> Baud: %lu, DataBits: %u, Parity: %c, StopBits: %u\r\n",
-            i + 1,
-            writeData.rs485Config[i].baudRate,
-            writeData.rs485Config[i].dataBits,
-            writeData.rs485Config[i].parity,
-            writeData.rs485Config[i].stopBits);
-    }
+    SYS_CONSOLE_PRINT("[Flash] Configuration saved.\r\n");
 }
 
-/*******************************************************************************
- *  \brief     Restore saved output states from flash memory.
- *
- *  \details   This function reads a configuration structure from non-volatile 
- *             flash memory, validates the integrity of the data using a magic 
- *             number and default validity checks, and restores the relay and 
- *             digital output states accordingly. If the flash data is invalid 
- *             or uninitialized, it initializes default configuration values, 
- *             applies them, and writes them to flash memory.
- *
- *             Additionally, it ensures all CAN server sockets are closed 
- *             before reinitializing with the restored or default configuration.
- *
- *  \note      This function should be called during system startup to restore 
- *             prior output states or initialize defaults.
- *
- *  \return    void
- *******************************************************************************/
-void readOutputsFromFlash(void)
+/**
+ * @brief  Public wrapper — save output states to flash.
+ */
+void saveOutputsToFlash(uint32_t u32Digital, uint16_t u16Relay, uint16_t u16SerialNum)
 {
-    uint8_t readBuffer[sizeof(flash_data_t)];
-    FCW_Read((uint32_t *)readBuffer, sizeof(flash_data_t), FLASH_ADDRESS);
-    flash_data_t *pDataVerify = (flash_data_t *)readBuffer;
+    prv_SaveOutputsToFlash_Raw(u32Digital, u16Relay, u16SerialNum);
+}
 
-    bool flashInvalid = false;
+/**
+ * @brief  Restore output states from flash, or write defaults if flash is invalid.
+ *
+ *         BUG FIX: local `uint16_t relayStatus` and `uint32_t doStatus` inside
+ *         this function shadowed the globals. The Save path at the end would
+ *         save the local (potentially wrong) values. Removed local shadows.
+ */
+static void prv_ReadOutputsFromFlash(void)
+{
+    uint8_t     au8ReadBuffer[sizeof(flash_data_t)];
+    uint32_t    u32Timeout;
+    bool        bFlashInvalid = false;
 
-    // Check if flash completely empty (0x00 or 0xFF)
-    bool flashCompletelyEmpty = true;
-    for (size_t i = 0; i < sizeof(flash_data_t); i++)
+    FCW_Read((uint32_t *)au8ReadBuffer, sizeof(flash_data_t), FLASH_ADDRESS);
+    flash_data_t *pData = (flash_data_t *)au8ReadBuffer;
+
+    /* Check for blank flash (all 0x00 or 0xFF) */
+    bool bBlank = true;
+    for (size_t i = 0U; i < sizeof(flash_data_t); i++)
     {
-        if (readBuffer[i] != 0x00 && readBuffer[i] != 0xFF)
+        if ((au8ReadBuffer[i] != 0x00U) && (au8ReadBuffer[i] != 0xFFU))
         {
-            flashCompletelyEmpty = false;
+            bBlank = false;
             break;
         }
     }
 
-    // Basic flash checks
-    if (pDataVerify->magic != FLASH_MAGIC || flashCompletelyEmpty)
+    if ((pData->magic != FLASH_MAGIC) || bBlank)
     {
-        flashInvalid = true;
+        bFlashInvalid = true;
     }
     else
     {
-        for (int i = 0; i < 6; i++)
+        for (uint8_t i = 0U; i < 6U; i++)
         {
-            if (pDataVerify->canPorts[i] == 0 || pDataVerify->canBaudRates[i] == 0)
+            if ((pData->canPorts[i] == 0U) || (pData->canBaudRates[i] == 0UL))
             {
-                flashInvalid = true;
+                bFlashInvalid = true;
                 break;
             }
         }
-
-        for (int i = 0; i < 2 && !flashInvalid; i++)
+        for (uint8_t i = 0U; (i < 2U) && (!bFlashInvalid); i++)
         {
-            if (pDataVerify->rs485Ports[i] == 0 ||
-                pDataVerify->rs485Config[i].baudRate == 0 ||
-                pDataVerify->rs485Config[i].dataBits == 0 ||
-                pDataVerify->rs485Config[i].stopBits == 0)
+            if ((pData->rs485Ports[i] == 0U)           ||
+                (pData->rs485Config[i].baudRate == 0UL) ||
+                (pData->rs485Config[i].dataBits == 0U)  ||
+                (pData->rs485Config[i].stopBits == 0U))
             {
-                flashInvalid = true;
-                break;
+                bFlashInvalid = true;
             }
         }
     }
 
-    if (!flashInvalid)
+    if (!bFlashInvalid)
     {
-        memcpy(&writeData, pDataVerify, sizeof(flash_data_t));
-        SYS_CONSOLE_PRINT("Restored Outputs - Digital: %08X, Relay: %04X\r\n", 
-                          writeData.digitalOutputs, writeData.relayOutputs);
-        SYS_CONSOLE_MESSAGE("Configuration loaded from flash.\r\n");
+        (void)memcpy(&writeData, pData, sizeof(flash_data_t));
+        serialnum = writeData.serialNumber;
+
+        SYS_CONSOLE_PRINT("[Flash] Restored Digital=0x%08lX Relay=0x%04X\r\n",
+                          (unsigned long)writeData.digitalOutputs,
+                          (unsigned)writeData.relayOutputs);
+
+        /* --- Restore relay outputs --- */
+        /* BUG FIX: use local variable from flash, not global relayStatus */
+        uint16_t u16SavedRelay = writeData.relayOutputs;
+        for (uint8_t i = 0U; i < (uint8_t)NUM_RELAY_PINS; i++)
+        {
+            bool bSet = ((u16SavedRelay & (uint16_t)(1U << i)) != 0U);
+            switch (i)
+            {
+                case 0U: bSet ? efuse1_in_Set()        : efuse1_in_Clear();        break;
+                case 1U: bSet ? efuse2_in_Set()        : efuse2_in_Clear();        break;
+                case 2U: bSet ? efuse3_in_Set()        : efuse3_in_Clear();        break;
+                case 3U: bSet ? efuse4_in_Set()        : efuse4_in_Clear();        break;
+                case 4U: bSet ? Relay_Output_1_Set()   : Relay_Output_1_Clear();   break;
+                case 5U: bSet ? Relay_Output_2_Set()   : Relay_Output_2_Clear();   break;
+                default: break;
+            }
+        }
+
+        /* --- Restore digital outputs --- */
+        uint32_t u32SavedDO = writeData.digitalOutputs;
+        for (uint8_t i = 0U; i < (uint8_t)NUM_DO_PINS; i++)
+        {
+            bool bSet = ((u32SavedDO & (1UL << i)) != 0U);
+            switch (i)
+            {
+                case  0U: bSet ? Digital_Output_1_Set()  : Digital_Output_1_Clear();  break;
+                case  1U: bSet ? Digital_Output_2_Set()  : Digital_Output_2_Clear();  break;
+                case  2U: bSet ? Digital_Output_3_Set()  : Digital_Output_3_Clear();  break;
+                case  3U: bSet ? Digital_Output_4_Set()  : Digital_Output_4_Clear();  break;
+                case  4U: bSet ? Digital_Output_5_Set()  : Digital_Output_5_Clear();  break;
+                case  5U: bSet ? Digital_Output_6_Set()  : Digital_Output_6_Clear();  break;
+                case  6U: bSet ? Digital_Output_7_Set()  : Digital_Output_7_Clear();  break;
+                case  7U: bSet ? Digital_Output_8_Set()  : Digital_Output_8_Clear();  break;
+                case  8U: bSet ? Digital_Output_9_Set()  : Digital_Output_9_Clear();  break;
+                case  9U: bSet ? Digital_Output_10_Set() : Digital_Output_10_Clear(); break;
+                case 10U: bSet ? Digital_Output_11_Set() : Digital_Output_11_Clear(); break;
+                case 11U: bSet ? Digital_Output_12_Set() : Digital_Output_12_Clear(); break;
+                case 12U: bSet ? Digital_Output_13_Set() : Digital_Output_13_Clear(); break;
+                case 13U: bSet ? Digital_Output_14_Set() : Digital_Output_14_Clear(); break;
+                case 14U: bSet ? Digital_Output_15_Set() : Digital_Output_15_Clear(); break;
+                case 15U: bSet ? Digital_Output_16_Set() : Digital_Output_16_Clear(); break;
+                case 16U: bSet ? Digital_Output_17_Set() : Digital_Output_17_Clear(); break;
+                case 17U: bSet ? Digital_Output_18_Set() : Digital_Output_18_Clear(); break;
+                case 18U: bSet ? Digital_Output_19_Set() : Digital_Output_19_Clear(); break;
+                case 19U: bSet ? Digital_Output_20_Set() : Digital_Output_20_Clear(); break;
+                case 20U: bSet ? Digital_Output_21_Set() : Digital_Output_21_Clear(); break;
+                case 21U: bSet ? Digital_Output_22_Set() : Digital_Output_22_Clear(); break;
+                case 22U: bSet ? Digital_Output_23_Set() : Digital_Output_23_Clear(); break;
+                case 23U: bSet ? Digital_Output_24_Set() : Digital_Output_24_Clear(); break;
+                default: break;
+            }
+        }
+
 #if HEV_IO_Aggregator
-        // Restore RS485 UART configuration
-        for (int uartIndex = 0; uartIndex < 2; uartIndex++) {
-            int baud = writeData.rs485Config[uartIndex].baudRate;
-            int dataBits = writeData.rs485Config[uartIndex].dataBits;
-            int stopBits = writeData.rs485Config[uartIndex].stopBits;
-            int parityEncoded = writeData.rs485Config[uartIndex].parity;
+        /* Restore RS-485 UART configuration */
+        for (uint8_t u8UartIdx = 0U; u8UartIdx < 2U; u8UartIdx++)
+        {
+            uint32_t u32Baud      = writeData.rs485Config[u8UartIdx].baudRate;
+            uint8_t  u8DataBits   = writeData.rs485Config[u8UartIdx].dataBits;
+            uint8_t  u8StopBits   = writeData.rs485Config[u8UartIdx].stopBits;
+            int32_t  i32Parity    = (int32_t)writeData.rs485Config[u8UartIdx].parity;
 
-            USART_DATA dataWidth;
-            switch (dataBits) {
-                case 5: dataWidth = USART_DATA_5_BIT; break;
-                case 6: dataWidth = USART_DATA_6_BIT; break;
-                case 7: dataWidth = USART_DATA_7_BIT; break;
-                case 8: dataWidth = USART_DATA_8_BIT; break;
+            USART_DATA eDataWidth;
+            switch (u8DataBits)
+            {
+                case 5U: eDataWidth = USART_DATA_5_BIT; break;
+                case 6U: eDataWidth = USART_DATA_6_BIT; break;
+                case 7U: eDataWidth = USART_DATA_7_BIT; break;
+                case 8U: eDataWidth = USART_DATA_8_BIT; break;
                 default:
-                    SYS_CONSOLE_PRINT("? Invalid Data Bits (%d) for RS485_%d\r\n", dataBits, uartIndex + 1);
+                    SYS_CONSOLE_PRINT("[RS485%u] Invalid data bits (%u)\r\n",
+                                      (unsigned)(u8UartIdx + 1U), (unsigned)u8DataBits);
                     continue;
             }
 
-            USART_PARITY parity;
-            switch (parityEncoded) {
-                case 0: parity = USART_PARITY_NONE; break;
-                case 1: parity = USART_PARITY_ODD; break;
-                case 2: parity = USART_PARITY_EVEN; break;
+            USART_PARITY eParity;
+            switch (i32Parity)
+            {
+                case 0: eParity = USART_PARITY_NONE; break;
+                case 1: eParity = USART_PARITY_ODD;  break;
+                case 2: eParity = USART_PARITY_EVEN; break;
                 default:
-                    SYS_CONSOLE_PRINT("? Invalid Parity (%d) for RS485_%d\r\n", parityEncoded, uartIndex + 1);
+                    SYS_CONSOLE_PRINT("[RS485%u] Invalid parity (%ld)\r\n",
+                                      (unsigned)(u8UartIdx + 1U), (long)i32Parity);
                     continue;
             }
 
-            USART_STOP stop = (stopBits == 1) ? USART_STOP_0_BIT : USART_STOP_1_BIT;
+            USART_STOP eStop = (u8StopBits == 1U) ? USART_STOP_0_BIT : USART_STOP_1_BIT;
 
-            USART_SERIAL_SETUP setup = {
-                .baudRate = baud,
-                .dataWidth = dataWidth,
-                .parity = parity,
-                .stopBits = stop
+            USART_SERIAL_SETUP sSetup = {
+                .baudRate  = u32Baud,
+                .dataWidth = eDataWidth,
+                .parity    = eParity,
+                .stopBits  = eStop
             };
 
-            if (uartIndex == 0) {
+            if (u8UartIdx == 0U)
+            {
                 SERCOM8_USART_ReadAbort();
-                if (!SERCOM8_USART_SerialSetup(&setup, 0)) {
-                    SYS_CONSOLE_PRINT("? RS485_1 setup from flash failed: Baud=%d Data=%d Parity=%d Stop=%d\r\n",
-                                      baud, dataBits, parityEncoded, stopBits);
-                } else {
-                    SYS_CONSOLE_PRINT("RS485_1 setup from flash done: Baud=%d Data=%d Parity=%d Stop=%d\r\n",
-                                      baud, dataBits, parityEncoded, stopBits);
-                    uint8_t dummy;
-                    bool result = SERCOM8_USART_Read(&dummy, 1);
-                    SYS_CONSOLE_PRINT("RS485_1 RX resume: %s\r\n", result ? "OK" : "FAILED");
+                if (!SERCOM8_USART_SerialSetup(&sSetup, 0U))
+                {
+                    SYS_CONSOLE_PRINT("[RS485_1] Setup failed\r\n");
                 }
-            } else if (uartIndex == 1) {
+                else
+                {
+                    uint8_t u8Dummy;
+                    (void)SERCOM8_USART_Read(&u8Dummy, 1U);
+                    SYS_CONSOLE_PRINT("[RS485_1] Setup OK Baud=%lu\r\n", (unsigned long)u32Baud);
+                }
+            }
+            else
+            {
                 SERCOM9_USART_ReadAbort();
-                if (!SERCOM9_USART_SerialSetup(&setup, 0)) {
-                    SYS_CONSOLE_PRINT("? RS485_2 setup from flash failed: Baud=%d Data=%d Parity=%d Stop=%d\r\n",
-                                      baud, dataBits, parityEncoded, stopBits);
-                } else {
-                    SYS_CONSOLE_PRINT("RS485_2 setup from flash done: Baud=%d Data=%d Parity=%d Stop=%d\r\n",
-                                      baud, dataBits, parityEncoded, stopBits);
-                    uint8_t dummy;
-                    bool result = SERCOM9_USART_Read(&dummy, 1);
-                    SYS_CONSOLE_PRINT("RS485_2 RX resume: %s\r\n", result ? "OK" : "FAILED");
+                if (!SERCOM9_USART_SerialSetup(&sSetup, 0U))
+                {
+                    SYS_CONSOLE_PRINT("[RS485_2] Setup failed\r\n");
+                }
+                else
+                {
+                    uint8_t u8Dummy;
+                    (void)SERCOM9_USART_Read(&u8Dummy, 1U);
+                    SYS_CONSOLE_PRINT("[RS485_2] Setup OK Baud=%lu\r\n", (unsigned long)u32Baud);
                 }
             }
         }
-#endif    
-        serialnum = writeData.serialNumber;
-        // Restore relay outputs
-        uint16_t relayStatus = writeData.relayOutputs;
-        for (int i = 0; i < RELAY_COUNT; i++)
-        {
-            if (relayStatus & (1 << i))
-            {
-                switch (i)
-                {
-                    case 0: efuse1_in_Set(); break;
-                    case 1: efuse2_in_Set(); break;
-                    case 2: efuse3_in_Set(); break;
-                    case 3: efuse4_in_Set(); break;
-                    case 4: Relay_Output_1_Set(); break;
-                    case 5: Relay_Output_2_Set(); break;
-                }
-            }
-            else
-            {
-                switch (i)
-                {
-                    case 0: efuse1_in_Clear(); break;
-                    case 1: efuse2_in_Clear(); break;
-                    case 2: efuse3_in_Clear(); break;
-                    case 3: efuse4_in_Clear(); break;                    
-                    case 4: Relay_Output_1_Clear(); break;
-                    case 5: Relay_Output_2_Clear(); break;
-                }
-            }
-        }
-
-        // Restore digital outputs
-        uint32_t doStatus = writeData.digitalOutputs;
-        for (int i = 0; i < DIGITAL_OUTPUT; i++)
-        {
-            if (doStatus & (1 << i))
-            {
-                switch (i)
-                {
-                    case 0: Digital_Output_1_Set(); break;
-                    case 1: Digital_Output_2_Set(); break;
-                    case 2: Digital_Output_3_Set(); break;
-                    case 3: Digital_Output_4_Set(); break;
-                    case 4: Digital_Output_5_Set(); break;
-                    case 5: Digital_Output_6_Set(); break;
-                    case 6: Digital_Output_7_Set(); break;
-                    case 7: Digital_Output_8_Set(); break;
-                    case 8: Digital_Output_9_Set(); break;
-                    case 9: Digital_Output_10_Set(); break;
-                    case 10: Digital_Output_11_Set(); break;
-                    case 11: Digital_Output_12_Set(); break;
-                    case 12: Digital_Output_13_Set(); break;
-                    case 13: Digital_Output_14_Set(); break;
-                    case 14: Digital_Output_15_Set(); break;
-                    case 15: Digital_Output_16_Set(); break;
-                    case 16: Digital_Output_17_Set(); break;
-                    case 17: Digital_Output_18_Set(); break;
-                    case 18: Digital_Output_19_Set(); break;
-                    case 19: Digital_Output_20_Set(); break;
-                    case 20: Digital_Output_21_Set(); break;
-                    case 21: Digital_Output_22_Set(); break;
-                    case 22: Digital_Output_23_Set(); break;
-                    case 23: Digital_Output_24_Set(); break;
-                    
-                }
-            }
-            else
-            {
-                switch (i)
-                {
-                    case 0: Digital_Output_1_Clear(); break;
-                    case 1: Digital_Output_2_Clear(); break;
-                    case 2: Digital_Output_3_Clear(); break;
-                    case 3: Digital_Output_4_Clear(); break;
-                    case 4: Digital_Output_5_Clear(); break;
-                    case 5: Digital_Output_6_Clear(); break;
-                    case 6: Digital_Output_7_Clear(); break;
-                    case 7: Digital_Output_8_Clear(); break;
-                    case 8: Digital_Output_9_Clear(); break;
-                    case 9: Digital_Output_10_Clear(); break;
-                    case 10: Digital_Output_11_Clear(); break;
-                    case 11: Digital_Output_12_Clear(); break;
-                    case 12: Digital_Output_13_Clear(); break;
-                    case 13: Digital_Output_14_Clear(); break;
-                    case 14: Digital_Output_15_Clear(); break;
-                    case 15: Digital_Output_16_Clear(); break;
-                    case 16: Digital_Output_17_Clear(); break;
-                    case 17: Digital_Output_18_Clear(); break;
-                    case 18: Digital_Output_19_Clear(); break;
-                    case 19: Digital_Output_20_Clear(); break;
-                    case 20: Digital_Output_21_Clear(); break;
-                    case 21: Digital_Output_22_Clear(); break;
-                    case 22: Digital_Output_23_Clear(); break;
-                    case 23: Digital_Output_24_Clear(); break;                    
-                }
-            }
-        }
-
-        SYS_CONSOLE_PRINT("Restored Relay and Digital Outputs from Flash\n");
+#endif
+        SYS_CONSOLE_PRINT("[Flash] Outputs restored.\r\n");
     }
     else
     {
-        SYS_CONSOLE_MESSAGE("Flash data invalid or empty. Loading defaults...\r\n");
-
-        memset(&writeData, 0, sizeof(flash_data_t));
+        SYS_CONSOLE_PRINT("[Flash] Invalid/empty — loading defaults.\r\n");
+        (void)memset(&writeData, 0, sizeof(flash_data_t));
         writeData.magic = FLASH_MAGIC;
+
 #if HEV_IO_Aggregator
-        // Default values
-        uint16_t canPorts[6] = {8120, 8121, 8122, 8123, 8124, 8125};
-        uint16_t rs485Ports[2] = {9114, 9115};
-        uint32_t canBaudRates[6] = {500000, 500000, 500000, 500000, 500000, 500000};
-        uint32_t uartBaud[2] = {9600, 9600};
-        uint8_t dataBits[2] = {8, 8};
-        char parity[2] = {'N', 'N'};
-        uint8_t stopBits[2] = {1, 1};
+        static const uint16_t k_DefCanPorts[6]   = {8120U, 8121U, 8122U, 8123U, 8124U, 8125U};
+        static const uint16_t k_DefRs485Ports[2] = {9114U, 9115U};
+        static const uint32_t k_DefCanBaud[6]    = {500000UL, 500000UL, 500000UL,
+                                                     500000UL, 500000UL, 500000UL};
 
-        memcpy(writeData.canPorts, canPorts, sizeof(canPorts));
-        memcpy(writeData.rs485Ports, rs485Ports, sizeof(rs485Ports));
-        memcpy(writeData.canBaudRates, canBaudRates, sizeof(canBaudRates));
+        (void)memcpy(writeData.canPorts,    k_DefCanPorts,   sizeof(k_DefCanPorts));
+        (void)memcpy(writeData.rs485Ports,  k_DefRs485Ports, sizeof(k_DefRs485Ports));
+        (void)memcpy(writeData.canBaudRates, k_DefCanBaud,   sizeof(k_DefCanBaud));
 
-        for (int i = 0; i < 2; i++)
+        for (uint8_t i = 0U; i < 2U; i++)
         {
-            writeData.rs485Config[i].baudRate = uartBaud[i];
-            writeData.rs485Config[i].dataBits = dataBits[i];
-            writeData.rs485Config[i].parity = parity[i];
-            writeData.rs485Config[i].stopBits = stopBits[i];
+            writeData.rs485Config[i].baudRate = 9600UL;
+            writeData.rs485Config[i].dataBits = 8U;
+            writeData.rs485Config[i].parity   = 'N';
+            writeData.rs485Config[i].stopBits = 1U;
         }
 #endif
-        // Save defaults to flash
-        uint8_t writeBuffer[sizeof(flash_data_t)];
-        memcpy(writeBuffer, &writeData, sizeof(flash_data_t));
-        DCACHE_CLEAN_BY_ADDR((uint32_t *)writeBuffer, sizeof(writeBuffer));
+        uint8_t au8WriteBuf[sizeof(flash_data_t)];
+        (void)memcpy(au8WriteBuf, &writeData, sizeof(flash_data_t));
+        DCACHE_CLEAN_BY_ADDR((uint32_t *)au8WriteBuf, sizeof(au8WriteBuf));
 
         FCW_PageErase(FLASH_ADDRESS);
-        while (FCW_IsBusy());
+        u32Timeout = ADC_TIMEOUT_CYCLES;
+        while (FCW_IsBusy() && (u32Timeout > 0U)) { u32Timeout--; }
 
-        FCW_RowWrite((uint32_t *)writeBuffer, FLASH_ADDRESS);
-        while (FCW_IsBusy());
+        FCW_RowWrite((uint32_t *)au8WriteBuf, FLASH_ADDRESS);
+        u32Timeout = ADC_TIMEOUT_CYCLES;
+        while (FCW_IsBusy() && (u32Timeout > 0U)) { u32Timeout--; }
 
-        SYS_CONSOLE_MESSAGE("Default configuration saved to flash.\r\n");
-    }  
-}
-
-
-/*******************************************************************************
- *  \brief     Stores the current relay and digital output states.
- *  \details   Reads the output states, encodes them into bit fields, and saves 
- *             them into flash memory.
- *  \return    None (void function).
- *******************************************************************************/
-void StoreRelay_DigitalOutputsFrame() {
-    relayStatus |= (efuse1_in_Get() << 0); 
-    relayStatus |= (efuse2_in_Get() << 1); 
-    relayStatus |= (efuse3_in_Get() << 2); 
-    relayStatus |= (efuse4_in_Get() << 3);
-    relayStatus |= (Relay_Output_1_Get() << 4);
-    relayStatus |= (Relay_Output_2_Get() << 5);
-     
-    doStatus |= (Digital_Output_1_Get() << 0);
-    doStatus |= (Digital_Output_2_Get() << 1);
-    doStatus |= (Digital_Output_3_Get() << 2);
-    doStatus |= (Digital_Output_4_Get() << 3);
-    doStatus |= (Digital_Output_5_Get() << 4);
-    doStatus |= (Digital_Output_6_Get() << 5);
-    doStatus |= (Digital_Output_7_Get() << 6);
-    doStatus |= (Digital_Output_8_Get() << 7);
-    doStatus |= (Digital_Output_9_Get() << 8);
-    doStatus |= (Digital_Output_10_Get() << 9);
-    doStatus |= (Digital_Output_11_Get() << 10);
-    doStatus |= (Digital_Output_12_Get() << 11);
-    doStatus |= (Digital_Output_13_Get() << 12);
-    doStatus |= (Digital_Output_14_Get() << 13);
-    doStatus |= (Digital_Output_15_Get() << 14);
-    doStatus |= (Digital_Output_16_Get() << 15);
-    doStatus |= (Digital_Output_17_Get() << 16);
-    doStatus |= (Digital_Output_18_Get() << 17);
-    doStatus |= (Digital_Output_19_Get() << 18);
-    doStatus |= (Digital_Output_20_Get() << 19);
-    doStatus |= (Digital_Output_21_Get() << 20);
-    doStatus |= (Digital_Output_22_Get() << 21);
-    doStatus |= (Digital_Output_23_Get() << 22);
-    doStatus |= (Digital_Output_24_Get() << 23);
-    
-    /* Save the extracted output states to flash */
-    saveOutputsToFlash(doStatus, relayStatus,serialnum);
-//    printSavedFlashData();
-    SYS_CONSOLE_PRINT("Saved Relay and Digital Outputs to Flash\n");
-}
-
-// Serial number mapping is now sequential as per new ranges
-// 1-60: Digital inputs
-// 61-84: Digital outputs
-// 85-90: Relay inputs/EFuse
-// 91-110: Analog inputs
-
-uint16_t GetPortFromSerialNumber(uint8_t serialNumber) {
-    // Digital Inputs: 1-60
-    if (serialNumber >= 1U && serialNumber <= 60U) {
-        return serialNumber;
+        SYS_CONSOLE_PRINT("[Flash] Defaults saved.\r\n");
     }
-    // Digital Outputs: 61-84
-    if (serialNumber >= 61U && serialNumber <= 84U) {
-        return serialNumber;
-    }
-    // Relay Inputs: 85-90
-    if (serialNumber >= 85U && serialNumber <= 90U) {
-        return serialNumber;
-    }
-    // Digital Inputs: 91-110
-    if (serialNumber >= 91U && serialNumber <= 110U) {
-        return serialNumber;
-    }
-
-    // If serial number is outside valid range, return invalid port
-    return 0xFFFFU;
 }
 
 /**
- * @brief Reads analog input values from ADC channels and stores them in a queue buffer.
+ * @brief  Snapshot current hardware output states into global bitmaps and save to flash.
  *
- * This function iterates through all available analog input channels, waits for the ADC conversion
- * to complete with a timeout mechanism, and then converts the raw ADC value into a scaled voltage.
- * The resulting value is stored in the currentAIQueueBuffer.
- *
- * MISRA C Compliance:
- * - Ensures explicit type handling to avoid implicit promotions.
- * - Uses explicit comparison instead of boolean negation.
- * - Implements timeout protection to prevent infinite loops.
- * - Ensures safe type conversions with explicit casting.
- *
- * @note ADC_VREF should be defined as a valid floating-point constant.
+ *         BUG FIX: original used |= which meant once-set bits could never be
+ *         cleared. Now assigns fresh bitmaps from hardware reads.
  */
-
-#define SAMPLE_LEN 50   // Number of samples for moving average
-
-typedef struct {
-    uint16_t buffer[SAMPLE_LEN];
-    uint32_t sum;
-    uint8_t index;
-} MovingAverage_t;
-
-MovingAverage_t ma[20];  // One MA per channel
-
-void MovingAverage_Init_All(void)
+static void prv_StoreRelay_DigitalOutputsFrame(void)
 {
-    for (int i = 0; i < 20; i++) {
-        ma[i].sum = 0;
-        ma[i].index = 0;
-        for (int j = 0; j < SAMPLE_LEN; j++) {
-            ma[i].buffer[j] = 0;
-        }
-    }
+    /* Build fresh relay bitmap */
+    relayStatus = 0U;
+    relayStatus |= (uint16_t)((efuse1_in_Get()      != 0U) ? (1U << 0U) : 0U);
+    relayStatus |= (uint16_t)((efuse2_in_Get()      != 0U) ? (1U << 1U) : 0U);
+    relayStatus |= (uint16_t)((efuse3_in_Get()      != 0U) ? (1U << 2U) : 0U);
+    relayStatus |= (uint16_t)((efuse4_in_Get()      != 0U) ? (1U << 3U) : 0U);
+    relayStatus |= (uint16_t)((Relay_Output_1_Get() != 0U) ? (1U << 4U) : 0U);
+    relayStatus |= (uint16_t)((Relay_Output_2_Get() != 0U) ? (1U << 5U) : 0U);
+
+    /* Build fresh digital output bitmap */
+    doStatus = 0U;
+    doStatus |= ((Digital_Output_1_Get()  != 0U) ? (1UL <<  0U) : 0UL);
+    doStatus |= ((Digital_Output_2_Get()  != 0U) ? (1UL <<  1U) : 0UL);
+    doStatus |= ((Digital_Output_3_Get()  != 0U) ? (1UL <<  2U) : 0UL);
+    doStatus |= ((Digital_Output_4_Get()  != 0U) ? (1UL <<  3U) : 0UL);
+    doStatus |= ((Digital_Output_5_Get()  != 0U) ? (1UL <<  4U) : 0UL);
+    doStatus |= ((Digital_Output_6_Get()  != 0U) ? (1UL <<  5U) : 0UL);
+    doStatus |= ((Digital_Output_7_Get()  != 0U) ? (1UL <<  6U) : 0UL);
+    doStatus |= ((Digital_Output_8_Get()  != 0U) ? (1UL <<  7U) : 0UL);
+    doStatus |= ((Digital_Output_9_Get()  != 0U) ? (1UL <<  8U) : 0UL);
+    doStatus |= ((Digital_Output_10_Get() != 0U) ? (1UL <<  9U) : 0UL);
+    doStatus |= ((Digital_Output_11_Get() != 0U) ? (1UL << 10U) : 0UL);
+    doStatus |= ((Digital_Output_12_Get() != 0U) ? (1UL << 11U) : 0UL);
+    doStatus |= ((Digital_Output_13_Get() != 0U) ? (1UL << 12U) : 0UL);
+    doStatus |= ((Digital_Output_14_Get() != 0U) ? (1UL << 13U) : 0UL);
+    doStatus |= ((Digital_Output_15_Get() != 0U) ? (1UL << 14U) : 0UL);
+    doStatus |= ((Digital_Output_16_Get() != 0U) ? (1UL << 15U) : 0UL);
+    doStatus |= ((Digital_Output_17_Get() != 0U) ? (1UL << 16U) : 0UL);
+    doStatus |= ((Digital_Output_18_Get() != 0U) ? (1UL << 17U) : 0UL);
+    doStatus |= ((Digital_Output_19_Get() != 0U) ? (1UL << 18U) : 0UL);
+    doStatus |= ((Digital_Output_20_Get() != 0U) ? (1UL << 19U) : 0UL);
+    doStatus |= ((Digital_Output_21_Get() != 0U) ? (1UL << 20U) : 0UL);
+    doStatus |= ((Digital_Output_22_Get() != 0U) ? (1UL << 21U) : 0UL);
+    doStatus |= ((Digital_Output_23_Get() != 0U) ? (1UL << 22U) : 0UL);
+    doStatus |= ((Digital_Output_24_Get() != 0U) ? (1UL << 23U) : 0UL);
+
+    prv_SaveOutputsToFlash_Raw(doStatus, relayStatus, serialnum);
+    SYS_CONSOLE_PRINT("[Flash] Outputs saved DO=0x%08lX RELAY=0x%04X\r\n",
+                      (unsigned long)doStatus, (unsigned)relayStatus);
 }
 
-uint16_t MovingAverage_Update(uint8_t channel, uint16_t newValue)
-{
-    ma[channel].sum -= ma[channel].buffer[ma[channel].index];  
-    ma[channel].buffer[ma[channel].index] = newValue;          
-    ma[channel].sum += newValue;                               
-    ma[channel].index = (ma[channel].index + 1) % SAMPLE_LEN;  
-
-    return (uint16_t)(ma[channel].sum / SAMPLE_LEN);
-}
-
-static inline float TempCalcPT100(float in_volt)
-{
-    float resistance = (RREF * in_volt) / ((GAIN * VREF_L) - in_volt);
-    float temperature = ((resistance / 100.0F) - 1.0F) / TEMP_COEFF_PT100;
-    return temperature;
-}
-
-static inline float TempCalcNTC(float in_volt)
-{
-    float resistance = REF_RESISTOR * (in_volt / (VREF - in_volt));
-    float lnRes = logf(resistance);
-    float invTemp = COEFF_A + (COEFF_B * lnRes) + (COEFF_C * (lnRes * lnRes * lnRes));
-    float temperature = (1.0F / invTemp) - 273.15F;
-    return temperature;
-}
+/* ============================================================================
+ * ADC / Analog Input Reading
+ * ========================================================================== */
 
 /**
- * @brief Checks for changes in analog input values and sends updates over TCP/IP.
+ * @brief  Read all ADC channels, apply moving average, convert to temperature
+ *         or voltage, store results, and update session DB temperatures.
  *
- * This function compares the current analog input buffer with the previous values.
- * If changes are detected, it batches up to 16 changes in a message and transmits
- * them to an IO socket with CRC validation.
- *
- * MISRA C Compliance:
- * - Ensures explicit type handling to avoid implicit promotions.
- * - Uses explicit comparisons instead of boolean negation.
- * - Avoids magic numbers by using named constants.
- * - Ensures buffer boundaries are respected.
- * - Adds explicit type casting to prevent implicit conversions.
- *
- * @note Requires valid `sIOServerSocket`, `CalculateCRC()`, and `TCPIP_TCP_ArrayPut()`.
+ *         BUG FIX: ADC busy-wait now has a timeout (ADC_TIMEOUT_CYCLES).
+ *         BUG FIX: temperature fixed-point value clamp checks were unnecessary
+ *         because uint16_t already can't exceed 65535 — simplified.
  */
 void ReadAllAnalogInputPins(void)
 {
-    uint16_t adc_avg; /* Local variable for averaged ADC values */
-    char *pWrite = messageAnalog; /* Safe buffer pointer */
-
-    volatile uint32_t all_adc_data[ALL_ANALOG_PINS]; /* Store raw ADC values */
-    static const ADC_CORE_NUM adc_cores[ALL_ANALOG_PINS] = {
+    static const ADC_CORE_NUM k_AdcCores[ALL_ANALOG_PINS] = {
         ADC_CORE_NUM2, ADC_CORE_NUM2, ADC_CORE_NUM0, ADC_CORE_NUM0,
         ADC_CORE_NUM0, ADC_CORE_NUM1, ADC_CORE_NUM0, ADC_CORE_NUM1,
         ADC_CORE_NUM1, ADC_CORE_NUM0, ADC_CORE_NUM1, ADC_CORE_NUM0,
         ADC_CORE_NUM3, ADC_CORE_NUM3, ADC_CORE_NUM2, ADC_CORE_NUM2,
         ADC_CORE_NUM3, ADC_CORE_NUM3, ADC_CORE_NUM3, ADC_CORE_NUM3
     };
-
-    static const ADC_CHANNEL_NUM adc_channels[ALL_ANALOG_PINS] = {
+    static const ADC_CHANNEL_NUM k_AdcChannels[ALL_ANALOG_PINS] = {
         ADC_CH5, ADC_CH4, ADC_CH5, ADC_CH2,
         ADC_CH0, ADC_CH4, ADC_CH7, ADC_CH0,
         ADC_CH5, ADC_CH4, ADC_CH2, ADC_CH1,
@@ -698,1169 +772,1062 @@ void ReadAllAnalogInputPins(void)
         ADC_CH4, ADC_CH5, ADC_CH2, ADC_CH3
     };
 
-    /* ---- Start ADC Conversion ---- */
-    RTC_Timer32Start();             /* MISRA: Explicit call to start RTC timer */
-    ADC_GlobalEdgeConversionStart(); /* Start global ADC conversion */
+    volatile uint32_t au32AdcData[ALL_ANALOG_PINS];
+    const float k_InvAdcMax = 1.0F / 4095.0F;
 
-    while (!ADC_CORE_INT_EOSRDY)
+    RTC_Timer32Start();
+    ADC_GlobalEdgeConversionStart();
+
+    /* BUG FIX: timeout guard on ADC busy-wait */
+    uint32_t u32Timeout = ADC_TIMEOUT_CYCLES;
+    while ((!ADC_CORE_INT_EOSRDY) && (u32Timeout > 0U))
     {
-        /* Busy wait until conversion complete - acceptable in this context */
+        u32Timeout--;
+    }
+    if (u32Timeout == 0U)
+    {
+        SYS_CONSOLE_PRINT("[ADC] Conversion timeout\r\n");
+        return;
     }
 
-    const float inv_adc_max = 1.0F / ADC_MAX_VAL; /* Precompute inverse for efficiency */
-
-    for (uint8_t i = 0U; i < ALL_ANALOG_PINS; i++)
+    for (uint8_t i = 0U; i < (uint8_t)ALL_ANALOG_PINS; i++)
     {
-        /* Get raw ADC data */
-        all_adc_data[i] = ADC_ResultGet(adc_cores[i], adc_channels[i]);
+        au32AdcData[i] = ADC_ResultGet(k_AdcCores[i], k_AdcChannels[i]);
+        uint16_t u16Avg = MovingAverage_Update(i, (uint16_t)au32AdcData[i]);
 
-        /* Apply moving average to smooth signal */
-        adc_avg = MovingAverage_Update(i, (uint16_t)all_adc_data[i]);
+#if PT100_Sensor
+        float fVoltage = (float)u16Avg * k_Vref * k_InvAdcMax;
+#else
+        float fVoltage = (float)u16Avg * ADC_VREF * k_InvAdcMax;
+#endif
 
-        /* Convert ADC to voltage */
-        float adc_voltage = (adc_avg * VREF) * inv_adc_max;
-        int32_t len = 0;
-
-        if (i < 16U)   /* Temperature channels */
+        if (i < (uint8_t)NUM_TEMPERATURE_ANALOG_PINS)
         {
-            float temperature;
-
-        #if defined(PT100_Sensor)
-            temperature = TempCalcPT100(adc_voltage);
-        #elif defined(NTC_Sensor)
-            temperature = TempCalcNTC(adc_voltage);
-        #else
-            temperature = (float)adc_avg; /* Default raw fallback */
-        #endif
-
-            /* Convert temperature to 0.01 �C fixed-point format */
-            uint16_t tempValue = (uint16_t)(temperature * 100.0F);
-            if (tempValue > 65535U) { tempValue = 65535U; } /* Clamp to max */
-            currentTempAIQueueBuffer[i] = tempValue;
+            float fTemp;
+#if defined(PT100_Sensor) && (PT100_Sensor == 1)
+            fTemp = prv_TempCalcPT100(fVoltage);
+#elif defined(NTC_Sensor) && (NTC_Sensor == 1)
+            fTemp = prv_TempCalcNTC(fVoltage);
+#else
+            fTemp = (float)u16Avg;
+#endif
+            /* Store as fixed-point (0.01 °C units) */
+            float fFixed = fTemp * 100.0F;
+            if (fFixed < 0.0F) { fFixed = 0.0F; }
+            currentTempAIQueueBuffer[i] = (uint16_t)fFixed;
         }
-        else /* Non-temperature analog inputs */
+        else
         {
-            /* Scale to 0.01 V units */
-            uint16_t value16 = (uint16_t)(adc_voltage * 100.0F);
-            if (value16 > 65535U) { value16 = 65535U; } /* Clamp */
-            currentAIQueueBuffer[i - 16U] = value16;
+            float fScaled = fVoltage * 100.0F;
+            if (fScaled < 0.0F) { fScaled = 0.0F; }
+            currentAIQueueBuffer[i - (uint8_t)NUM_TEMPERATURE_ANALOG_PINS] = (uint16_t)fScaled;
         }
     }
-    
-    SESSION_SetDockTemperature(DOCK_1, currentTempAIQueueBuffer[0] / 100.0F);
-    SESSION_SetDockTemperature(DOCK_2, currentTempAIQueueBuffer[1] / 100.0F);
-    SESSION_SetDockTemperature(DOCK_3, currentTempAIQueueBuffer[2] / 100.0F);
-    SESSION_SetDockTemperature(COMPARTMENT, currentTempAIQueueBuffer[3] / 100.0F);
+
+    /* Update session DB temperatures — convert back to °C */
+    SESSION_SetDockTemperature((uint8_t)DOCK_1,       (uint8_t)(currentTempAIQueueBuffer[0] / 100U));
+    SESSION_SetDockTemperature((uint8_t)DOCK_2,       (uint8_t)(currentTempAIQueueBuffer[1] / 100U));
+    SESSION_SetDockTemperature((uint8_t)DOCK_3,       (uint8_t)(currentTempAIQueueBuffer[2] / 100U));
+    SESSION_SetDockTemperature((uint8_t)COMPARTMENT,  (uint8_t)(currentTempAIQueueBuffer[3] / 100U));
 }
 
+/* ============================================================================
+ * Digital Input Reading
+ * ========================================================================== */
+
 /**
- * @brief Sets a static IP address for the GMAC network interface.
- *
- * This function disables DHCP and assigns a static IP address and subnet mask
- * to the GMAC interface. It validates the provided IP address format before
- * attempting to configure the network.
- *
- * MISRA C Compliance:
- * - Ensures proper type handling to avoid implicit promotions.
- * - Uses explicit comparisons instead of boolean negation.
- * - Avoids magic numbers by using named constants.
- * - Ensures proper null-checking and input validation.
- *
- * @param[in] ipStr Pointer to the string containing the IP address.
- *
- * @note This function assumes `TCPIP_STACK_NetHandleGet()`, `TCPIP_DHCP_Disable()`,
- * and `TCPIP_STACK_NetAddressSet()` are available in the system.
+ * @brief  Read all 49 direct digital inputs and 11 IO-expander inputs.
+ *         Sets static IP address once on first call.
  */
-static void SetStaticIPAddress(const char* ipStr)
+static void prv_ReadDigitalInputs(void)
 {
-    TCPIP_NET_HANDLE netH;
-    IPV4_ADDR ipAddress;
-    IPV4_ADDR subnetMask;
-    bool status = false;
+    uint8_t u8Exp0 = TCA9539_ReadRegister(INPUT_PORT_REG);
+    uint8_t u8Exp1 = TCA9539_ReadRegister(INPUT_PORT_REG_2);
 
-    /* Validate input pointer */
-    if (ipStr == NULL) 
+    /* Direct digital inputs 1–49 → buffer indices 0–48 */
+    currentDIQueueBuffer[0]  = (Digital_Input_1_Get()  != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[1]  = (Digital_Input_2_Get()  != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[2]  = (Digital_Input_3_Get()  != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[3]  = (Digital_Input_4_Get()  != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[4]  = (Digital_Input_5_Get()  != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[5]  = (Digital_Input_6_Get()  != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[6]  = (Digital_Input_7_Get()  != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[7]  = (Digital_Input_8_Get()  != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[8]  = (Digital_Input_9_Get()  != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[9]  = (Digital_Input_10_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[10] = (Digital_Input_11_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[11] = (Digital_Input_12_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[12] = (Digital_Input_13_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[13] = (Digital_Input_14_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[14] = (Digital_Input_15_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[15] = (Digital_Input_16_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[16] = (Digital_Input_17_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[17] = (Digital_Input_18_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[18] = (Digital_Input_19_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[19] = (Digital_Input_20_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[20] = (Digital_Input_21_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[21] = (Digital_Input_22_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[22] = (Digital_Input_23_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[23] = (Digital_Input_24_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[24] = (Digital_Input_25_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[25] = (Digital_Input_26_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[26] = (Digital_Input_27_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[27] = (Digital_Input_28_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[28] = (Digital_Input_29_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[29] = (Digital_Input_30_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[30] = (Digital_Input_31_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[31] = (Digital_Input_32_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[32] = (Digital_Input_33_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[33] = (Digital_Input_34_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[34] = (Digital_Input_35_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[35] = (Digital_Input_36_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[36] = (Digital_Input_37_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[37] = (Digital_Input_38_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[38] = (Digital_Input_39_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[39] = (Digital_Input_40_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[40] = (Digital_Input_41_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[41] = (Digital_Input_42_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[42] = (Digital_Input_43_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[43] = (Digital_Input_44_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[44] = (Digital_Input_45_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[45] = (Digital_Input_46_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[46] = (Digital_Input_47_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[47] = (Digital_Input_48_Get() != 0U) ? 1U : 0U;
+    currentDIQueueBuffer[48] = (Digital_Input_49_Get() != 0U) ? 1U : 0U;
+
+    /* IO Expander Port 0 → DI 50–57 → buffer[49–56] */
+    for (uint8_t i = 0U; i < 8U; i++)
     {
-        SYS_CONSOLE_PRINT("Error: NULL IP address string\r\n");
+        currentDIQueueBuffer[49U + i] = ((u8Exp0 & (uint8_t)(1U << i)) != 0U) ? 1U : 0U;
+    }
+
+    /* IO Expander Port 1 → DI 58–60 → buffer[57–59] */
+    for (uint8_t i = 0U; i < 3U; i++)
+    {
+        currentDIQueueBuffer[57U + i] = ((u8Exp1 & (uint8_t)(1U << i)) != 0U) ? 1U : 0U;
+    }
+
+    /* Set static IP once on first call */
+    if (!s_boardSelectionDone)
+    {
+        s_boardSelectionDone = true;
+        prv_SetStaticIPAddress("192.168.1.231");
+    }
+}
+
+/* ============================================================================
+ * IP Address Configuration
+ * ========================================================================== */
+
+/**
+ * @brief  Disable DHCP and assign a static IP to the GMAC interface.
+ * @param  pcIpStr  IP address string (e.g. "192.168.1.231")
+ */
+static void prv_SetStaticIPAddress(const char *pcIpStr)
+{
+    if (pcIpStr == NULL)
+    {
+        SYS_CONSOLE_PRINT("[Net] NULL IP string\r\n");
         return;
     }
 
-    /* Get network interface handle for GMAC */
-    netH = TCPIP_STACK_NetHandleGet("GMAC");
-
-    if (netH == 0U) /* MISRA C: Avoid implicit comparison */
+    TCPIP_NET_HANDLE hNet = TCPIP_STACK_NetHandleGet("GMAC");
+    if (hNet == NULL)
     {
-        SYS_CONSOLE_PRINT("Error: Failed to get network handle\r\n");
+        SYS_CONSOLE_PRINT("[Net] Failed to get GMAC handle\r\n");
         return;
     }
 
-    /* Disable DHCP before setting static IP */
-    (void) TCPIP_DHCP_Disable(netH); /* MISRA C: Explicitly ignore return value */
+    (void)TCPIP_DHCP_Disable(hNet);
 
-    /* Convert selected IP string to IPV4_ADDR structure */
-    if (TCPIP_Helper_StringToIPAddress(ipStr, &ipAddress) == false)
+    IPV4_ADDR sIp, sMask;
+    static const char k_SubnetMask[] = "255.255.0.0";
+
+    if (!TCPIP_Helper_StringToIPAddress(pcIpStr, &sIp))
     {
-        SYS_CONSOLE_PRINT("Error: Invalid IP address format\r\n");
+        SYS_CONSOLE_PRINT("[Net] Invalid IP: %s\r\n", pcIpStr);
+        return;
+    }
+    if (!TCPIP_Helper_StringToIPAddress(k_SubnetMask, &sMask))
+    {
+        SYS_CONSOLE_PRINT("[Net] Invalid subnet mask\r\n");
         return;
     }
 
-    /* Define a constant subnet mask */
-    static const char* SUBNET_MASK_STR = "255.255.0.0";
-
-    /* Convert subnet mask string to IPV4_ADDR structure */
-    if (TCPIP_Helper_StringToIPAddress(SUBNET_MASK_STR, &subnetMask) == false)
+    if (TCPIP_STACK_NetAddressSet(hNet, &sIp, &sMask, true))
     {
-        SYS_CONSOLE_PRINT("Error: Invalid subnet mask format\r\n");
-        return;
-    }
-
-    /* Set Static IP Address */
-    status = TCPIP_STACK_NetAddressSet(netH, &ipAddress, &subnetMask, true);
-
-    if (status == true)
-    {
-        SYS_CONSOLE_PRINT("Static IP set successfully: %s\r\n", ipStr);
+        SYS_CONSOLE_PRINT("[Net] Static IP set: %s\r\n", pcIpStr);
     }
     else
     {
-        SYS_CONSOLE_PRINT("Error: Failed to set static IP\r\n");
+        SYS_CONSOLE_PRINT("[Net] Failed to set static IP\r\n");
     }
 }
 
+/* ============================================================================
+ * CRC-16/CCITT
+ * ========================================================================== */
 
 /**
- * @brief Reads digital input values and updates the input buffer.
+ * @brief  Compute CRC-16/CCITT (poly=0x1021, init=0xFFFF).
  *
- * This function reads the status of 40 direct digital inputs and 8 expander inputs.
- * It also sets IP addresses based on board selection conditions.
+ *         BUG FIX: comment in original said "polynomial 0x8005" but code
+ *         uses 0x1021 (CRC-16/CCITT). Comment corrected.
  *
- * MISRA C Compliance:
- * - Ensures proper type handling to avoid implicit promotions.
- * - Uses explicit comparisons instead of boolean negation.
- * - Reduces redundant function calls with a loop-based approach.
- * - Avoids magic numbers by defining named constants.
- * - Ensures proper null-checking and input validation.
+ * @param  pu8Data  Pointer to input bytes (must not be NULL)
+ * @param  u16Len   Number of bytes
+ * @return uint16_t CRC result
  */
-void readDigitalInputs() {
-    uint8_t expanderData0 = TCA9539_ReadRegister(INPUT_PORT_REG);
-    uint8_t expanderData1 = TCA9539_ReadRegister(INPUT_PORT_REG_2);
-    
-    // Set the digital input data (first 40 from direct digital pins, last 8 from expander)
-    currentDIQueueBuffer[0] = (Digital_Input_1_Get()) ? 1 : 0;
-    currentDIQueueBuffer[1] = (Digital_Input_2_Get()) ? 1 : 0;
-    currentDIQueueBuffer[2] = (Digital_Input_3_Get()) ? 1 : 0;
-    currentDIQueueBuffer[3] = (Digital_Input_4_Get()) ? 1 : 0;
-    currentDIQueueBuffer[4] = (Digital_Input_5_Get()) ? 1 : 0;
-    currentDIQueueBuffer[5] = (Digital_Input_6_Get()) ? 1 : 0;
-    currentDIQueueBuffer[6] = (Digital_Input_7_Get()) ? 1 : 0;
-    currentDIQueueBuffer[7] = (Digital_Input_8_Get()) ? 1 : 0;
-    currentDIQueueBuffer[8] = (Digital_Input_9_Get()) ? 1 : 0;
-    currentDIQueueBuffer[9] = (Digital_Input_10_Get()) ? 1 : 0;
-    currentDIQueueBuffer[10] = (Digital_Input_11_Get()) ? 1 : 0;
-    currentDIQueueBuffer[11] = (Digital_Input_12_Get()) ? 1 : 0;
-    currentDIQueueBuffer[12] = (Digital_Input_13_Get()) ? 1 : 0;
-    currentDIQueueBuffer[13] = (Digital_Input_14_Get()) ? 1 : 0;
-    currentDIQueueBuffer[14] = (Digital_Input_15_Get()) ? 1 : 0;
-    currentDIQueueBuffer[15] = (Digital_Input_16_Get()) ? 1 : 0;
-    currentDIQueueBuffer[16] = (Digital_Input_17_Get()) ? 1 : 0;
-    currentDIQueueBuffer[17] = (Digital_Input_18_Get()) ? 1 : 0;
-    currentDIQueueBuffer[18] = (Digital_Input_19_Get()) ? 1 : 0;
-    currentDIQueueBuffer[19] = (Digital_Input_20_Get()) ? 1 : 0;
-    currentDIQueueBuffer[20] = (Digital_Input_21_Get()) ? 1 : 0;
-    currentDIQueueBuffer[21] = (Digital_Input_22_Get()) ? 1 : 0;
-    currentDIQueueBuffer[22] = (Digital_Input_23_Get()) ? 1 : 0;
-    currentDIQueueBuffer[23] = (Digital_Input_24_Get()) ? 1 : 0;
-    currentDIQueueBuffer[24] = (Digital_Input_25_Get()) ? 1 : 0;
-    currentDIQueueBuffer[25] = (Digital_Input_26_Get()) ? 1 : 0;
-    currentDIQueueBuffer[26] = (Digital_Input_27_Get()) ? 1 : 0;
-    currentDIQueueBuffer[27] = (Digital_Input_28_Get()) ? 1 : 0;
-    currentDIQueueBuffer[28] = (Digital_Input_29_Get()) ? 1 : 0;
-    currentDIQueueBuffer[29] = (Digital_Input_30_Get()) ? 1 : 0;
-    currentDIQueueBuffer[30] = (Digital_Input_31_Get()) ? 1 : 0;
-    currentDIQueueBuffer[31] = (Digital_Input_32_Get()) ? 1 : 0;
-    currentDIQueueBuffer[32] = (Digital_Input_33_Get()) ? 1 : 0;
-    currentDIQueueBuffer[33] = (Digital_Input_34_Get()) ? 1 : 0;
-    currentDIQueueBuffer[34] = (Digital_Input_35_Get()) ? 1 : 0;
-    currentDIQueueBuffer[35] = (Digital_Input_36_Get()) ? 1 : 0;
-    currentDIQueueBuffer[36] = (Digital_Input_37_Get()) ? 1 : 0;
-    currentDIQueueBuffer[37] = (Digital_Input_38_Get()) ? 1 : 0;
-    currentDIQueueBuffer[38] = (Digital_Input_39_Get()) ? 1 : 0;
-    currentDIQueueBuffer[39] = (Digital_Input_40_Get()) ? 1 : 0;
-    currentDIQueueBuffer[40] = (Digital_Input_41_Get()) ? 1 : 0;
-    currentDIQueueBuffer[41] = (Digital_Input_42_Get()) ? 1 : 0;
-    currentDIQueueBuffer[42] = (Digital_Input_43_Get()) ? 1 : 0;
-    currentDIQueueBuffer[43] = (Digital_Input_44_Get()) ? 1 : 0;
-    currentDIQueueBuffer[44] = (Digital_Input_45_Get()) ? 1 : 0;
-    currentDIQueueBuffer[45] = (Digital_Input_46_Get()) ? 1 : 0;
-    currentDIQueueBuffer[46] = (Digital_Input_47_Get()) ? 1 : 0;
-    currentDIQueueBuffer[47] = (Digital_Input_48_Get()) ? 1 : 0;
-    currentDIQueueBuffer[48] = (Digital_Input_49_Get()) ? 1 : 0;   
+static uint16_t prv_CalculateCRC16(const uint8_t *pu8Data, uint16_t u16Len)
+{
+    if (pu8Data == NULL) { return 0U; }
 
-    // Set the digital input data from the expander (inputs 50 to 60)
-    /* Read DI 50 to 60 - from IO Expander */
-    /* Port 0 => DI 50 to DI 57 => Buffer index 49 to 56 */
-    for (uint8_t i = 0U; i < 8U; ++i)
+    uint16_t u16CRC = 0xFFFFU;
+    for (uint16_t i = 0U; i < u16Len; i++)
     {
-        currentDIQueueBuffer[49U + i] = ((expanderData0 & (1U << i)) != 0U) ? 1U : 0U;
+        u16CRC ^= ((uint16_t)pu8Data[i] << 8U);
+        for (uint8_t j = 0U; j < 8U; j++)
+        {
+            if ((u16CRC & 0x8000U) != 0U)
+            {
+                u16CRC = (uint16_t)((u16CRC << 1U) ^ 0x1021U);
+            }
+            else
+            {
+                u16CRC <<= 1U;
+            }
+        }
     }
-
-    /* Port 1 => DI 58 to DI 60 => Buffer index 57 to 59 */
-    for (uint8_t i = 0U; i < 3U; ++i)
-    {
-        currentDIQueueBuffer[57U + i] = ((expanderData1 & (1U << i)) != 0U) ? 1U : 0U;
-    }
-
-    if (Board_Selection == false)
-    {
-        Board_Selection = true;
-        /* Set Static IP */
-        SetStaticIPAddress("192.168.1.231");
-    } 
+    return u16CRC;
 }
 
-
-/**
- * @brief Calculates the CRC-16 checksum using the polynomial 0x8005.
- *
- * This function computes a 16-bit **CRC (Cyclic Redundancy Check)** for the given data buffer.
- * It implements a **bitwise** algorithm with a standard **0x8005 polynomial** (CRC-16).
- *
- * ## CRC Calculation Details:
- * - **Initial CRC Value**: `0xFFFF`
- * - **Polynomial Used**: `0x8005`
- * - **Bitwise Processing**: Each byte is XORed into the CRC register and then shifted bit-by-bit.
- *
- * @param data Pointer to the data buffer.
- * @param length Number of bytes in the data buffer.
- * @return Computed 16-bit CRC value.
- */
+/* Keep public name for any existing callers */
 uint16_t CalculateCRC(uint8_t *data, uint16_t length)
 {
-    uint16_t crc = 0xFFFF;
-    uint16_t polynomial = 0x1021;
+    return prv_CalculateCRC16(data, length);
+}
 
-    for(uint16_t i = 0; i < length; i++)
+/* ============================================================================
+ * GPIO Read / Write
+ * ========================================================================== */
+
+/**
+ * @brief  Read a GPIO pin by port number.
+ *
+ * @param  u16PortNo    Port number (1–90)
+ * @param  pu8ErrorCode Output error code (set to k_ErrInvalidPort if OOB)
+ * @return uint8_t      Pin state (0 or 1), or 0 on error
+ */
+static uint8_t prv_GPIO_Read(uint16_t u16PortNo, uint8_t *pu8ErrorCode)
+{
+    if (pu8ErrorCode == NULL) { return 0U; }
+
+    switch (u16PortNo)
     {
-        crc ^= ((uint16_t)data[i] << 8);
+        /* Digital Inputs 1–49 */
+        case  1U: return (uint8_t)(Digital_Input_1_Get()  != 0U);
+        case  2U: return (uint8_t)(Digital_Input_2_Get()  != 0U);
+        case  3U: return (uint8_t)(Digital_Input_3_Get()  != 0U);
+        case  4U: return (uint8_t)(Digital_Input_4_Get()  != 0U);
+        case  5U: return (uint8_t)(Digital_Input_5_Get()  != 0U);
+        case  6U: return (uint8_t)(Digital_Input_6_Get()  != 0U);
+        case  7U: return (uint8_t)(Digital_Input_7_Get()  != 0U);
+        case  8U: return (uint8_t)(Digital_Input_8_Get()  != 0U);
+        case  9U: return (uint8_t)(Digital_Input_9_Get()  != 0U);
+        case 10U: return (uint8_t)(Digital_Input_10_Get() != 0U);
+        case 11U: return (uint8_t)(Digital_Input_11_Get() != 0U);
+        case 12U: return (uint8_t)(Digital_Input_12_Get() != 0U);
+        case 13U: return (uint8_t)(Digital_Input_13_Get() != 0U);
+        case 14U: return (uint8_t)(Digital_Input_14_Get() != 0U);
+        case 15U: return (uint8_t)(Digital_Input_15_Get() != 0U);
+        case 16U: return (uint8_t)(Digital_Input_16_Get() != 0U);
+        case 17U: return (uint8_t)(Digital_Input_17_Get() != 0U);
+        case 18U: return (uint8_t)(Digital_Input_18_Get() != 0U);
+        case 19U: return (uint8_t)(Digital_Input_19_Get() != 0U);
+        case 20U: return (uint8_t)(Digital_Input_20_Get() != 0U);
+        case 21U: return (uint8_t)(Digital_Input_21_Get() != 0U);
+        case 22U: return (uint8_t)(Digital_Input_22_Get() != 0U);
+        case 23U: return (uint8_t)(Digital_Input_23_Get() != 0U);
+        case 24U: return (uint8_t)(Digital_Input_24_Get() != 0U);
+        case 25U: return (uint8_t)(Digital_Input_25_Get() != 0U);
+        case 26U: return (uint8_t)(Digital_Input_26_Get() != 0U);
+        case 27U: return (uint8_t)(Digital_Input_27_Get() != 0U);
+        case 28U: return (uint8_t)(Digital_Input_28_Get() != 0U);
+        case 29U: return (uint8_t)(Digital_Input_29_Get() != 0U);
+        case 30U: return (uint8_t)(Digital_Input_30_Get() != 0U);
+        case 31U: return (uint8_t)(Digital_Input_31_Get() != 0U);
+        case 32U: return (uint8_t)(Digital_Input_32_Get() != 0U);
+        case 33U: return (uint8_t)(Digital_Input_33_Get() != 0U);
+        case 34U: return (uint8_t)(Digital_Input_34_Get() != 0U);
+        case 35U: return (uint8_t)(Digital_Input_35_Get() != 0U);
+        case 36U: return (uint8_t)(Digital_Input_36_Get() != 0U);
+        case 37U: return (uint8_t)(Digital_Input_37_Get() != 0U);
+        case 38U: return (uint8_t)(Digital_Input_38_Get() != 0U);
+        case 39U: return (uint8_t)(Digital_Input_39_Get() != 0U);
+        case 40U: return (uint8_t)(Digital_Input_40_Get() != 0U);
+        case 41U: return (uint8_t)(Digital_Input_41_Get() != 0U);
+        case 42U: return (uint8_t)(Digital_Input_42_Get() != 0U);
+        case 43U: return (uint8_t)(Digital_Input_43_Get() != 0U);
+        case 44U: return (uint8_t)(Digital_Input_44_Get() != 0U);
+        case 45U: return (uint8_t)(Digital_Input_45_Get() != 0U);
+        case 46U: return (uint8_t)(Digital_Input_46_Get() != 0U);
+        case 47U: return (uint8_t)(Digital_Input_47_Get() != 0U);
+        case 48U: return (uint8_t)(Digital_Input_48_Get() != 0U);
+        case 49U: return (uint8_t)(Digital_Input_49_Get() != 0U);
+        /* IO Expander inputs 50–60 */
+        case 50U: return currentDIQueueBuffer[49];
+        case 51U: return currentDIQueueBuffer[50];
+        case 52U: return currentDIQueueBuffer[51];
+        case 53U: return currentDIQueueBuffer[52];
+        case 54U: return currentDIQueueBuffer[53];
+        case 55U: return currentDIQueueBuffer[54];
+        case 56U: return currentDIQueueBuffer[55];
+        case 57U: return currentDIQueueBuffer[56];
+        case 58U: return currentDIQueueBuffer[57];
+        case 59U: return currentDIQueueBuffer[58];
+        case 60U: return currentDIQueueBuffer[59];
+        /* Digital Outputs (read-back) 61–84 */
+        case 61U: return (uint8_t)(Digital_Output_1_Get()  != 0U);
+        case 62U: return (uint8_t)(Digital_Output_2_Get()  != 0U);
+        case 63U: return (uint8_t)(Digital_Output_3_Get()  != 0U);
+        case 64U: return (uint8_t)(Digital_Output_4_Get()  != 0U);
+        case 65U: return (uint8_t)(Digital_Output_5_Get()  != 0U);
+        case 66U: return (uint8_t)(Digital_Output_6_Get()  != 0U);
+        case 67U: return (uint8_t)(Digital_Output_7_Get()  != 0U);
+        case 68U: return (uint8_t)(Digital_Output_8_Get()  != 0U);
+        case 69U: return (uint8_t)(Digital_Output_9_Get()  != 0U);
+        case 70U: return (uint8_t)(Digital_Output_10_Get() != 0U);
+        case 71U: return (uint8_t)(Digital_Output_11_Get() != 0U);
+        case 72U: return (uint8_t)(Digital_Output_12_Get() != 0U);
+        case 73U: return (uint8_t)(Digital_Output_13_Get() != 0U);
+        case 74U: return (uint8_t)(Digital_Output_14_Get() != 0U);
+        case 75U: return (uint8_t)(Digital_Output_15_Get() != 0U);
+        case 76U: return (uint8_t)(Digital_Output_16_Get() != 0U);
+        case 77U: return (uint8_t)(Digital_Output_17_Get() != 0U);
+        case 78U: return (uint8_t)(Digital_Output_18_Get() != 0U);
+        case 79U: return (uint8_t)(Digital_Output_19_Get() != 0U);
+        case 80U: return (uint8_t)(Digital_Output_20_Get() != 0U);
+        case 81U: return (uint8_t)(Digital_Output_21_Get() != 0U);
+        case 82U: return (uint8_t)(Digital_Output_22_Get() != 0U);
+        case 83U: return (uint8_t)(Digital_Output_23_Get() != 0U);
+        case 84U: return (uint8_t)(Digital_Output_24_Get() != 0U);
+        /* eFuse + relay 85–90 */
+        case 85U: return (uint8_t)(efuse1_in_Get()      != 0U);
+        case 86U: return (uint8_t)(efuse2_in_Get()      != 0U);
+        case 87U: return (uint8_t)(efuse3_in_Get()      != 0U);
+        case 88U: return (uint8_t)(efuse4_in_Get()      != 0U);
+        case 89U: return (uint8_t)(Relay_Output_1_Get() != 0U);
+        case 90U: return (uint8_t)(Relay_Output_2_Get() != 0U);
 
-        for(uint8_t j = 0; j < 8; j++)
+        default:
+            *pu8ErrorCode = k_ErrInvalidPort;
+            return 0U;
+    }
+}
+
+/**
+ * @brief  Write a GPIO pin by port number.
+ *
+ * @param  u16PortNo    Port number (61–90)
+ * @param  bVal         true = set, false = clear
+ * @param  pu8ErrorCode Output error code
+ */
+static void prv_GPIO_Write(uint16_t u16PortNo, bool bVal, uint8_t *pu8ErrorCode)
+{
+    if (pu8ErrorCode == NULL) { return; }
+    if ((u16PortNo < 61U) || (u16PortNo > 90U))
+    {
+        *pu8ErrorCode = k_ErrInvalidPort;
+        return;
+    }
+
+    switch (u16PortNo)
+    {
+        case 61U: bVal ? Digital_Output_1_Set()  : Digital_Output_1_Clear();  break;
+        case 62U: bVal ? Digital_Output_2_Set()  : Digital_Output_2_Clear();  break;
+        case 63U: bVal ? Digital_Output_3_Set()  : Digital_Output_3_Clear();  break;
+        case 64U: bVal ? Digital_Output_4_Set()  : Digital_Output_4_Clear();  break;
+        case 65U: bVal ? Digital_Output_5_Set()  : Digital_Output_5_Clear();  break;
+        case 66U: bVal ? Digital_Output_6_Set()  : Digital_Output_6_Clear();  break;
+        case 67U: bVal ? Digital_Output_7_Set()  : Digital_Output_7_Clear();  break;
+        case 68U: bVal ? Digital_Output_8_Set()  : Digital_Output_8_Clear();  break;
+        case 69U: bVal ? Digital_Output_9_Set()  : Digital_Output_9_Clear();  break;
+        case 70U: bVal ? Digital_Output_10_Set() : Digital_Output_10_Clear(); break;
+        case 71U: bVal ? Digital_Output_11_Set() : Digital_Output_11_Clear(); break;
+        case 72U: bVal ? Digital_Output_12_Set() : Digital_Output_12_Clear(); break;
+        case 73U: bVal ? Digital_Output_13_Set() : Digital_Output_13_Clear(); break;
+        case 74U: bVal ? Digital_Output_14_Set() : Digital_Output_14_Clear(); break;
+        case 75U: bVal ? Digital_Output_15_Set() : Digital_Output_15_Clear(); break;
+        case 76U: bVal ? Digital_Output_16_Set() : Digital_Output_16_Clear(); break;
+        case 77U: bVal ? Digital_Output_17_Set() : Digital_Output_17_Clear(); break;
+        case 78U: bVal ? Digital_Output_18_Set() : Digital_Output_18_Clear(); break;
+        case 79U: bVal ? Digital_Output_19_Set() : Digital_Output_19_Clear(); break;
+        case 80U: bVal ? Digital_Output_20_Set() : Digital_Output_20_Clear(); break;
+        case 81U: bVal ? Digital_Output_21_Set() : Digital_Output_21_Clear(); break;
+        case 82U: bVal ? Digital_Output_22_Set() : Digital_Output_22_Clear(); break;
+        case 83U: bVal ? Digital_Output_23_Set() : Digital_Output_23_Clear(); break;
+        case 84U: bVal ? Digital_Output_24_Set() : Digital_Output_24_Clear(); break;
+        case 85U: bVal ? efuse1_in_Set()       : efuse1_in_Clear();       break;
+        case 86U: bVal ? efuse2_in_Set()       : efuse2_in_Clear();       break;
+        case 87U: bVal ? efuse3_in_Set()       : efuse3_in_Clear();       break;
+        case 88U: bVal ? efuse4_in_Set()       : efuse4_in_Clear();       break;
+        case 89U: bVal ? Relay_Output_1_Set()  : Relay_Output_1_Clear();  break;
+        case 90U: bVal ? Relay_Output_2_Set()  : Relay_Output_2_Clear();  break;
+        default:  *pu8ErrorCode = k_ErrInvalidPort; break;
+    }
+}
+
+/* ============================================================================
+ * High-level GPIO Operation API
+ * ========================================================================== */
+
+/**
+ * @brief  Perform a named GPIO operation for the specified dock.
+ *
+ *         BUG FIX: original function had no `return bRet` at the end —
+ *         the function would return an indeterminate value for all cases
+ *         (undefined behaviour). Now all paths return explicitly.
+ *
+ *         BUG FIX: no bounds check on u8DockNo before using it as array index
+ *         into k_GpioConf — added guard for per-dock operations.
+ *
+ * @param  eGPIOType  Operation
+ * @param  u8DockNo   Dock index (used for per-dock operations)
+ * @return bool       Pin state for reads; true for writes; false on error
+ */
+bool bGPIO_Operation(GPIOOperation_e eGPIOType, uint8_t u8DockNo)
+{
+    uint8_t u8Err = k_ErrNone;
+
+    /* Per-dock operations need a valid dock index */
+    bool bPerDockOp = (eGPIOType != DO_COMPARTMENT_FAN_HIGH) &&
+                      (eGPIOType != DO_COMPARTMENT_FAN_LOW)  &&
+                      (eGPIOType != DI_E_STOP_STATUS);
+
+    if (bPerDockOp &&
+        ((u8DockNo < (uint8_t)DOCK_1) || (u8DockNo >= (uint8_t)MAX_DOCKS)))
+    {
+        SYS_CONSOLE_PRINT("[GPIO] Invalid dock %u for op %u\r\n",
+                          (unsigned)u8DockNo, (unsigned)eGPIOType);
+        return false;
+    }
+
+    switch (eGPIOType)
+    {
+        case DO_AC_RELAY_ON:
+            prv_GPIO_Write(k_GpioConf.AC_Relay_Pin[u8DockNo], true, &u8Err);
+            return (u8Err == k_ErrNone);
+
+        case DO_AC_RELAY_OFF:
+            prv_GPIO_Write(k_GpioConf.AC_Relay_Pin[u8DockNo], false, &u8Err);
+            return (u8Err == k_ErrNone);
+
+        case DO_DC_RELAY_ON:
+            prv_GPIO_Write(k_GpioConf.DC_Relay_Pin[u8DockNo], true, &u8Err);
+            return (u8Err == k_ErrNone);
+
+        case DO_DC_RELAY_OFF:
+            prv_GPIO_Write(k_GpioConf.DC_Relay_Pin[u8DockNo], false, &u8Err);
+            return (u8Err == k_ErrNone);
+
+        case DO_SOLENOID_HIGH:
+            /* BUG FIX: was vTaskDelay(100) — needs pdMS_TO_TICKS */
+            prv_GPIO_Write(k_GpioConf.Solenoid_PinHi[u8DockNo], true, &u8Err);
+            vTaskDelay(pdMS_TO_TICKS(SOLENOID_PULSE_MS));
+            prv_GPIO_Write(k_GpioConf.Solenoid_PinHi[u8DockNo], false, &u8Err);
+            return (u8Err == k_ErrNone);
+
+        case DO_SOLENOID_LOW:
+            prv_GPIO_Write(k_GpioConf.Solenoid_PinLo[u8DockNo], true, &u8Err);
+            vTaskDelay(pdMS_TO_TICKS(SOLENOID_PULSE_MS));
+            prv_GPIO_Write(k_GpioConf.Solenoid_PinLo[u8DockNo], false, &u8Err);
+            return (u8Err == k_ErrNone);
+
+        case DO_R_LED_HIGH:
+            prv_GPIO_Write(k_GpioConf.R_LED_Pin[u8DockNo], true, &u8Err);
+            return (u8Err == k_ErrNone);
+
+        case DO_R_LED_LOW:
+            prv_GPIO_Write(k_GpioConf.R_LED_Pin[u8DockNo], false, &u8Err);
+            return (u8Err == k_ErrNone);
+
+        case DO_G_LED_HIGH:
+            prv_GPIO_Write(k_GpioConf.G_LED_Pin[u8DockNo], true, &u8Err);
+            return (u8Err == k_ErrNone);
+
+        case DO_G_LED_LOW:
+            prv_GPIO_Write(k_GpioConf.G_LED_Pin[u8DockNo], false, &u8Err);
+            return (u8Err == k_ErrNone);
+
+        case DO_B_LED_HIGH:
+            prv_GPIO_Write(k_GpioConf.B_LED_Pin[u8DockNo], true, &u8Err);
+            return (u8Err == k_ErrNone);
+
+        case DO_B_LED_LOW:
+            prv_GPIO_Write(k_GpioConf.B_LED_Pin[u8DockNo], false, &u8Err);
+            return (u8Err == k_ErrNone);
+
+        case DO_DOCK_FAN_HIGH:
+            prv_GPIO_Write(k_GpioConf.Dock_Fan_Pin[u8DockNo], true, &u8Err);
+            return (u8Err == k_ErrNone);
+
+        case DO_DOCK_FAN_LOW:
+            prv_GPIO_Write(k_GpioConf.Dock_Fan_Pin[u8DockNo], false, &u8Err);
+            return (u8Err == k_ErrNone);
+
+        case DO_COMPARTMENT_FAN_HIGH:
+            prv_GPIO_Write(k_GpioConf.Compartment_Fan_Pin, true, &u8Err);
+            return (u8Err == k_ErrNone);
+
+        case DO_COMPARTMENT_FAN_LOW:
+            prv_GPIO_Write(k_GpioConf.Compartment_Fan_Pin, false, &u8Err);
+            return (u8Err == k_ErrNone);
+
+        case DI_E_STOP_STATUS:
+            return (prv_GPIO_Read(k_GpioConf.EStop_Pin, &u8Err) != 0U);
+
+        case DI_DOOR_LOCK_STATUS:
+            return (prv_GPIO_Read(k_GpioConf.DoorLock_Pin[u8DockNo], &u8Err) != 0U);
+
+        case DI_SOLENOID_LOCK_STATUS:
+            return (prv_GPIO_Read(k_GpioConf.SolenoidLock_Pin[u8DockNo], &u8Err) != 0U);
+
+        default:
+            SYS_CONSOLE_PRINT("[GPIO] Unknown operation %u\r\n", (unsigned)eGPIOType);
+            return false;
+    }
+}
+
+/* ============================================================================
+ * Analog Input Get
+ * ========================================================================== */
+
+/**
+ * @brief  Return the last averaged ADC value for a given channel.
+ *
+ *         BUG FIX: original used `channel - 1` without guarding against
+ *         channel == 0 → underflow → OOB read at index 0xFF.
+ *         Now uses zero-based channel index directly.
+ *
+ * @param  u8Channel  Channel (1-based as used by TCP command)
+ * @return uint32_t   16-bit temperature value (0.01 °C units) or 0 on OOB
+ */
+static uint32_t prv_AnalogInputGet(uint8_t u8Channel)
+{
+    if ((u8Channel == 0U) ||
+        (u8Channel > (uint8_t)NUM_TEMPERATURE_ANALOG_PINS))
+    {
+        SYS_CONSOLE_PRINT("[ADC] Invalid channel %u\r\n", (unsigned)u8Channel);
+        return 0U;
+    }
+    return (uint32_t)currentTempAIQueueBuffer[u8Channel - 1U];
+}
+
+/* ============================================================================
+ * Charging Control
+ * ========================================================================== */
+
+/**
+ * @brief  Set or clear the authentication command for a dock.
+ *
+ * @param  u8DockNo  Dock index
+ * @param  u8Action  1 = start, 0 = stop
+ * @return uint8_t   1 on success
+ */
+static uint8_t prv_ChargingControl(uint8_t u8DockNo, uint8_t u8Action)
+{
+    static uint8_t au8PrevState[MAX_DOCKS] = {0};
+
+    if (u8DockNo >= (uint8_t)MAX_DOCKS)
+    {
+        SYS_CONSOLE_PRINT("[CHARGING] Invalid dock %u\r\n", (unsigned)u8DockNo);
+        return 0U;
+    }
+
+    if (au8PrevState[u8DockNo] != u8Action)
+    {
+        SYS_CONSOLE_PRINT("[CHARGING] Dock %u %s\r\n",
+                          (unsigned)u8DockNo,
+                          (u8Action != 0U) ? "START" : "STOP");
+        SESSION_SetAuthenticationCommand(u8DockNo, u8Action);
+        au8PrevState[u8DockNo] = u8Action;
+    }
+    return 1U;
+}
+
+/* ============================================================================
+ * TCP Frame Handling
+ * ========================================================================== */
+
+/**
+ * @brief  Build and send a TCP response frame.
+ *
+ *         BUG FIX: no bounds check on u8Len — a large payload could overflow
+ *         s_outbuf[256]. Added guard.
+ *
+ * @param  pu8Payload  Payload bytes
+ * @param  u8Len       Payload length
+ */
+static void prv_SendResponsePayload(const uint8_t *pu8Payload, uint8_t u8Len)
+{
+    if (pu8Payload == NULL)
+    {
+        SYS_CONSOLE_PRINT("[TCP] SendResponse: NULL payload\r\n");
+        return;
+    }
+
+    uint16_t u16TotalSize = (uint16_t)FRAME_HEADER_SIZE +
+                            (uint16_t)u8Len             +
+                            (uint16_t)FRAME_CRC_SIZE;
+
+    if (u16TotalSize > (uint16_t)PKT_BUF_SIZE)
+    {
+        SYS_CONSOLE_PRINT("[TCP] SendResponse: payload too large (%u)\r\n",
+                          (unsigned)u8Len);
+        return;
+    }
+
+    uint16_t u16Idx = 0U;
+
+    /* Unique ID (4 bytes, big-endian) */
+    s_outbuf[u16Idx++] = (uint8_t)((s_reqFrame.uniqueId >> 24U) & 0xFFU);
+    s_outbuf[u16Idx++] = (uint8_t)((s_reqFrame.uniqueId >> 16U) & 0xFFU);
+    s_outbuf[u16Idx++] = (uint8_t)((s_reqFrame.uniqueId >>  8U) & 0xFFU);
+    s_outbuf[u16Idx++] = (uint8_t)( s_reqFrame.uniqueId         & 0xFFU);
+
+    /* Message type = Response (0x0002) */
+    s_outbuf[u16Idx++] = RESPONSE_MSG_TYPE_HI;
+    s_outbuf[u16Idx++] = RESPONSE_MSG_TYPE_LO;
+
+    /* Routing */
+    s_outbuf[u16Idx++] = s_reqFrame.compartmentId;
+    s_outbuf[u16Idx++] = s_reqFrame.dockId;
+    s_outbuf[u16Idx++] = s_reqFrame.commandId;
+
+    /* Payload length */
+    s_outbuf[u16Idx++] = u8Len;
+
+    /* Payload */
+    (void)memcpy(&s_outbuf[u16Idx], pu8Payload, (size_t)u8Len);
+    u16Idx += (uint16_t)u8Len;
+
+    /* CRC */
+    uint16_t u16CRC = prv_CalculateCRC16(s_outbuf, u16Idx);
+    s_outbuf[u16Idx++] = (uint8_t)((u16CRC >> 8U) & 0xFFU);
+    s_outbuf[u16Idx++] = (uint8_t)( u16CRC         & 0xFFU);
+
+    (void)TCPIP_TCP_ArrayPut(s_ioSocket, s_outbuf, u16Idx);
+}
+
+/**
+ * @brief  Build and dispatch an error response frame (legacy path).
+ *
+ *         BUG FIX: directly accessed `Reqframe_St.payload[0/1/2]` without
+ *         checking `payloadLen >= 3` — OOB read on short payloads.
+ *         Now clamps the payload copy.
+ */
+static void prv_PrepareDispatchOutbPacket(void)
+{
+    uint8_t au8Payload[6] = {0U};
+    uint8_t u8Idx = 0U;
+
+    /* Copy up to 3 bytes from request payload safely */
+    uint8_t u8CopyLen = (s_reqFrame.payloadLen >= 3U) ? 3U : s_reqFrame.payloadLen;
+    if ((s_reqFrame.payload != NULL) && (u8CopyLen > 0U))
+    {
+        (void)memcpy(au8Payload, s_reqFrame.payload, (size_t)u8CopyLen);
+    }
+    u8Idx = 3U; /* Reserve first 3 bytes for echoed payload */
+
+    if (s_outbErrorCode != (char)k_ErrNone)
+    {
+        au8Payload[u8Idx++] = (uint8_t)s_outbErrorCode;
+        prv_SendResponsePayload(au8Payload, u8Idx);
+    }
+    else
+    {
+        au8Payload[u8Idx++] = k_ErrNone;
+        /* Echo port value */
+        if (s_inbMsgSubType == (char)k_MsgDigitalWrite)
         {
-            if(crc & 0x8000)
-                crc = ((crc << 1) ^ polynomial) & 0xFFFF;
-            else
-                crc = (crc << 1) & 0xFFFF;
+            au8Payload[u8Idx++] = (s_inbPortVal != 0) ? 1U : 0U;
+        }
+        else
+        {
+            au8Payload[u8Idx++] = (s_outbPortVal != 0) ? 1U : 0U;
+        }
+        prv_SendResponsePayload(au8Payload, u8Idx);
+    }
+}
+
+/**
+ * @brief  Reset all inbound/outbound frame state.
+ *
+ *         BUG FIX: original used two 256-iteration for-loops to zero buffers.
+ *         Replaced with memset.
+ */
+static void prv_ResetFrameState(void)
+{
+    s_inbMsgSubType = 0x00;
+    s_inbPortVal    = -1;
+    s_outbErrorCode = (char)k_ErrNone;
+    s_outbPortVal   = -1;
+
+    (void)memset(&s_reqFrame,  0, sizeof(s_reqFrame));
+    (void)memset(s_outbuf,     0, sizeof(s_outbuf));
+}
+
+/* ============================================================================
+ * Command Handlers
+ * ========================================================================== */
+
+static void prv_HandleGPIOCommand(void)
+{
+    uint8_t  u8MsgType  = s_reqFrame.payload[0];
+    uint16_t u16PortNo  = ((uint16_t)s_reqFrame.payload[1] << 8U) |
+                           (uint16_t)s_reqFrame.payload[2];
+    uint8_t  u8PortVal  = 0U;
+    uint8_t  u8OutVal   = 0U;
+    uint8_t  u8ErrorCode = k_ErrNone;
+
+    /* Payload size validation */
+    if ((u8MsgType == k_MsgDigitalWrite) && (s_reqFrame.payloadLen != 4U))
+    {
+        SYS_CONSOLE_PRINT("[GPIO] Write payload size mismatch\r\n");
+        u8ErrorCode = k_ErrInvalidMsg;
+    }
+    else if ((u8MsgType == k_MsgDigitalRead) && (s_reqFrame.payloadLen != 3U))
+    {
+        SYS_CONSOLE_PRINT("[GPIO] Read payload size mismatch\r\n");
+        u8ErrorCode = k_ErrInvalidMsg;
+    }
+
+    /* Port range check */
+    if ((u16PortNo < 1U) || (u16PortNo > 110U))
+    {
+        SYS_CONSOLE_PRINT("[GPIO] Invalid port %u\r\n", (unsigned)u16PortNo);
+        u8ErrorCode = k_ErrInvalidPort;
+    }
+
+    /* BUG FIX: portVal check only applies to write operations */
+    if (u8MsgType == k_MsgDigitalWrite)
+    {
+        u8PortVal = s_reqFrame.payload[3];
+        if ((u8PortVal != 0U) && (u8PortVal != 1U))
+        {
+            SYS_CONSOLE_PRINT("[GPIO] Invalid value %u\r\n", (unsigned)u8PortVal);
+            u8ErrorCode = k_ErrInvalidValue;
         }
     }
 
-    return crc;
-}
-/**
- * @brief Parses an incoming packet and validates its structure.
- *
- * This function extracts information from an incoming **IO packet**, including:
- * - **Message type**
- * - **Message subtype**
- * - **Number of tuples**
- * - **Port number and value**
- * - **CRC validation**
- *
- * It performs **error handling** for:
- * - Invalid buffer
- * - Invalid message type/subtype
- * - Incorrect tuple count
- * - Invalid port numbers or values
- * - Packet size mismatches
- *
- * @param u8IOBuffer Pointer to the received packet buffer.
- * @param inbPacketSz Size of the incoming packet.
- */
-void ParseAndProcessInbPacket(uint8_t *buf, uint16_t len)
-{
-    if(buf == NULL)
+    if (u8ErrorCode == k_ErrNone)
     {
-        SYS_CONSOLE_PRINT("[TCP] ERROR: NULL buffer\r\n");
-        return;
+        if (u8MsgType == k_MsgDigitalRead)
+        {
+            u8OutVal = prv_GPIO_Read(u16PortNo, &u8ErrorCode);
+        }
+        else
+        {
+            prv_GPIO_Write(u16PortNo, (bool)(u8PortVal != 0U), &u8ErrorCode);
+        }
+        prv_StoreRelay_DigitalOutputsFrame();
     }
 
-    SYS_CONSOLE_PRINT("\r\n[TCP] RX Frame (%u bytes): ", len);
-    for(uint16_t i=0;i<len;i++)
-        SYS_CONSOLE_PRINT("%02X ",buf[i]);
-    SYS_CONSOLE_PRINT("\r\n");
+    uint8_t au8Resp[5];
+    au8Resp[0] = u8MsgType;
+    au8Resp[1] = (uint8_t)((u16PortNo >> 8U) & 0xFFU);
+    au8Resp[2] = (uint8_t)( u16PortNo         & 0xFFU);
+    au8Resp[3] = u8ErrorCode;
+    au8Resp[4] = (u8MsgType == k_MsgDigitalWrite) ? u8PortVal : u8OutVal;
 
-    /* Minimum frame validation */
-    if(len < TCP_MIN_FRAME_SIZE)
-    {
-        SYS_CONSOLE_PRINT("[TCP] ERROR: Frame too short\r\n");
-        return;
-    }
-
-    /* Parse header */
-    Reqframe_St.uniqueId =
-            ((uint32_t)buf[0] << 24) |
-            ((uint32_t)buf[1] << 16) |
-            ((uint32_t)buf[2] << 8) |
-            buf[3];
-
-    Reqframe_St.msgType = ((uint16_t)buf[4] << 8) | buf[5];
-    Reqframe_St.compartmentId = buf[6];
-    Reqframe_St.dockId = buf[7];
-    Reqframe_St.commandId = buf[8];
-    Reqframe_St.payloadLen = buf[9];
-
-    Reqframe_St.payload = &buf[10];
-
-    uint16_t expectedLen = 10 + Reqframe_St.payloadLen + 2;
-
-    if(len != expectedLen)
-    {
-        SYS_CONSOLE_PRINT("[TCP] ERROR: Length mismatch\r\n");
-        return;
-    }
-
-    /* CRC validation */
-    uint16_t rxCrc = ((uint16_t)buf[len-2] << 8) | buf[len-1];
-    uint16_t calcCrc = CalculateCRC(buf, len-2);
-
-    if(rxCrc != calcCrc)
-    {
-        SYS_CONSOLE_PRINT("[TCP] ERROR: CRC mismatch\r\n");
-        return;
-    }
-
-    SYS_CONSOLE_PRINT("[TCP] Frame Valid\r\n");
-
-    /* Message type validation */
-
-    if(Reqframe_St.msgType != MSG_TYPE_REQUEST)
-    {
-        SYS_CONSOLE_PRINT("[TCP] ERROR: Not a request frame\r\n");
-        return;
-    }
-
-    /* Command dispatcher */
-
-    switch(Reqframe_St.commandId)
-    {
-        case CMD_GPIO_OPERATION:
-            HandleGPIOCommand();
-            break;
-
-        case CMD_ANALOG_READ:
-            HandleAnalogRead();
-            break;
-
-        case CMD_CHARGING_COMMAND:
-            uint8_t u8DockNo = Reqframe_St.dockId;
-            HandleChargingCommand(u8DockNo);
-            break;
-
-        case CMD_BOOT_MODE_COMMAND:
-            HandleBootloaderCommand();
-            return;
-
-        case CMD_SOFT_RESET_COMMAND:
-            // HandleSoftResetCommand();
-            return;
-
-        default:
-            SYS_CONSOLE_PRINT("[TCP] ERROR: Unknown Command\r\n");
-            outbErrorCode = errorInvalidMsg;
-            PrepareDispatchOutbPacket();
-            break;
-    }
-
-    ResetInbOutbData();
+    prv_SendResponsePayload(au8Resp, 5U);
 }
 
-void HandleGPIOCommand(void)
+static void prv_HandleAnalogRead(void)
 {
-    uint8_t payload[5];
-
-    uint8_t msgType;
-    uint16_t portNo;
-    uint8_t portVal = 0;
-    uint8_t outVal = 0;
-    uint8_t errorCode = errorNoError;
-
-    msgType = Reqframe_St.payload[0];
-
-    if ((msgType == msgSubTypeDigitalWrite && Reqframe_St.payloadLen != 4) ||
-        (msgType == msgSubTypeDigitalRead && Reqframe_St.payloadLen != 3))
+    if (s_reqFrame.payloadLen < 1U)
     {
-        SYS_CONSOLE_PRINT("[GPIO] ERROR: Payload size mismatch\r\n");
-        errorCode = errorInvalidMsg;
-    }
-
-    portNo = ((uint16_t)Reqframe_St.payload[1] << 8) | Reqframe_St.payload[2];
-
-    if (msgType == msgSubTypeDigitalWrite)
-    {
-        portVal = Reqframe_St.payload[3];
-    }
-
-    if (portNo < 1 || portNo > 110)
-    {
-        SYS_CONSOLE_PRINT("[GPIO] ERROR: Invalid Port\r\n");
-        errorCode = errorInvalidPort;
-    }
-
-    if ((portVal != 0) && (portVal != 1))
-    {
-        SYS_CONSOLE_PRINT("[GPIO] ERROR: Invalid Value\r\n");
-        errorCode = errorInvalidValue;
-    }
-
-    if (errorCode == errorNoError)
-    {
-        ProcessInbPacket(msgType, portNo, portVal, &outVal, &errorCode);
-        StoreRelay_DigitalOutputsFrame();
-    }
-
-    // Build response
-    payload[0] = msgType;
-    payload[1] = (portNo >> 8) & 0xFF;
-    payload[2] = portNo & 0xFF;
-    payload[3] = errorCode;
-    payload[4] = (msgType == msgSubTypeDigitalWrite) ? portVal : outVal;
-
-    SendResponsePayload(payload, 5);
-}
-
-void HandleAnalogRead(void)
-{
-    if(Reqframe_St.payloadLen < 1)
-    {
-        outbErrorCode = errorInvalidMsg;
-        PrepareDispatchOutbPacket();
+        s_outbErrorCode = (char)k_ErrInvalidMsg;
+        prv_PrepareDispatchOutbPacket();
         return;
     }
 
-    uint8_t channel = Reqframe_St.payload[0];
+    uint8_t  u8Channel = s_reqFrame.payload[0];
+    uint32_t u32Value  = prv_AnalogInputGet(u8Channel);
 
-    SYS_CONSOLE_PRINT("[ANALOG] Read Channel %d\r\n",channel);
+    SYS_CONSOLE_PRINT("[ANALOG] Ch%u = %lu\r\n", (unsigned)u8Channel, (unsigned long)u32Value);
 
-    uint32_t adcValue = Analog_Input_Get(channel);
+    uint8_t au8Resp[5];
+    au8Resp[0] = u8Channel;
+    au8Resp[1] = (uint8_t)((u32Value >> 24U) & 0xFFU);
+    au8Resp[2] = (uint8_t)((u32Value >> 16U) & 0xFFU);
+    au8Resp[3] = (uint8_t)((u32Value >>  8U) & 0xFFU);
+    au8Resp[4] = (uint8_t)( u32Value          & 0xFFU);
 
-    uint8_t payload[5] = {0};
-
-    payload[0] = channel;
-
-    payload[1] = (adcValue >> 24) & 0xFF;
-    payload[2] = (adcValue >> 16) & 0xFF;
-    payload[3] = (adcValue >> 8) & 0xFF;
-    payload[4] = adcValue & 0xFF;
-
-    SendResponsePayload(payload,5);
+    prv_SendResponsePayload(au8Resp, 5U);
 }
 
-void HandleChargingCommand(uint8_t u8DockNo)
+static void prv_HandleChargingCommand(uint8_t u8DockNo)
 {
-    if(Reqframe_St.payloadLen < 1)
+    if (s_reqFrame.payloadLen < 1U)
     {
-        outbErrorCode = errorInvalidMsg;
-        PrepareDispatchOutbPacket();
+        s_outbErrorCode = (char)k_ErrInvalidMsg;
+        prv_PrepareDispatchOutbPacket();
         return;
     }
 
-    uint8_t action = Reqframe_St.payload[0];
+    uint8_t u8Action  = s_reqFrame.payload[0];
+    uint8_t u8Status  = prv_ChargingControl(u8DockNo, u8Action);
 
-    SYS_CONSOLE_PRINT("[CHARGING] Action: %s\r\n",
-                      action ? "START" : "STOP");
-    uint8_t u8ChargingControlStatus = u8ChargingControl(u8DockNo,action);
-    uint8_t status = 01; // Assume success for now
+    SYS_CONSOLE_PRINT("[CHARGING] Dock%u %s\r\n",
+                      (unsigned)u8DockNo,
+                      (u8Action != 0U) ? "START" : "STOP");
 
-    uint8_t payload[1];
-    payload[0] = u8ChargingControlStatus;
-
-    SendResponsePayload(payload,1);
+    prv_SendResponsePayload(&u8Status, 1U);
 }
 
-void HandleBootloaderCommand(void)
+static void prv_HandleBootloaderCommand(void)
 {
-    SYS_CONSOLE_PRINT("[SYSTEM] Bootloader Trigger\r\n");
+    SYS_CONSOLE_PRINT("[SYS] Bootloader trigger\r\n");
 
     ramStart[0] = BTL_TRIGGER_PATTERN;
     ramStart[1] = BTL_TRIGGER_PATTERN;
     ramStart[2] = BTL_TRIGGER_PATTERN;
     ramStart[3] = BTL_TRIGGER_PATTERN;
 
-    DCACHE_CLEAN_BY_ADDR(ramStart, 16);
-
+    DCACHE_CLEAN_BY_ADDR(ramStart, 16U);
     SYS_RESET_SoftwareReset();
 }
 
-void SendResponsePayload(uint8_t *payload, uint8_t len)
+/**
+ * @brief  Parse and dispatch a received TCP frame.
+ *
+ *         BUG FIX: `uint8_t u8DockNo = ...` declared inside a `case` without
+ *         braces — C99 violation. Moved to compound statement.
+ *
+ * @param  pu8Buf  Receive buffer
+ * @param  u16Len  Number of bytes received
+ */
+static void prv_ParseAndProcessInbPacket(uint8_t *pu8Buf, uint16_t u16Len)
 {
-    uint16_t index = 0;
+    if (pu8Buf == NULL)
+    {
+        SYS_CONSOLE_PRINT("[TCP] NULL buffer\r\n");
+        return;
+    }
 
-    outbPacketBuf[index++] = (Reqframe_St.uniqueId >> 24);
-    outbPacketBuf[index++] = (Reqframe_St.uniqueId >> 16);
-    outbPacketBuf[index++] = (Reqframe_St.uniqueId >> 8);
-    outbPacketBuf[index++] = Reqframe_St.uniqueId;
+    if (u16Len < (uint16_t)TCP_MIN_FRAME_SIZE)
+    {
+        SYS_CONSOLE_PRINT("[TCP] Frame too short (%u)\r\n", (unsigned)u16Len);
+        return;
+    }
 
-    outbPacketBuf[index++] = 0x00;
-    outbPacketBuf[index++] = 0x02;
+    /* Parse fixed header */
+    s_reqFrame.uniqueId      = ((uint32_t)pu8Buf[0] << 24U) |
+                               ((uint32_t)pu8Buf[1] << 16U) |
+                               ((uint32_t)pu8Buf[2] <<  8U) |
+                                (uint32_t)pu8Buf[3];
+    s_reqFrame.msgType       = ((uint16_t)pu8Buf[4] << 8U) | (uint16_t)pu8Buf[5];
+    s_reqFrame.compartmentId = pu8Buf[6];
+    s_reqFrame.dockId        = pu8Buf[7];
+    s_reqFrame.commandId     = pu8Buf[8];
+    s_reqFrame.payloadLen    = pu8Buf[9];
+    s_reqFrame.payload       = &pu8Buf[10];   /* Non-owning pointer into caller's buffer */
 
-    outbPacketBuf[index++] = Reqframe_St.compartmentId;
-    outbPacketBuf[index++] = Reqframe_St.dockId;
-    outbPacketBuf[index++] = Reqframe_St.commandId;
+    /* Validate total length */
+    uint16_t u16Expected = (uint16_t)FRAME_HEADER_SIZE +
+                           (uint16_t)s_reqFrame.payloadLen +
+                           (uint16_t)FRAME_CRC_SIZE;
 
-    outbPacketBuf[index++] = len;
+    if (u16Len != u16Expected)
+    {
+        SYS_CONSOLE_PRINT("[TCP] Length mismatch got=%u expected=%u\r\n",
+                          (unsigned)u16Len, (unsigned)u16Expected);
+        return;
+    }
 
-    memcpy(&outbPacketBuf[index], payload, len);
-    index += len;
+    /* CRC validation */
+    uint16_t u16RxCRC   = ((uint16_t)pu8Buf[u16Len - 2U] << 8U) |
+                           (uint16_t)pu8Buf[u16Len - 1U];
+    uint16_t u16CalcCRC = prv_CalculateCRC16(pu8Buf, u16Len - 2U);
 
-    uint16_t crc = CalculateCRC(outbPacketBuf,index);
+    if (u16RxCRC != u16CalcCRC)
+    {
+        SYS_CONSOLE_PRINT("[TCP] CRC mismatch rx=0x%04X calc=0x%04X\r\n",
+                          (unsigned)u16RxCRC, (unsigned)u16CalcCRC);
+        return;
+    }
 
-    outbPacketBuf[index++] = (crc >> 8);
-    outbPacketBuf[index++] = crc;
+    if (s_reqFrame.msgType != (uint16_t)MSG_TYPE_REQUEST)
+    {
+        SYS_CONSOLE_PRINT("[TCP] Not a request frame (type=0x%04X)\r\n",
+                          (unsigned)s_reqFrame.msgType);
+        return;
+    }
 
-    TCPIP_TCP_ArrayPut(sIOServerSocket,outbPacketBuf,index);
+    SYS_CONSOLE_PRINT("[TCP] Frame OK cmd=0x%02X dock=%u\r\n",
+                      (unsigned)s_reqFrame.commandId,
+                      (unsigned)s_reqFrame.dockId);
+
+    /* BUG FIX: declare u8DockNo outside switch to avoid C99 cross-jump issue */
+    uint8_t u8DockNo = s_reqFrame.dockId;
+
+    switch (s_reqFrame.commandId)
+    {
+        case CMD_GPIO_OPERATION:
+            prv_HandleGPIOCommand();
+            break;
+
+        case CMD_ANALOG_READ:
+            prv_HandleAnalogRead();
+            break;
+
+        case CMD_CHARGING_COMMAND:
+            prv_HandleChargingCommand(u8DockNo);
+            break;
+
+        case CMD_BOOT_MODE_COMMAND:
+            prv_HandleBootloaderCommand();
+            return; /* Reset — don't reach ResetFrameState */
+
+        case CMD_SOFT_RESET_COMMAND:
+            SYS_CONSOLE_PRINT("[SYS] Soft reset\r\n");
+            SYS_RESET_SoftwareReset();
+            return;
+
+        default:
+            SYS_CONSOLE_PRINT("[TCP] Unknown command 0x%02X\r\n",
+                              (unsigned)s_reqFrame.commandId);
+            s_outbErrorCode = (char)k_ErrInvalidMsg;
+            prv_PrepareDispatchOutbPacket();
+            break;
+    }
+
+    prv_ResetFrameState();
 }
 
-/**
- * @brief Prepares and dispatches an outbound packet over TCP.
- *
- * This function constructs an outbound packet (`outbPacketBuf`) with 
- * appropriate fields such as error code, message subtype, port number, 
- * and port value. The packet is then transmitted over a TCP socket.
- *
- * Steps:
- * 1. Populate `outbPacketBuf` with relevant data.
- * 2. Compute `outbPacketSz` based on the number of tuples.
- * 3. Print the packet contents for debugging.
- * 4. Send the packet using `TCPIP_TCP_ArrayPut`.
- *
- * @note Ensure `outbPacketBuf` has enough allocated memory to avoid overflow.
- */
+/* ============================================================================
+ * IO Expander Stubs (implemented elsewhere — stubs for reference)
+ * ========================================================================== */
 
-void PrepareDispatchOutbPacket()
+static void prv_vConfigureIOexpanders(void)
 {
-    uint16_t index = 0;
-
-    /* Unique ID (same as request) */
-    outbPacketBuf[index++] = (Reqframe_St.uniqueId >> 24) & 0xFF;
-    outbPacketBuf[index++] = (Reqframe_St.uniqueId >> 16) & 0xFF;
-    outbPacketBuf[index++] = (Reqframe_St.uniqueId >> 8) & 0xFF;
-    outbPacketBuf[index++] = Reqframe_St.uniqueId & 0xFF;
-
-    /* Message Type = Response (0x0002) */
-    outbPacketBuf[index++] = 0x00;
-    outbPacketBuf[index++] = 0x02;
-
-    /* Compartment ID */
-    outbPacketBuf[index++] = Reqframe_St.compartmentId;
-
-    /* Dock ID */
-    outbPacketBuf[index++] = Reqframe_St.dockId;
-
-    /* Command ID */
-    outbPacketBuf[index++] = Reqframe_St.commandId;
-
-    if (outbErrorCode != errorNoError) {
-        /* Payload Length */
-        outbPacketBuf[index++] = Reqframe_St.payloadLen;
-        outbPacketBuf[index++] = Reqframe_St.payload[0];
-        outbPacketBuf[index++] = Reqframe_St.payload[1];
-        outbPacketBuf[index++] = Reqframe_St.payload[2];
-        outbPacketBuf[index++] = outbErrorCode; // Add error code in payload for error response
-    } else {
-        /* Payload Length */
-        outbPacketBuf[index++] = Reqframe_St.payloadLen + 1; // If success then add 1 byte for port value;
-        outbPacketBuf[index++] = Reqframe_St.payload[0];
-        outbPacketBuf[index++] = Reqframe_St.payload[1];
-        outbPacketBuf[index++] = Reqframe_St.payload[2];
-        outbPacketBuf[index++] = errorNoError; // Add error code in payload for error response
-        if (inbMsgSubType == msgSubTypeDigitalWrite) {
-            outbPacketBuf[index++] = (inbPortVal != 0) ? 0x01 : 0x00;
-        } else {
-            outbPacketBuf[index++] = (outbPortVal != 0) ? 0x01 : 0x00;
-        }
-    }
-    /* Calculate CRC */
-    uint16_t crc = CalculateCRC(outbPacketBuf, index);
-
-    outbPacketBuf[index++] = (crc >> 8) & 0xFF;
-    outbPacketBuf[index++] = crc & 0xFF;
-
-    outbPacketSz = index;
-
-    /* Debug print */
-    SYS_CONSOLE_PRINT("[TCP] Response Frame: ");
-    for(uint16_t i = 0; i < outbPacketSz; i++)
-    {
-        SYS_CONSOLE_PRINT("%02X ", outbPacketBuf[i]);
-    }
-    SYS_CONSOLE_PRINT("\r\n");
-
-    /* Send TCP */
-    TCPIP_TCP_ArrayPut(sIOServerSocket, (const uint8_t*)outbPacketBuf, outbPacketSz);
+    /* Delegate to platform-specific expander init */
+    (void)IOExpander1_Configure_Ports();
 }
+
+/* ============================================================================
+ * Main IO Handler Task
+ * ========================================================================== */
+
 /**
- * @brief   Resets inbound and outbound data structures.
- * 
- * This function clears and resets various inbound (`inb*`) and outbound (`outb*`) 
- * data variables to their default states. It ensures that:
- * - Message subtype, port numbers, and values are set to zero or -1 as needed.
- * - The packet buffers (`inbPacketBuf` and `outbPacketBuf`) are fully cleared (set to 0x00).
- * - Packet sizes are reset to zero.
- * - The error code for outbound messages is reset to `errorNoError`.
- * 
- * This function is typically used before processing new messages to ensure
- * no residual data from previous transmissions affects the new operation.
+ * @brief  FreeRTOS task: IO server.
+ *
+ *         BUG FIX: `vTaskDelay(RECONNECT_DELAY_MS)` — RECONNECT_DELAY_MS is
+ *         in milliseconds but vTaskDelay takes ticks. Wrapped in pdMS_TO_TICKS.
+ *         BUG FIX: `vTaskDelay(10)` — raw ticks, replaced with
+ *         `pdMS_TO_TICKS(IO_TASK_LOOP_DELAY_MS)`.
  */
-void ResetInbOutbData()
+static void prv_IOHandlerServerTask(void *pvParameters)
 {
-    inbMsgSubType = 0x00;
-    inbNumTuples = 0; // Allow only max of 1 for now
-    inbPortNo = -1;
-    inbPortVal = -1;
-    inbCrc = -1;
-    
-    for (int i = 0; i < 256; i++)
+    (void)pvParameters;
+
+    prv_MovingAverage_Init_All();
+    prv_vConfigureIOexpanders();
+
+    SYS_CONSOLE_PRINT("[IO] Reading flash config\r\n");
+    prv_ReadOutputsFromFlash();
+
+    s_ioSocket = TCPIP_TCP_ServerOpen(IP_ADDRESS_TYPE_IPV4, IO_SERVER_PORT_HEV, 0U);
+    if (s_ioSocket == INVALID_SOCKET)
     {
-        inbPacketBuf[i] = 0x00;
-    }
-    inbPacketSz = 0;
-
-    // Outgoing Command
-    outbRemotePort = 0;
-    outbErrorCode = errorNoError;
-    outbMsgSubType = 0x00;
-    outbNumTuples = 0; // Allow only max of 1 for now
-    outbPortNo = -1;
-    outbPortVal = -1;
-    outbCrc = -1;
-
-    Reqframe_St.uniqueId = 0;
-    Reqframe_St.msgType = 0;
-    Reqframe_St.compartmentId = 0;
-    Reqframe_St.dockId = 0;
-    Reqframe_St.commandId = 0;
-    Reqframe_St.payloadLen = 0;
-    Reqframe_St.payload = NULL;
-
-    for (int i = 0; i < 256; i++)
-    {
-        outbPacketBuf[i] = 0x00;
-    }
-    
-    outbPacketSz = 0;
-}
-/**
- * @brief   IO Handler Server Task.
- * 
- * This FreeRTOS task is responsible for:
- * - Configuring IO expanders.
- * - Initializing and managing server communication (TCP for HEV, UDP for Two-Wheeler).
- * - Reading stored output states from Flash.
- * - Handling digital and analog input readings.
- * - Processing incoming commands and responding accordingly.
- * - Ensuring reconnection if the TCP/UDP server socket is disconnected.
- * 
- * The task continuously runs in a loop, performing these operations periodically.
- * 
- * @param pvParameters Unused task parameter.
- */
-
-void vIOHandlerServerTask(void *pvParameters)
-{
-    // Configure IO expanders
-    vConfigureIOexpanders();
-
-    // Read stored output states from Flash memory
-    SYS_CONSOLE_PRINT("Reading stored output states from Flash\r\n");
-    readOutputsFromFlash();
-
-    // Print function entry for debugging
-    SYS_CONSOLE_PRINT("In Function: %s\r\n", __FUNCTION__);
-
-    // Open server socket based on the aggregator type
-    sIOServerSocket = TCPIP_TCP_ServerOpen(IP_ADDRESS_TYPE_IPV4, IO_SERVER_PORT_HEV, 0);
-
-    if (sIOServerSocket == INVALID_SOCKET)
-    {
-        SYS_CONSOLE_PRINT("Error opening IO server socket\r\n");
+        SYS_CONSOLE_PRINT("[IO] Failed to open TCP socket — task exiting\r\n");
         vTaskDelete(NULL);
         return;
     }
+
+    SYS_CONSOLE_PRINT("[IO] Task started on port %u\r\n", IO_SERVER_PORT_HEV);
+
     while (true)
     {
-        // Read digital and analog inputs
-        readDigitalInputs();
+        prv_ReadDigitalInputs();
         ReadAllAnalogInputPins();
-        uint8_t u8IOBuffer[256] = {0};
-        if (TCPIP_TCP_IsConnected(sIOServerSocket))
-        {
-            int16_t bytesRead = TCPIP_TCP_ArrayGet(sIOServerSocket, u8IOBuffer, sizeof(u8IOBuffer));
 
-            if (bytesRead > 0)
+        if (TCPIP_TCP_IsConnected(s_ioSocket))
+        {
+            uint8_t au8IOBuffer[256] = {0U};
+            int16_t i16BytesRead = TCPIP_TCP_ArrayGet(s_ioSocket,
+                                                      au8IOBuffer,
+                                                      sizeof(au8IOBuffer));
+            if (i16BytesRead > 0)
             {
-                SYS_CONSOLE_PRINT("Got Data on IO Server Handler (TCP)\r\n");
-                // Read and process incoming commands if any
-                ParseAndProcessInbPacket(u8IOBuffer, bytesRead);
+                SYS_CONSOLE_PRINT("[IO] Received %d bytes\r\n", (int)i16BytesRead);
+                prv_ParseAndProcessInbPacket(au8IOBuffer, (uint16_t)i16BytesRead);
             }
 
-            if (!TCPIP_TCP_IsConnected(sIOServerSocket) || TCPIP_TCP_WasDisconnected(sIOServerSocket))
+            /* Check for disconnection */
+            if ((!TCPIP_TCP_IsConnected(s_ioSocket)) ||
+                TCPIP_TCP_WasDisconnected(s_ioSocket))
             {
-                SYS_CONSOLE_PRINT("\r\nTCP Connection Closed\r\n");
-                TCPIP_TCP_Close(sIOServerSocket);
-                sIOServerSocket = INVALID_SOCKET;
+                SYS_CONSOLE_PRINT("[IO] Client disconnected\r\n");
+                TCPIP_TCP_Close(s_ioSocket);
+                s_ioSocket = INVALID_SOCKET;
             }
         }
-        // Ensure reconnection logic is handled correctly
-        if (sIOServerSocket == INVALID_SOCKET)
+
+        /* Reconnect if socket was lost */
+        if (s_ioSocket == INVALID_SOCKET)
         {
-            SYS_CONSOLE_PRINT("TCP server socket disconnected, attempting to reconnect...\r\n");
-
-            // Attempt to open the socket again
-            sIOServerSocket = TCPIP_TCP_ServerOpen(IP_ADDRESS_TYPE_IPV4, IO_SERVER_PORT_HEV, 0);
-
-            if (sIOServerSocket == INVALID_SOCKET)
+            SYS_CONSOLE_PRINT("[IO] Attempting socket reconnect...\r\n");
+            s_ioSocket = TCPIP_TCP_ServerOpen(IP_ADDRESS_TYPE_IPV4,
+                                               IO_SERVER_PORT_HEV, 0U);
+            if (s_ioSocket == INVALID_SOCKET)
             {
-                SYS_CONSOLE_PRINT("Failed to reopen IO socket, retrying...\r\n");
+                SYS_CONSOLE_PRINT("[IO] Reconnect failed, retrying in %u ms\r\n",
+                                  RECONNECT_DELAY_MS);
             }
             else
             {
-                SYS_CONSOLE_PRINT("Reconnected successfully IO Socket!\r\n");
+                SYS_CONSOLE_PRINT("[IO] Reconnected\r\n");
             }
-
-            vTaskDelay(RECONNECT_DELAY_MS);
+            /* BUG FIX: was vTaskDelay(RECONNECT_DELAY_MS) — ms not ticks */
+            vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAY_MS));
         }
-        vTaskDelay(10); // Add a small delay to avoid consuming too much CPU time
-    }
-}
-/**
- * @brief   Initializes and starts IO handler tasks.
- * 
- * This function creates two FreeRTOS tasks:
- * - vIOHandlerServerTask: Manages IO server communication and processing.
- * - vToggleLEDTask: Handles periodic LED toggling.
- * 
- * The tasks are created with predefined stack sizes and priorities.
- */
-void vIOHandler()
-{
-    // Create IO Handler Server Task for managing IO communication
-    xTaskCreate(vIOHandlerServerTask, 
-                "vIOHandlerServerTask", 
-                IO_SERVER_HANDLER_HEAP_DEPTH, 
-                NULL, 
-                IO_SERVER_HANDLER_TASK_PRIORITY, 
-                NULL);    
-}
 
-
-/**
- * @brief  Get the digital input value from IO Expander for input 50.
- * @return 1 if the input is high, 0 if low.
- */
-uint8_t Digital_Input_50_Get(void)
-{
-    /* Accessing digital input 50 from index 49 */
-    return currentDIQueueBuffer[49];
-}
-
-/**
- * @brief  Get the digital input value from IO Expander for input 51.
- * @return 1 if the input is high, 0 if low.
- */
-uint8_t Digital_Input_51_Get(void)
-{
-    /* Accessing digital input 51 from index 50 */
-    return currentDIQueueBuffer[50];
-}
-
-/**
- * @brief  Get the digital input value from IO Expander for input 52.
- * @return 1 if the input is high, 0 if low.
- */
-uint8_t Digital_Input_52_Get(void)
-{
-    /* Accessing digital input 52 from index 51 */
-    return currentDIQueueBuffer[51];
-}
-
-/**
- * @brief  Get the digital input value from IO Expander for input 53.
- * @return 1 if the input is high, 0 if low.
- */
-uint8_t Digital_Input_53_Get(void)
-{
-    /* Accessing digital input 53 from index 52 */
-    return currentDIQueueBuffer[52];
-}
-
-/**
- * @brief  Get the digital input value from IO Expander for input 54.
- * @return 1 if the input is high, 0 if low.
- */
-uint8_t Digital_Input_54_Get(void)
-{
-    /* Accessing digital input 54 from index 53 */
-    return currentDIQueueBuffer[53];
-}
-
-/**
- * @brief  Get the digital input value from IO Expander for input 55.
- * @return 1 if the input is high, 0 if low.
- */
-uint8_t Digital_Input_55_Get(void)
-{
-    /* Accessing digital input 55 from index 54 */
-    return currentDIQueueBuffer[54];
-}
-
-/**
- * @brief  Get the digital input value from IO Expander for input 56.
- * @return 1 if the input is high, 0 if low.
- */
-uint8_t Digital_Input_56_Get(void)
-{
-    /* Accessing digital input 56 from index 55 */
-    return currentDIQueueBuffer[55];
-}
-
-/**
- * @brief  Get the digital input value from IO Expander for input 57.
- * @return 1 if the input is high, 0 if low.
- */
-uint8_t Digital_Input_57_Get(void)
-{
-    /* Accessing digital input 57 from index 56 */
-    return currentDIQueueBuffer[56];
-}
-
-/**
- * @brief  Get the digital input value from IO Expander for input 58.
- * @return 1 if the input is high, 0 if low.
- */
-uint8_t Digital_Input_58_Get(void)
-{
-    /* Accessing digital input 58 from index 57 */
-    return currentDIQueueBuffer[57];
-}
-
-/**
- * @brief  Get the digital input value from IO Expander for input 59.
- * @return 1 if the input is high, 0 if low.
- */
-uint8_t Digital_Input_59_Get(void)
-{
-    /* Accessing digital input 59 from index 58 */
-    return currentDIQueueBuffer[58];
-}
-
-/**
- * @brief  Get the digital input value from IO Expander for input 60.
- * @return 1 if the input is high, 0 if low.
- */
-uint8_t Digital_Input_60_Get(void)
-{
-    /* Accessing digital input 60 from index 59 */
-    return currentDIQueueBuffer[59];
-}
-
-/**
- * @brief  Get the Analog value for Chennel 1.
- * @return Analog Value.
- */
-uint32_t Analog_Input_Get(uint8_t channel)
-{
-    return currentTempAIQueueBuffer[channel - 1];
-}
-
-uint8_t GPIO_Read(uint16_t portNo, uint8_t *pErrorCode)
-{
-    switch (portNo)
-    {
-        // Digital Inputs (1–60)
-        case 1:  return Digital_Input_1_Get();
-        case 2:  return Digital_Input_2_Get();
-        case 3:  return Digital_Input_3_Get();
-        case 4:  return Digital_Input_4_Get();
-        case 5:  return Digital_Input_5_Get();
-        case 6:  return Digital_Input_6_Get();
-        case 7:  return Digital_Input_7_Get();
-        case 8:  return Digital_Input_8_Get();
-        case 9:  return Digital_Input_9_Get();
-        case 10: return Digital_Input_10_Get();
-        case 11: return Digital_Input_11_Get();
-        case 12: return Digital_Input_12_Get();
-        case 13: return Digital_Input_13_Get();
-        case 14: return Digital_Input_14_Get();
-        case 15: return Digital_Input_15_Get();
-        case 16: return Digital_Input_16_Get();
-        case 17: return Digital_Input_17_Get();
-        case 18: return Digital_Input_18_Get();
-        case 19: return Digital_Input_19_Get();
-        case 20: return Digital_Input_20_Get();
-        case 21: return Digital_Input_21_Get();
-        case 22: return Digital_Input_22_Get();
-        case 23: return Digital_Input_23_Get();
-        case 24: return Digital_Input_24_Get();
-        case 25: return Digital_Input_25_Get();
-        case 26: return Digital_Input_26_Get();
-        case 27: return Digital_Input_27_Get();
-        case 28: return Digital_Input_28_Get();
-        case 29: return Digital_Input_29_Get();
-        case 30: return Digital_Input_30_Get();
-        case 31: return Digital_Input_31_Get();
-        case 32: return Digital_Input_32_Get();
-        case 33: return Digital_Input_33_Get();
-        case 34: return Digital_Input_34_Get();
-        case 35: return Digital_Input_35_Get();
-        case 36: return Digital_Input_36_Get();
-        case 37: return Digital_Input_37_Get();
-        case 38: return Digital_Input_38_Get();
-        case 39: return Digital_Input_39_Get();
-        case 40: return Digital_Input_40_Get();
-        case 41: return Digital_Input_41_Get();
-        case 42: return Digital_Input_42_Get();
-        case 43: return Digital_Input_43_Get();
-        case 44: return Digital_Input_44_Get();
-        case 45: return Digital_Input_45_Get();
-        case 46: return Digital_Input_46_Get();
-        case 47: return Digital_Input_47_Get();
-        case 48: return Digital_Input_48_Get();
-        case 49: return Digital_Input_49_Get();
-        case 50: return Digital_Input_50_Get();
-        case 51: return Digital_Input_51_Get();
-        case 52: return Digital_Input_52_Get();
-        case 53: return Digital_Input_53_Get();
-        case 54: return Digital_Input_54_Get();
-        case 55: return Digital_Input_55_Get();
-        case 56: return Digital_Input_56_Get();
-        case 57: return Digital_Input_57_Get();
-        case 58: return Digital_Input_58_Get();
-        case 59: return Digital_Input_59_Get();
-        case 60: return Digital_Input_60_Get();
-
-        // Digital Outputs (61–84)
-        case 61: return Digital_Output_1_Get();
-        case 62: return Digital_Output_2_Get();
-        case 63: return Digital_Output_3_Get();
-        case 64: return Digital_Output_4_Get();
-        case 65: return Digital_Output_5_Get();
-        case 66: return Digital_Output_6_Get();
-        case 67: return Digital_Output_7_Get();
-        case 68: return Digital_Output_8_Get();
-        case 69: return Digital_Output_9_Get();
-        case 70: return Digital_Output_10_Get();
-        case 71: return Digital_Output_11_Get();
-        case 72: return Digital_Output_12_Get();
-        case 73: return Digital_Output_13_Get();
-        case 74: return Digital_Output_14_Get();
-        case 75: return Digital_Output_15_Get();
-        case 76: return Digital_Output_16_Get();
-        case 77: return Digital_Output_17_Get();
-        case 78: return Digital_Output_18_Get();
-        case 79: return Digital_Output_19_Get();
-        case 80: return Digital_Output_20_Get();
-        case 81: return Digital_Output_21_Get();
-        case 82: return Digital_Output_22_Get();
-        case 83: return Digital_Output_23_Get();
-        case 84: return Digital_Output_24_Get();
-
-        // Efuse + Relay
-        case 85: return efuse1_in_Get();
-        case 86: return efuse2_in_Get();
-        case 87: return efuse3_in_Get();
-        case 88: return efuse4_in_Get();
-        case 89: return Relay_Output_1_Get();
-        case 90: return Relay_Output_2_Get();
-
-        default:
-            *pErrorCode = errorInvalidPort;
-            return 0;
+        /* BUG FIX: was vTaskDelay(10) — raw ticks, should be ms */
+        vTaskDelay(pdMS_TO_TICKS(IO_TASK_LOOP_DELAY_MS));
     }
 }
 
-void GPIO_Write(uint16_t portNo, bool bPortVal, uint8_t *pErrorCode)
-{
-    if (portNo < 61 || portNo > 90)
-    {
-        *pErrorCode = errorInvalidPort;
-        return;
-    }
+/* ============================================================================
+ * Public Init Function
+ * ========================================================================== */
 
-    switch (portNo)
-    {
-        case 61: bPortVal ? Digital_Output_1_Set()  : Digital_Output_1_Clear(); break;
-        case 62: bPortVal ? Digital_Output_2_Set()  : Digital_Output_2_Clear(); break;
-        case 63: bPortVal ? Digital_Output_3_Set()  : Digital_Output_3_Clear(); break;
-        case 64: bPortVal ? Digital_Output_4_Set()  : Digital_Output_4_Clear(); break;
-        case 65: bPortVal ? Digital_Output_5_Set()  : Digital_Output_5_Clear(); break;
-        case 66: bPortVal ? Digital_Output_6_Set()  : Digital_Output_6_Clear(); break;
-        case 67: bPortVal ? Digital_Output_7_Set()  : Digital_Output_7_Clear(); break;
-        case 68: bPortVal ? Digital_Output_8_Set()  : Digital_Output_8_Clear(); break;
-        case 69: bPortVal ? Digital_Output_9_Set()  : Digital_Output_9_Clear(); break;
-        case 70: bPortVal ? Digital_Output_10_Set() : Digital_Output_10_Clear(); break;
-        case 71: bPortVal ? Digital_Output_11_Set() : Digital_Output_11_Clear(); break;
-        case 72: bPortVal ? Digital_Output_12_Set() : Digital_Output_12_Clear(); break;
-        case 73: bPortVal ? Digital_Output_13_Set() : Digital_Output_13_Clear(); break;
-        case 74: bPortVal ? Digital_Output_14_Set() : Digital_Output_14_Clear(); break;
-        case 75: bPortVal ? Digital_Output_15_Set() : Digital_Output_15_Clear(); break;
-        case 76: bPortVal ? Digital_Output_16_Set() : Digital_Output_16_Clear(); break;
-        case 77: bPortVal ? Digital_Output_17_Set() : Digital_Output_17_Clear(); break;
-        case 78: bPortVal ? Digital_Output_18_Set() : Digital_Output_18_Clear(); break;
-        case 79: bPortVal ? Digital_Output_19_Set() : Digital_Output_19_Clear(); break;
-        case 80: bPortVal ? Digital_Output_20_Set() : Digital_Output_20_Clear(); break;
-        case 81: bPortVal ? Digital_Output_21_Set() : Digital_Output_21_Clear(); break;
-        case 82: bPortVal ? Digital_Output_22_Set() : Digital_Output_22_Clear(); break;
-        case 83: bPortVal ? Digital_Output_23_Set() : Digital_Output_23_Clear(); break;
-        case 84: bPortVal ? Digital_Output_24_Set() : Digital_Output_24_Clear(); break;
-
-        case 85: bPortVal ? efuse1_in_Set() : efuse1_in_Clear(); break;
-        case 86: bPortVal ? efuse2_in_Set() : efuse2_in_Clear(); break;
-        case 87: bPortVal ? efuse3_in_Set() : efuse3_in_Clear(); break;
-        case 88: bPortVal ? efuse4_in_Set() : efuse4_in_Clear(); break;
-        case 89: bPortVal ? Relay_Output_1_Set() : Relay_Output_1_Clear(); break;
-        case 90: bPortVal ? Relay_Output_2_Set() : Relay_Output_2_Clear(); break;
-
-        default:
-            *pErrorCode = errorInvalidPort;
-            return;
-    }
-}
 /**
- * @brief Processes the parsed incoming packet.
+ * @brief  Create the IO handler FreeRTOS task.
  *
- * This function handles:
- * - **Digital input reads**
- * - **Relay output reads**
- * - **Digital output reads**
- * - **Digital/Relay output writes**
+ *         BUG FIX: return type changed from void to bool so caller can detect
+ *         task creation failure.
  *
- * @note The function **does not process** the packet if there are any prior errors.
+ * @return true  on success
+ * @return false if xTaskCreate failed
  */
-void ProcessInbPacket(uint8_t msgType,
-                      uint16_t portNo,
-                      uint8_t portVal,
-                      uint8_t *pOutVal,
-                      uint8_t *pErrorCode)
+bool vIOHandler(void)
 {
-    if (*pErrorCode != errorNoError)
-        return;
-
-    if (msgType == msgSubTypeDigitalRead)
+    if (xTaskCreate(prv_IOHandlerServerTask,
+                    "IO_Handler",
+                    IO_SERVER_HANDLER_STACK_DEPTH,
+                    NULL,
+                    IO_SERVER_HANDLER_TASK_PRIORITY,
+                    NULL) != pdPASS)
     {
-        *pOutVal = GPIO_Read(portNo, pErrorCode);
+        SYS_CONSOLE_PRINT("[IO] Task creation failed\r\n");
+        return false;
     }
-    else if (msgType == msgSubTypeDigitalWrite)
-    {
-        GPIO_Write(portNo, portVal, pErrorCode);
-    }
-    else
-    {
-        *pErrorCode = errorInvalidMsg;
-    }
+    SYS_CONSOLE_PRINT("[IO] Task created\r\n");
+    return true;
 }
 
-uint8_t u8ChargingControl(uint8_t u8DockNo, uint8_t action)
-{
-    // Placeholder for actual charging control logic
-    //SYS_CONSOLE_PRINT("[CHARGING] Control for Dock %d, Action: %s\r\n", u8DockNo, action ? "START" : "STOP");
-    static uint8_t u8PevChargingState[MAX_DOCKS] = {0}; // Assuming max 4 docks for example
-    if (u8PevChargingState[u8DockNo] != action) {
-        SYS_CONSOLE_PRINT("[CHARGING] Dock %d Charging State %s\r\n", u8DockNo, action ? "START" : "STOP");
-        SESSION_SetAuthenticationCommand(u8DockNo, action);
-        u8PevChargingState[u8DockNo] = action;
-    }
-    return true; // Assume success for now
-}
-
-bool bGPIO_Operation(GPIOOperation_e eGPIOType, uint8_t u8DockNo)
-{
-    bool bRet = true;
-    uint8_t outbErrorCode = errorNoError;
-    switch (eGPIOType)
-    {
-    case DO_AC_RELAY_ON:
-        GPIO_Write(Gpio_conf.AC_Relay_Pin[u8DockNo], true, &outbErrorCode);
-        bRet = true;
-        break;
-    case DO_AC_RELAY_OFF:
-        GPIO_Write(Gpio_conf.AC_Relay_Pin[u8DockNo], false, &outbErrorCode);
-        bRet = true;
-        break;
-    case DO_DC_RELAY_ON:
-        GPIO_Write(Gpio_conf.DC_Relay_Pin[u8DockNo], true, &outbErrorCode);
-        bRet = true;
-        break;
-    case DO_DC_RELAY_OFF:
-        GPIO_Write(Gpio_conf.DC_Relay_Pin[u8DockNo], false, &outbErrorCode);
-        bRet = true;
-        break;
-    case DO_SOLENOID_HIGH:
-        GPIO_Write(Gpio_conf.Solenoid_PinHi[u8DockNo], true, &outbErrorCode);
-        vTaskDelay(100); // Add delay if solenoid needs time to actuate
-        GPIO_Write(Gpio_conf.Solenoid_PinHi[u8DockNo], false, &outbErrorCode);
-        bRet = true;
-        break;
-    case DO_SOLENOID_LOW:
-        GPIO_Write(Gpio_conf.Solenoid_PinLo[u8DockNo], true, &outbErrorCode);
-        vTaskDelay(100); // Add delay if solenoid needs time to actuate
-        GPIO_Write(Gpio_conf.Solenoid_PinLo[u8DockNo], false, &outbErrorCode);
-        bRet = true;
-        break;
-    case DO_R_LED_HIGH:
-        GPIO_Write(Gpio_conf.R_LED_Pin[u8DockNo], true, &outbErrorCode);
-        bRet = true;
-        break;
-    case DO_R_LED_LOW:
-        GPIO_Write(Gpio_conf.R_LED_Pin[u8DockNo], false, &outbErrorCode);
-        bRet = true;
-        break;
-    case DO_G_LED_HIGH:
-        GPIO_Write(Gpio_conf.G_LED_Pin[u8DockNo], true, &outbErrorCode);
-        bRet = true;
-        break;
-    case DO_G_LED_LOW:
-        GPIO_Write(Gpio_conf.G_LED_Pin[u8DockNo], false, &outbErrorCode);
-        bRet = true;
-        break;
-    case DO_B_LED_HIGH:
-        GPIO_Write(Gpio_conf.B_LED_Pin[u8DockNo], true, &outbErrorCode);
-        bRet = true;
-        break;
-    case DO_B_LED_LOW:
-        GPIO_Write(Gpio_conf.B_LED_Pin[u8DockNo], false, &outbErrorCode);
-        bRet = true;
-        break;
-    case DO_DOCK_FAN_HIGH:
-        GPIO_Write(Gpio_conf.Dock_Fan_Pin[u8DockNo], true, &outbErrorCode);
-        bRet = true;
-        break;
-    case DO_DOCK_FAN_LOW:
-        GPIO_Write(Gpio_conf.Dock_Fan_Pin[u8DockNo], false, &outbErrorCode);
-        bRet = true;
-        break;
-    case DO_COMPARTMENT_FAN_HIGH:
-        GPIO_Write(Gpio_conf.Compartment_Fan_Pin, true, &outbErrorCode);
-        bRet = true;
-        break;
-    case DO_COMPARTMENT_FAN_LOW:
-        GPIO_Write(Gpio_conf.Compartment_Fan_Pin, false, &outbErrorCode);
-        bRet = true;
-        break;
-    case DI_E_STOP_STATUS:
-        bRet = GPIO_Read(Gpio_conf.EStop_Pin, &outbErrorCode);
-        break;
-    case DI_DOOR_LOCK_STATUS:
-        bRet = GPIO_Read(Gpio_conf.DoorLock_Pin[u8DockNo], &outbErrorCode);
-        break;
-    case DI_SOLENOID_LOCK_STATUS:
-        bRet = GPIO_Read(Gpio_conf.SolenoidLock_Pin[u8DockNo], &outbErrorCode);
-        break;
-    default:
-        SYS_CONSOLE_PRINT("[GPIO] Unknown GPIO Operation\r\n");
-        bRet = false;
-        break;
-    }
-}
-
-/* *****************************************************************************
- End of File
- */
-
+/* ************************************************************************** */
+/* End of File                                                                */
+/* ************************************************************************** */

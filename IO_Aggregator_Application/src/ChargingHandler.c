@@ -1,98 +1,81 @@
 /******************************************************************************
- * @file    ChargingHandler.c
- * @brief   Charging Handler module implementation
+ * File Name   : ChargingHandler.c
+ * Description : Charging Handler module implementation
  *
- * @details
- * Implements charging control logic including initialization, monitoring,
- * and state transitions.
+ * Dual-protocol EV charging state machine supporting:
+ *   - PROTOCOL_17017_25  : LEVDC ISO 17017-25 standard CAN protocol
+ *   - PROTOCOL_TVS_PROP  : TVS proprietary CAN protocol
  *
- * @author  Sarang Parmar
- * @date    16-Mar-2026
- * @version 1.0
+ * Active protocol is selected at compile-time in ChargingHandler.h via:
+ *   #define CHARGING_PROTOCOL   PROTOCOL_17017_25   (or PROTOCOL_TVS_PROP)
  *
+ * State Machine Flow (both protocols follow the same states):
+ *   INIT → AUTH_SUCCESS → PARAM_VALIDATE → CONNECTION_CONFIRMED
+ *        → INITIALIZE → PRECHARGE → CHARGING → SHUTDOWN
+ *        → SESSION_COMPLETE → INIT
+ *                          ↘ ERROR ↗
+ *
+ * Author  : Sarang Parmar
+ * Date    : 16-Mar-2026
+ * Version : 2.0
  ******************************************************************************/
 
 /******************************************************************************
  * Includes
  ******************************************************************************/
-
 #include "ChargingHandler.h"
-#include "definitions.h"                // SYS function prototypes
+#include "definitions.h"
 #include "configuration.h"
 #include "device.h"
 #include "ChargingCommunicationHandler.h"
-// #include "timers.h"
-/******************************************************************************
- * Private Macros
- ******************************************************************************/
-/******************************************************************************
- * CHARGING Task Configuration Macros
- ******************************************************************************/
-
-/* Task Name */
-#define CHARGING_TASK_NAME                "CHARGING_TASK"
-/* Task Stack Size (in words) */
-#define CHARGING_TASK_STACK_SIZE_WORDS    (1024U)
-/* Task Priority */
-#define CHARGING_TASK_PRIORITY            (tskIDLE_PRIORITY + 2U)
-/* Task Queue Length (if needed later) */
-#define CHARGING_TASK_QUEUE_LENGTH        (5U)
-/* Task Delay */
-#define CHARGING_TASK_DELAY_MS            (1000U)
-/* LEVDC Shutoff Delay */
-#define LEVDC_SHUTOFF_DELAY_MS 2000U
-/* Fault Check Cooldown Period */
-#define FAULT_CHECK_COOLDOWN_MS 10000U  /* Skip fault checking for 10000 ms after a fault occurs */
-/* Number of PMs per group for TONHE modules */
-#define LEVDC_POWER_RESOLUTION    50U   /* Power resolution in watts */
-#define LEVDC_MAX_VOLTAGE         120U  /* As per Standard: 120 volt requirement */
-#define LEVDC_MAX_CURRENT         100U  /* As per Standard: 100 Amp requirement */
-#define LEVDC_RATED_DC_OP_POWER   ((LEVDC_MAX_VOLTAGE * LEVDC_MAX_CURRENT) / LEVDC_POWER_RESOLUTION)
-
-/* Define these as per your hardware specs */
-#define CHARGER_TYPE_AC                 0x01
-#define OUTPUT_ENABLE                   0x01
-#define OUTPUT_DISABLE                  0x00
-#define FAN_ENABLE                      0x01
-#define FAN_DISABLE                     0x00
-#define AC_INPUT_VALID                  0x01
-#define ERROR_NONE                      0x00
-#define DERATING_NONE                   0x00
-#define DERATING_ACTIVE                 0x01
-#define PRE_CHARGE_VOLTAGE_THRESHOLD    60u
-#define TEMP_DERATING_THRESHOLD         45u
-#define SOC_CHARGE_COMPLETE             100u
-/******************************************************************************
- * Private Type Definitions
- ******************************************************************************/
 
 /******************************************************************************
- * Private Variables
+ * Task Configuration
+ ******************************************************************************/
+#define CHARGING_TASK_NAME              "CHARGING_TASK"
+#define CHARGING_TASK_STACK_SIZE_WORDS  (1024U)
+#define CHARGING_TASK_PRIORITY          (tskIDLE_PRIORITY + 2U)
+#define CHARGING_TASK_DELAY_MS          (1000U)
+
+/******************************************************************************
+ * Fault / Timing Configuration
+ ******************************************************************************/
+#define FAULT_CHECK_COOLDOWN_MS         (10000U) /**< Cooldown between fault checks (ms)     */
+#define ZERO_CURRENT_FAULT_THRESHOLD_MS (30000U) /**< Duration of zero-current before fault  */
+#define PRECHARGE_FAIL_THRESHOLD_MS     (30000U) /**< Max time allowed in pre-charge phase   */
+#define BMS_COMMS_TIMEOUT_MS            (10000U) /**< BMS timeout before comm fault          */
+#define PM_COMMS_TIMEOUT_MS             (10000U) /**< PM  timeout before comm fault          */
+#define BMS_FAULT_DEBOUNCE_MS           (2000U)  /**< BMS fault must persist this long       */
+#define PM_FAULT_DEBOUNCE_MS            (2000U)  /**< PM  fault must persist this long       */
+#define ZERO_CURRENT_THRESHOLD_A        (0.5f)   /**< Current below this = zero-current fault*/
+#define ENERGY_CALC_INTERVAL_MS         (1000U)  /**< Energy calculation interval            */
+#define PRINT_INTERVAL_MS               (10000U) /**< Console print interval                 */
+
+/******************************************************************************
+ * Static Variables
  ******************************************************************************/
 static TaskHandle_t xCHARGING_TASK = NULL;
-ChargingMsgFrameInfo_t Charging_LiveInfo[MAX_DOCKS];
+
 /******************************************************************************
- * Private Function Prototypes
+ * Private Function Prototypes — Task & Top-Level
  ******************************************************************************/
 static void CHARGING_TASK(void *pvParameters);
-
 static void Charging_StateMachine(uint8_t u8DockNo);
-
-/* Charging Process Handler */
 static void vChargingProcessHandler(uint8_t u8DockNo);
-/* Vehicle & Power Module */
 static void vUpdateVehiclePMInfo(uint8_t u8DockNo);
 static void vEnergyTimeCalculation(uint8_t u8DockNo);
 static void updateSystemState(uint8_t u8DockNo);
 
-/* LED */
+/******************************************************************************
+ * Private Function Prototypes — LED
+ ******************************************************************************/
 void vSetLedState(uint8_t u8DockNo, uint8_t ledColor, uint8_t ledState);
 
-/* Stop & Fault Handling */
+/******************************************************************************
+ * Private Function Prototypes — Stop & Fault
+ ******************************************************************************/
 static bool bCheckStopCondition(uint8_t u8DockNo);
 static bool bCheckFaultCondition(uint8_t u8DockNo);
-
-/* Individual Fault Checks */
 static bool bCheckEStopFault(uint8_t u8DockNo);
 static bool bCheckBMSFault(uint8_t u8DockNo);
 static bool bCheckPMFault(uint8_t u8DockNo);
@@ -100,210 +83,237 @@ static bool bCheckBMSStatus(uint8_t u8DockNo);
 static bool bCheckPMStatus(uint8_t u8DockNo);
 static bool bCheckZeroCurrentFault(uint8_t u8DockNo);
 static bool bCheckPrechargeFailure(uint8_t u8DockNo);
-
-/* Fault Status Helpers */
 static bool bGetBMSFaultStatus(uint8_t u8DockNo);
 static bool bGetPMFaultStatus(uint8_t u8DockNo);
 
-/*==============================================================================
- * TVS Charging State Function Prototypes
- *============================================================================*/
-static void vTVS_SendInitReq          (uint8_t u8DockNo);
-static void vTVS_AuthSuccess          (uint8_t u8DockNo);
-static void vTVS_ValidateParameters   (uint8_t u8DockNo);
-static void vTVS_ConnectionConfirmed  (uint8_t u8DockNo);
-static void vTVS_InitializeState      (uint8_t u8DockNo);
-static void vTVS_PreChargingState     (uint8_t u8DockNo);
-static void vTVS_StartCharging        (uint8_t u8DockNo);
-static void vTVS_Shutdown             (uint8_t u8DockNo);
-static void vTVS_SessionComplete      (uint8_t u8DockNo);
-static void vTVS_SessionError         (uint8_t u8DockNo);
-
-
-/* Utility Functions */
-static const char* CH_GetStateString(CH_State_e state);
-static void vPrintSystemData(uint8_t u8DockNo);
-static void vPrintStateAndDeviceInfo(uint8_t dockNo);
-static void vPrintChargingInfo(uint8_t u8DockNo);
 /******************************************************************************
- * Global Function Definitions
+ * Private Function Prototypes — Debug / Print
  ******************************************************************************/
+static const char *CH_GetStateString(CH_State_e state);
+static void vPrintSystemData(uint8_t u8DockNo);
+static void vPrintStateAndDeviceInfo(uint8_t u8DockNo);
+static void vPrintChargingInfo(uint8_t u8DockNo);
 
-/******************************************************************************
- * @brief  Initialize CHARGING Task
+
+/* ============================================================
+ * SECTION 1: PROTOCOL-SPECIFIC LIVE DATA STORES & GET/SET
+ * ============================================================ */
+
+/* ----------------------------------------------------------
+ * 1A. LEVDC ISO 17017-25 Protocol Data Store
+ * ---------------------------------------------------------- */
+#if (CHARGING_PROTOCOL == PROTOCOL_17017_25)
+
+ChargingMsgFrameInfo_t Charging_LiveInfo[MAX_DOCKS];
+
+/**
+ * @brief  Thread-safe read/write of the LEVDC live CAN frame for one dock.
  *
- * @return true  - Task created successfully
- * @return false - Task creation failed
-//  ******************************************************************************/
-bool ChargingTask_Init(void)
-{
-    bool bStatus = false;
-
-    BaseType_t xTaskStatus;
-
-    xTaskStatus = xTaskCreate(CHARGING_TASK,
-                              CHARGING_TASK_NAME,
-                              CHARGING_TASK_STACK_SIZE_WORDS,
-                              NULL,
-                              CHARGING_TASK_PRIORITY,
-                              &xCHARGING_TASK);
-
-    if (xTaskStatus == pdPASS)
-    {
-        SYS_CONSOLE_PRINT("CHARGING_TASK Created\r\n");
-        vChargingCommunicationInit();
-        bStatus = true;
-    }
-    else
-    {
-        SYS_CONSOLE_PRINT("CHARGING_TASK Creation Failed\r\n");
-    }
-    return bStatus;
-}
+ * @param  u8DockNo    Dock index (0 to MAX_DOCKS-1)
+ * @param  psData      Pointer to caller's ChargingMsgFrameInfo_t buffer
+ * @param  u8Operation SET_PARA = write live store, GET_PARA = read live store
+ * @return true on success, false on NULL pointer or invalid dock index
+ */
 bool bGetSetLevdcBMSData(uint8_t u8DockNo,
-                                 ChargingMsgFrameInfo_t *psData,
-                                 uint8_t u8Operation)
-{
-    uint8_t u8Ret = false;
-    /* Input validation */
-    if ((psData == NULL) || (u8DockNo >= MAX_DOCKS)) {
-        return false;
-    }
-    taskENTER_CRITICAL();
-    switch (u8Operation) {
-        case SET_PARA: {
-            memcpy((void *)&Charging_LiveInfo[u8DockNo],
-                   (const void *)psData,
-                   sizeof(ChargingMsgFrameInfo_t));
-            u8Ret = true;
-        }
-        break;
-        case GET_PARA: {
-            memcpy((void *)psData,
-                   (const void *)&Charging_LiveInfo[u8DockNo],
-                   sizeof(ChargingMsgFrameInfo_t));
-            u8Ret = true;
-        }
-        break;
-        default: {
-            /* Invalid operation */
-            u8Ret = false;
-        }
-        break;
-    }
-    taskEXIT_CRITICAL();
-    return u8Ret;
-}
-
-/*==============================================================================
- * TVS Unified GET/SET - Full Frame
- * @param u8DockNo   : Dock index (0 to MAX_DOCKS-1)
- * @param psData     : Pointer to TVS_MsgFrameInfo_t
- * @param u8Operation: SET_PARA or GET_PARA
- * @return           : true on success, false on failure
- *============================================================================*/
-bool bGetSetTVSBMSData(uint8_t u8DockNo,
-                    TVS_MsgFrameInfo_t *psData,
-                    uint8_t u8Operation)
+                         ChargingMsgFrameInfo_t *psData,
+                         uint8_t u8Operation)
 {
     bool bRet = false;
 
-    /* Input validation */
-    if ((psData == NULL) || (u8DockNo >= MAX_DOCKS)) {
+    if ((psData == NULL) || (u8DockNo >= MAX_DOCKS))
+    {
         return false;
     }
 
     taskENTER_CRITICAL();
     switch (u8Operation)
     {
-        case SET_PARA: {
-            memcpy((void *)&TVS_LiveInfo[u8DockNo],
+        case SET_PARA:
+            memcpy((void *)&Charging_LiveInfo[u8DockNo],
                    (const void *)psData,
-                   sizeof(TVS_MsgFrameInfo_t));
+                   sizeof(ChargingMsgFrameInfo_t));
             bRet = true;
-        }
-        break;
+            break;
 
-        case GET_PARA: {
+        case GET_PARA:
             memcpy((void *)psData,
-                   (const void *)&TVS_LiveInfo[u8DockNo],
-                   sizeof(TVS_MsgFrameInfo_t));
+                   (const void *)&Charging_LiveInfo[u8DockNo],
+                   sizeof(ChargingMsgFrameInfo_t));
             bRet = true;
-        }
-        break;
+            break;
 
-        default: {
-            /* Invalid operation */
+        default:
             bRet = false;
-        }
-        break;
+            break;
     }
     taskEXIT_CRITICAL();
     return bRet;
 }
 
-/* EV readiness check — preserves original logic but safer copy-by-value */
-static bool bIsEvReadyForCharging(uint8_t u8DockNo)
-{
-    bool bRet = true;
-    ChargingMsgFrameInfo_t sChargingLiveInfo = {0};
-    (void)bGetSetLevdcBMSData(u8DockNo, &sChargingLiveInfo, GET_PARA);
+#endif /* PROTOCOL_17017_25 */
 
-    if (sChargingLiveInfo.LevdcRX_500ID_Info.u8EvChargingEnable)
+/* ----------------------------------------------------------
+ * 1B. TVS Proprietary Protocol Data Store
+ * ---------------------------------------------------------- */
+#if (CHARGING_PROTOCOL == PROTOCOL_TVS_PROP)
+
+TVS_MsgFrameInfo_t TVS_LiveInfo[MAX_DOCKS];
+
+/* Compile-time struct size assertions — all CAN frames must be exactly 8 bytes */
+static_assert(sizeof(TVS_Tx90_Info_t)          == 8U, "TVS_Tx90_Info_t must be 8 bytes");
+static_assert(sizeof(TVS_Tx91_ChargeProfile_t) == 8U, "TVS_Tx91_ChargeProfile_t must be 8 bytes");
+static_assert(sizeof(TVS_Tx92_FMVersionInfo_t) == 8U, "TVS_Tx92_FMVersionInfo_t must be 8 bytes");
+static_assert(sizeof(TVS_Rx100_Status_t)       == 8U, "TVS_Rx100_Status_t must be 8 bytes");
+static_assert(sizeof(TVS_Rx101_Profile_t)      == 8U, "TVS_Rx101_Profile_t must be 8 bytes");
+
+/**
+ * @brief  Thread-safe read/write of the TVS live CAN frame for one dock.
+ *
+ * @param  u8DockNo    Dock index (0 to MAX_DOCKS-1)
+ * @param  psData      Pointer to caller's TVS_MsgFrameInfo_t buffer
+ * @param  u8Operation SET_PARA = write live store, GET_PARA = read live store
+ * @return true on success, false on NULL pointer or invalid dock index
+ */
+bool bGetSetTVSBMSData(uint8_t u8DockNo,
+                       TVS_MsgFrameInfo_t *psData,
+                       uint8_t u8Operation)
+{
+    bool bRet = false;
+
+    if ((psData == NULL) || (u8DockNo >= MAX_DOCKS))
     {
-        SYS_CONSOLE_PRINT("MAIN: EV Charging Enabled for G%d\r\n", (int)u8DockNo);
-        bRet = true;
+        return false;
     }
-    else if (sChargingLiveInfo.LevdcRX_500ID_Info.u8EvConStatus ||
-             sChargingLiveInfo.LevdcRX_500ID_Info.u8EvChargingPosition ||
-             sChargingLiveInfo.LevdcRX_500ID_Info.u8WaitReqToEngTransfer ||
-             sChargingLiveInfo.LevdcRX_500ID_Info.u8EnergyTransferError)
+
+    taskENTER_CRITICAL();
+    switch (u8Operation)
     {
-        SYS_CONSOLE_PRINT("MAIN: Energy Transfer Error/EV Connection/Position/Wait Request Issue for G%d\r\n", (int)u8DockNo);
-        bRet = false;
+        case SET_PARA:
+            memcpy((void *)&TVS_LiveInfo[u8DockNo],
+                   (const void *)psData,
+                   sizeof(TVS_MsgFrameInfo_t));
+            bRet = true;
+            break;
+
+        case GET_PARA:
+            memcpy((void *)psData,
+                   (const void *)&TVS_LiveInfo[u8DockNo],
+                   sizeof(TVS_MsgFrameInfo_t));
+            bRet = true;
+            break;
+
+        default:
+            bRet = false;
+            break;
     }
-    SYS_CONSOLE_PRINT("MAIN: bIsEvReadyForCharging(G%d) = %d\r\n", (int)u8DockNo, (int)bRet);
+    taskEXIT_CRITICAL();
     return bRet;
 }
-/******************************************************************************
- * Private Function Definitions
- ******************************************************************************/
-static void CHARGING_TASK(void *pvParameters)
-{
-    (void)pvParameters;
-    SYS_CONSOLE_PRINT("In Function: %s\r\n", __FUNCTION__);
-    for (;;)
-    {
-        for (uint8_t u8DockNo = DOCK_1; u8DockNo < MAX_DOCKS; u8DockNo++)
-        {
-            vChargingProcessHandler(u8DockNo);
-            Charging_StateMachine(u8DockNo);
-        }
 
-        vTaskDelay(pdMS_TO_TICKS(CHARGING_TASK_DELAY_MS));
+#endif /* PROTOCOL_TVS_PROP */
+
+
+/* ============================================================
+ * SECTION 2: PROTOCOL-SPECIFIC STATE MACHINE FUNCTIONS
+ * ============================================================ */
+
+/* ----------------------------------------------------------
+ * 2A. LEVDC ISO 17017-25 State Functions
+ *     Prefix: v17017_
+ * ---------------------------------------------------------- */
+#if (CHARGING_PROTOCOL == PROTOCOL_17017_25)
+
+/* Private prototypes */
+static void v17017_SendInitReq        (uint8_t u8DockNo);
+static void v17017_AuthSuccess        (uint8_t u8DockNo);
+static void v17017_ValidateParameters (uint8_t u8DockNo);
+static void v17017_ConnectionConfirmed(uint8_t u8DockNo);
+static void v17017_InitializeState    (uint8_t u8DockNo);
+static void v17017_PreChargingState   (uint8_t u8DockNo);
+static void v17017_StartCharging      (uint8_t u8DockNo);
+static void v17017_Shutdown           (uint8_t u8DockNo);
+static void v17017_SessionComplete    (uint8_t u8DockNo);
+static void v17017_SessionError       (uint8_t u8DockNo);
+static bool bIsEvReadyForCharging     (uint8_t u8DockNo);
+
+/**
+ * @brief  Check whether EV is ready for energy transfer.
+ *         Reads 0x500 frame and evaluates EV status bits.
+ */
+static bool bIsEvReadyForCharging(uint8_t u8DockNo)
+{
+    bool bRet = false;
+    ChargingMsgFrameInfo_t sFrame = {0};
+    (void)bGetSetLevdcBMSData(u8DockNo, &sFrame, GET_PARA);
+
+    if (sFrame.LevdcRX_500ID_Info.u8EvChargingEnable)
+    {
+        SYS_CONSOLE_PRINT("G%d: EV Charging Enabled\r\n", (int)u8DockNo);
+        bRet = true;
     }
+    else if (sFrame.LevdcRX_500ID_Info.u8EvConStatus          ||
+             sFrame.LevdcRX_500ID_Info.u8EvChargingPosition   ||
+             sFrame.LevdcRX_500ID_Info.u8WaitReqToEngTransfer ||
+             sFrame.LevdcRX_500ID_Info.u8EnergyTransferError)
+    {
+        SYS_CONSOLE_PRINT("G%d: EV not ready (ConStatus/Position/WaitReq/TransferErr)\r\n", (int)u8DockNo);
+        bRet = false;
+    }
+    SYS_CONSOLE_PRINT("G%d: bIsEvReadyForCharging = %d\r\n", (int)u8DockNo, (int)bRet);
+    return bRet;
 }
 
+/**
+ * @brief CH_STATE_INIT — Broadcast EVSE identity and wait for EV authentication.
+ *
+ * Populates:
+ *   0x508 - u8EvseStopCtrl = EVSE_NOERROR
+ *   0x509 - u8ControlProtocolNum = 1
+ *   0x510 - u8EVSEVolatageControlOpt = VOLTAGE_CONTROL_ENABLED
+ *
+ * Transition: → CH_STATE_AUTH_SUCCESS when AUTH command received from EV.
+ */
 static void v17017_SendInitReq(uint8_t u8DockNo)
 {
-    ChargingMsgFrameInfo_t sChargingLiveInfo = {0};
+    ChargingMsgFrameInfo_t sFrame = {0};
 
-    sChargingLiveInfo.LevdcTX_508ID_Info.u8EvseStopCtrl = EVSE_NOERROR;
-    sChargingLiveInfo.LevdcTX_509ID_Info.u8ControlProtocolNum = 1;
-    sChargingLiveInfo.LevdcTX_510ID_Info.u8EVSEVolatageControlOpt = VOLTAGE_CONTROL_ENABLED;
+    sFrame.LevdcTX_508ID_Info.u8EvseStopCtrl             = EVSE_NOERROR;
+    sFrame.LevdcTX_509ID_Info.u8ControlProtocolNum        = 1U;
+    sFrame.LevdcTX_510ID_Info.u8EVSEVolatageControlOpt   = VOLTAGE_CONTROL_ENABLED;
 
-    (void)bGetSetLevdcBMSData(u8DockNo, &sChargingLiveInfo, SET_PARA);
+    (void)bGetSetLevdcBMSData(u8DockNo, &sFrame, SET_PARA);
+
     if (SESSION_GetAuthenticationCommand(u8DockNo) == 1U)
     {
         SESSION_SetChargingState(u8DockNo, CH_STATE_AUTH_SUCCESS);
     }
 }
 
+/**
+ * @brief CH_STATE_AUTH_SUCCESS — Authentication acknowledged by EV.
+ *
+ * Transition: → CH_STATE_PARAM_VALIDATE immediately.
+ */
 static void v17017_AuthSuccess(uint8_t u8DockNo)
 {
     SESSION_SetChargingState(u8DockNo, CH_STATE_PARAM_VALIDATE);
 }
 
+/**
+ * @brief CH_STATE_PARAM_VALIDATE — Validate EV parameters and advertise capability.
+ *
+ * Guards:
+ *   - BMSRxStatus must be true (EV CAN frames received)
+ *
+ * Populates (0x508):
+ *   u8EvseStatus        = EVSE_CHARGING
+ *   u16RatedOutputVol   = LEVDC_MAX_VOLTAGE * 10
+ *   u16ConfDCvolLimit   = LEVDC_MAX_VOLTAGE * 10
+ *   u16AvailOutputCur   = LEVDC_MAX_CURRENT * 10
+ *   u8EVCompatible      = EV_COMPATIBLE
+ *
+ * Transition: → CH_STATE_CONNECTION_CONFIRMED on success.
+ */
 static void v17017_ValidateParameters(uint8_t u8DockNo)
 {
     if (SESSION_GetBMSRxStatus(u8DockNo) == false)
@@ -312,53 +322,71 @@ static void v17017_ValidateParameters(uint8_t u8DockNo)
         return;
     }
 
-    ChargingMsgFrameInfo_t sChargingLiveInfo = {0};
-    (void)bGetSetLevdcBMSData(u8DockNo, &sChargingLiveInfo, GET_PARA);
+    ChargingMsgFrameInfo_t sFrame = {0};
+    (void)bGetSetLevdcBMSData(u8DockNo, &sFrame, GET_PARA);
 
-    sChargingLiveInfo.LevdcTX_508ID_Info.u8EvseStopCtrl = EVSE_NOERROR;
-    sChargingLiveInfo.LevdcTX_508ID_Info.u8EvseStatus = EVSE_CHARGING;
+    sFrame.LevdcTX_508ID_Info.u8EvseStopCtrl         = EVSE_NOERROR;
+    sFrame.LevdcTX_508ID_Info.u8EvseStatus           = EVSE_CHARGING;
+    sFrame.LevdcTX_508ID_Info.u16RatedOutputVol      = (uint16_t)(LEVDC_MAX_VOLTAGE * FACTOR_10);
+    sFrame.LevdcTX_508ID_Info.u16ConfDCvolLimit      = (uint16_t)(LEVDC_MAX_VOLTAGE * FACTOR_10);
+    sFrame.LevdcTX_508ID_Info.u16AvailOutputCur      = (uint16_t)(LEVDC_MAX_CURRENT * FACTOR_10);
+    sFrame.LevdcTX_508ID_Info.u8EVCompatible         = EV_COMPATIBLE;
+    sFrame.LevdcTX_509ID_Info.u8AvailDCOutputPower   = 0xFFU;
+    sFrame.LevdcTX_509ID_Info.u16RemainChargeTime    = 0xFFFFU;
 
-    sChargingLiveInfo.LevdcTX_509ID_Info.u8AvailDCOutputPower = 0xFF;
-    sChargingLiveInfo.LevdcTX_509ID_Info.u16RemainChargeTime = 0xFFFF;
-    sChargingLiveInfo.LevdcTX_508ID_Info.u16RatedOutputVol = (uint16_t)(LEVDC_MAX_VOLTAGE * FACTOR_10);
-    sChargingLiveInfo.LevdcTX_508ID_Info.u16ConfDCvolLimit = (uint16_t)(LEVDC_MAX_VOLTAGE * FACTOR_10);
-    sChargingLiveInfo.LevdcTX_508ID_Info.u16AvailOutputCur = (uint16_t)(LEVDC_MAX_CURRENT * FACTOR_10);
-
-    sChargingLiveInfo.LevdcTX_508ID_Info.u8EVCompatible = EV_COMPATIBLE;
     SESSION_SetStartChargingComm(u8DockNo, true);
     SESSION_SetChargingState(u8DockNo, CH_STATE_CONNECTION_CONFIRMED);
-    (void)bGetSetLevdcBMSData(u8DockNo, &sChargingLiveInfo, SET_PARA);
+    (void)bGetSetLevdcBMSData(u8DockNo, &sFrame, SET_PARA);
 }
 
+/**
+ * @brief CH_STATE_CONNECTION_CONFIRMED — Latch connector and validate EV demand.
+ *
+ * Reads from 0x500:
+ *   u16DcOutputVolTarget → u16OutputVoltage
+ *   u16ReqDcCurrent      → u16OutputCurrent
+ *   u16DcOutputVoltLimit → u16BatVoltMaxLimit
+ *
+ * Condition: If BatVoltLimit ≤ LEVDC_MAX_VOLTAGE AND ReqCurrent ≤ LEVDC_MAX_CURRENT
+ *            → advance to CH_STATE_INITIALIZE.
+ */
 static void v17017_ConnectionConfirmed(uint8_t u8DockNo)
 {
-    ChargingMsgFrameInfo_t sChargingLiveInfo = {0};
-    (void)bGetSetLevdcBMSData(u8DockNo, &sChargingLiveInfo, GET_PARA);
+    ChargingMsgFrameInfo_t sFrame = {0};
+    (void)bGetSetLevdcBMSData(u8DockNo, &sFrame, GET_PARA);
 
-    sChargingLiveInfo.LevdcTX_508ID_Info.u8ConLatchStatus = GUN_LATCHED;
-    sChargingLiveInfo.LevdcTX_508ID_Info.u8ChargingSysError = EVSE_NOERROR;
-    sChargingLiveInfo.LevdcTX_508ID_Info.u8EvseMalFunctionError = EVSE_NOERROR;
-    sChargingLiveInfo.LevdcTX_508ID_Info.u8EvseStatus = EVSE_STANDBY;
-    sChargingLiveInfo.LevdcTX_508ID_Info.u8EvseStopCtrl = EVSE_NOERROR;
+    sFrame.LevdcTX_508ID_Info.u8ConLatchStatus       = GUN_LATCHED;
+    sFrame.LevdcTX_508ID_Info.u8ChargingSysError     = EVSE_NOERROR;
+    sFrame.LevdcTX_508ID_Info.u8EvseMalFunctionError = EVSE_NOERROR;
+    sFrame.LevdcTX_508ID_Info.u8EvseStatus           = EVSE_STANDBY;
+    sFrame.LevdcTX_508ID_Info.u8EvseStopCtrl         = EVSE_NOERROR;
 
-    uint16_t u16OutputVoltage = (uint16_t)(sChargingLiveInfo.LevdcRX_500ID_Info.u16DcOutputVolTarget / FACTOR_10);
-    uint16_t u16OutputCurrent = (uint16_t)(sChargingLiveInfo.LevdcRX_500ID_Info.u16ReqDcCurrent / FACTOR_10);
-    uint16_t u16BatVoltMaxLimit = (uint16_t)(sChargingLiveInfo.LevdcRX_500ID_Info.u16DcOutputVoltLimit / FACTOR_10);
-    (void)bGetSetLevdcBMSData(u8DockNo, &sChargingLiveInfo, SET_PARA);
-    SYS_CONSOLE_PRINT("G%d ->Demand V: %d I: %d CAN: %d | Bat V Limit: %d\r\n",
-          (int)u8DockNo,
-          (int)u16OutputVoltage,
-          (int)u16OutputCurrent,
-          (int)SESSION_GetBMSRxStatus(u8DockNo),
-          (int)u16BatVoltMaxLimit);
+    uint16_t u16OutputVoltage   = (uint16_t)(sFrame.LevdcRX_500ID_Info.u16DcOutputVolTarget / FACTOR_10);
+    uint16_t u16OutputCurrent   = (uint16_t)(sFrame.LevdcRX_500ID_Info.u16ReqDcCurrent      / FACTOR_10);
+    uint16_t u16BatVoltMaxLimit = (uint16_t)(sFrame.LevdcRX_500ID_Info.u16DcOutputVoltLimit  / FACTOR_10);
+
+    (void)bGetSetLevdcBMSData(u8DockNo, &sFrame, SET_PARA);
+
+    SYS_CONSOLE_PRINT("G%d -> Demand V: %d  I: %d  BMS_RX: %d  BatVLim: %d\r\n",
+                      (int)u8DockNo,
+                      (int)u16OutputVoltage,
+                      (int)u16OutputCurrent,
+                      (int)SESSION_GetBMSRxStatus(u8DockNo),
+                      (int)u16BatVoltMaxLimit);
 
     if ((u16BatVoltMaxLimit <= LEVDC_MAX_VOLTAGE) && (u16OutputCurrent <= LEVDC_MAX_CURRENT))
     {
         SESSION_SetChargingState(u8DockNo, CH_STATE_INITIALIZE);
     }
-    (void)bGetSetLevdcBMSData(u8DockNo, &sChargingLiveInfo, SET_PARA);
 }
 
+/**
+ * @brief CH_STATE_INITIALIZE — Wait for EV ready-for-charging signal.
+ *
+ * Reads EV status bits from 0x500 via bIsEvReadyForCharging().
+ * Transition: EV ready   → CH_STATE_PRECHARGE
+ *             EV not ready → CH_STATE_CONNECTION_CONFIRMED (retry)
+ */
 static void v17017_InitializeState(uint8_t u8DockNo)
 {
     if (bIsEvReadyForCharging(u8DockNo))
@@ -371,65 +399,102 @@ static void v17017_InitializeState(uint8_t u8DockNo)
     }
 }
 
+/**
+ * @brief CH_STATE_PRECHARGE — Signal EVSE ready and turn on rectifier.
+ *
+ * Populates:
+ *   0x508 - u8EVSEReadyForCharge = EVSE_READY_FOR_CHARGE
+ *   0x509 - u8AvailDCOutputPower = LEVDC_RATED_DC_OP_POWER
+ *   0x509 - u16RemainChargeTime  = EV's estimated charging time
+ *
+ * Transition: → CH_STATE_CHARGING immediately.
+ */
 static void v17017_PreChargingState(uint8_t u8DockNo)
 {
-    ChargingMsgFrameInfo_t sChargingLiveInfo = {0};
-    (void)bGetSetLevdcBMSData(u8DockNo, &sChargingLiveInfo, GET_PARA);
+    ChargingMsgFrameInfo_t sFrame = {0};
+    (void)bGetSetLevdcBMSData(u8DockNo, &sFrame, GET_PARA);
 
-    sChargingLiveInfo.LevdcTX_508ID_Info.u8EVSEReadyForCharge = EVSE_READY_FOR_CHARGE;
+    sFrame.LevdcTX_508ID_Info.u8EVSEReadyForCharge      = EVSE_READY_FOR_CHARGE;
+    sFrame.LevdcTX_509ID_Info.u8AvailDCOutputPower      = (uint8_t)LEVDC_RATED_DC_OP_POWER;
+    sFrame.LevdcTX_509ID_Info.u16RemainChargeTime       = sFrame.LevdcRX_501ID_Info.u16EstimatedChargingTime;
 
-    sChargingLiveInfo.LevdcTX_509ID_Info.u8AvailDCOutputPower = (uint8_t)LEVDC_RATED_DC_OP_POWER;
-    sChargingLiveInfo.LevdcTX_509ID_Info.u16RemainChargeTime = sChargingLiveInfo.LevdcRX_501ID_Info.u16EstimatedChargingTime;
-
-    (void)bGetSetLevdcBMSData(u8DockNo, &sChargingLiveInfo, SET_PARA);
-    SESSION_SetChargingState(u8DockNo, CH_STATE_CHARGING);
+    (void)bGetSetLevdcBMSData(u8DockNo, &sFrame, SET_PARA);
 
     SESSION_SetPMState(u8DockNo, RECTIFIER_ON);
+    SESSION_SetChargingState(u8DockNo, CH_STATE_CHARGING);
 }
 
+/**
+ * @brief CH_STATE_CHARGING — Main active charging loop.
+ *
+ * Populates each cycle:
+ *   0x508 - u8EvseStatus          = EVSE_CHARGING
+ *   0x509 - u16EVSEoutputVoltage  = PM output voltage * 10
+ *   0x509 - u16EVSEoutputCurrent  = PM output current * 10
+ *
+ * Turns on AC and DC relays.
+ * Transition: stays in CH_STATE_CHARGING (stop detected by vChargingProcessHandler).
+ */
 static void v17017_StartCharging(uint8_t u8DockNo)
 {
+    ChargingMsgFrameInfo_t sFrame = {0};
+    (void)bGetSetLevdcBMSData(u8DockNo, &sFrame, GET_PARA);
 
-    ChargingMsgFrameInfo_t sChargingLiveInfo = {0};
-    (void)bGetSetLevdcBMSData(u8DockNo, &sChargingLiveInfo, GET_PARA);
+    sFrame.LevdcTX_508ID_Info.u8EvseStatus          = EVSE_CHARGING;
+    sFrame.LevdcTX_509ID_Info.u16EVSEoutputVoltage  = (uint16_t)(SESSION_GetPmOutputVoltage(u8DockNo) * FACTOR_10);
+    sFrame.LevdcTX_509ID_Info.u16EVSEoutputCurrent  = (uint16_t)(SESSION_GetPmOutputCurrent(u8DockNo) * FACTOR_10);
 
-    sChargingLiveInfo.LevdcTX_508ID_Info.u8EvseStatus = EVSE_CHARGING;
-
-    sChargingLiveInfo.LevdcTX_509ID_Info.u16EVSEoutputVoltage = (uint16_t)(SESSION_GetPmOutputVoltage(u8DockNo) * FACTOR_10);
-    sChargingLiveInfo.LevdcTX_509ID_Info.u16EVSEoutputCurrent = (uint16_t)(SESSION_GetPmOutputCurrent(u8DockNo) * FACTOR_10);
     bGPIO_Operation(DO_AC_RELAY_ON, u8DockNo);
     bGPIO_Operation(DO_DC_RELAY_ON, u8DockNo);
 
-    (void)bGetSetLevdcBMSData(u8DockNo, &sChargingLiveInfo, SET_PARA);
+    (void)bGetSetLevdcBMSData(u8DockNo, &sFrame, SET_PARA);
 
     SESSION_SetChargingState(u8DockNo, CH_STATE_CHARGING);
 }
 
+/**
+ * @brief CH_STATE_SHUTDOWN — Safe shutdown of EVSE output.
+ *
+ * Actions:
+ *   - Turns off AC and DC relays
+ *   - Turns off rectifier
+ *   - Signals EVSE standby + gun unlatched to EV
+ *   - Waits LEVDC_SHUTOFF_DELAY_MS before clearing live data
+ *
+ * Transition: → CH_STATE_SESSION_COMPLETE.
+ */
 static void v17017_Shutdown(uint8_t u8DockNo)
 {
     bGPIO_Operation(DO_AC_RELAY_OFF, u8DockNo);
     bGPIO_Operation(DO_DC_RELAY_OFF, u8DockNo);
     SESSION_SetPMState(u8DockNo, RECTIFIER_OFF);
 
-    ChargingMsgFrameInfo_t sChargingLiveInfo = {0};
-    (void)bGetSetLevdcBMSData(u8DockNo, &sChargingLiveInfo, GET_PARA);
+    ChargingMsgFrameInfo_t sFrame = {0};
+    (void)bGetSetLevdcBMSData(u8DockNo, &sFrame, GET_PARA);
 
-    sChargingLiveInfo.LevdcTX_508ID_Info.u8EvseStatus = EVSE_STANDBY;
-    sChargingLiveInfo.LevdcTX_508ID_Info.u8ConLatchStatus = GUN_UNLATCHED;
-    sChargingLiveInfo.LevdcTX_508ID_Info.u8EvseStopCtrl = EVSE_ERROR;
-    sChargingLiveInfo.LevdcTX_508ID_Info.u16AvailOutputCur = 0U;
-    sChargingLiveInfo.LevdcTX_508ID_Info.u16RatedOutputVol = 0U;
+    sFrame.LevdcTX_508ID_Info.u8EvseStatus       = EVSE_STANDBY;
+    sFrame.LevdcTX_508ID_Info.u8ConLatchStatus   = GUN_UNLATCHED;
+    sFrame.LevdcTX_508ID_Info.u8EvseStopCtrl     = EVSE_ERROR;
+    sFrame.LevdcTX_508ID_Info.u16AvailOutputCur  = 0U;
+    sFrame.LevdcTX_508ID_Info.u16RatedOutputVol  = 0U;
 
-    (void)bGetSetLevdcBMSData(u8DockNo, &sChargingLiveInfo, SET_PARA);
+    (void)bGetSetLevdcBMSData(u8DockNo, &sFrame, SET_PARA);
 
     vTaskDelay(LEVDC_SHUTOFF_DELAY_MS);
     SESSION_SetStartChargingComm(u8DockNo, false);
-    (void)memset(&sChargingLiveInfo, 0, sizeof(sChargingLiveInfo));
-    (void)bGetSetLevdcBMSData(u8DockNo, &sChargingLiveInfo, SET_PARA);
+
+    (void)memset(&sFrame, 0, sizeof(sFrame));
+    (void)bGetSetLevdcBMSData(u8DockNo, &sFrame, SET_PARA);
 
     SESSION_SetChargingState(u8DockNo, CH_STATE_SESSION_COMPLETE);
 }
 
+/**
+ * @brief CH_STATE_SESSION_COMPLETE — End-of-session cleanup.
+ *
+ * Transition: Fault present → CH_STATE_ERROR
+ *             No fault      → CH_STATE_INIT
+ */
 static void v17017_SessionComplete(uint8_t u8DockNo)
 {
     if (SESSION_GetSystemFaultBitmap(u8DockNo) != SYSTEM_FAULT_NONE)
@@ -441,6 +506,12 @@ static void v17017_SessionComplete(uint8_t u8DockNo)
         SESSION_SetChargingState(u8DockNo, CH_STATE_INIT);
     }
 }
+
+/**
+ * @brief CH_STATE_ERROR — Hold in error until fault clears.
+ *
+ * Transition: Fault cleared → CH_STATE_INIT
+ */
 static void v17017_SessionError(uint8_t u8DockNo)
 {
     if (SESSION_GetSystemFaultBitmap(u8DockNo) == SYSTEM_FAULT_NONE)
@@ -449,25 +520,52 @@ static void v17017_SessionError(uint8_t u8DockNo)
     }
 }
 
-/*==============================================================================
- * CH_STATE_INIT
- * - First state on session start
- * - Send initial handshake request to BMS/EVSE
- *============================================================================*/
+#endif /* PROTOCOL_17017_25 */
+
+
+/* ----------------------------------------------------------
+ * 2B. TVS Proprietary Protocol State Functions
+ *     Prefix: vTVS_
+ * ---------------------------------------------------------- */
+#if (CHARGING_PROTOCOL == PROTOCOL_TVS_PROP)
+
+/* Private prototypes */
+static void vTVS_SendInitReq        (uint8_t u8DockNo);
+static void vTVS_AuthSuccess        (uint8_t u8DockNo);
+static void vTVS_ValidateParameters (uint8_t u8DockNo);
+static void vTVS_ConnectionConfirmed(uint8_t u8DockNo);
+static void vTVS_InitializeState    (uint8_t u8DockNo);
+static void vTVS_PreChargingState   (uint8_t u8DockNo);
+static void vTVS_StartCharging      (uint8_t u8DockNo);
+static void vTVS_Shutdown           (uint8_t u8DockNo);
+static void vTVS_SessionComplete    (uint8_t u8DockNo);
+static void vTVS_SessionError       (uint8_t u8DockNo);
+
+/**
+ * @brief CH_STATE_INIT — Broadcast charger identity and firmware version to BMS.
+ *
+ * Populates (0x90):
+ *   u8ChargerType = TVS_CHARGER_TYPE_3KW_DELTA_OFFBOARD
+ *   u8ErrorState  = TVS_CHARGER_ERR_NONE
+ *   u8Fan/Output/Derating = all OFF/NONE
+ *
+ * Populates (0x92): full firmware version fields from FW_VERSION_* macros.
+ *
+ * Transition: → CH_STATE_AUTH_SUCCESS when BMS sets AUTH command = 1.
+ */
 static void vTVS_SendInitReq(uint8_t u8DockNo)
 {
-    TVS_MsgFrameInfo_t sTVSFrame = {0};
+    TVS_MsgFrameInfo_t sFrame = {0};
+    (void)bGetSetTVSBMSData(u8DockNo, &sFrame, GET_PARA);
 
-    /* Read current frame */
-    bGetSetTVSBMSData(u8DockNo, &sTVSFrame, GET_PARA);
+    /* Charger identity (0x90) */
+    sFrame.TVS_Tx90_ChargerInfo.u8ChargerType = (uint8_t)TVS_CHARGER_TYPE_3KW_DELTA_OFFBOARD;
+    sFrame.TVS_Tx90_ChargerInfo.u8ErrorState  = (uint8_t)TVS_CHARGER_ERR_NONE;
+    sFrame.TVS_Tx90_ChargerInfo.u8Fan         = (uint8_t)TVS_FAN_OFF;
+    sFrame.TVS_Tx90_ChargerInfo.u8Output      = (uint8_t)TVS_OUTPUT_OFF;
+    sFrame.TVS_Tx90_ChargerInfo.u8Derating    = (uint8_t)TVS_DERATING_NONE;
 
-    /* TODO: Populate init request fields */
-    sTVSFrame.TVS_Tx90_ChargerInfo.u8ChargerType = CHARGER_TYPE_AC;
-    sTVSFrame.TVS_Tx90_ChargerInfo.u8Output      = OUTPUT_DISABLE;
-    sTVSFrame.TVS_Tx90_ChargerInfo.u8ErrorState  = ERROR_NONE;
-
-    /* Write back */
-    bGetSetTVSBMSData(u8DockNo, &sTVSFrame, SET_PARA);
+    (void)bGetSetTVSBMSData(u8DockNo, &sFrame, SET_PARA);
 
     if (SESSION_GetAuthenticationCommand(u8DockNo) == 1U)
     {
@@ -475,287 +573,898 @@ static void vTVS_SendInitReq(uint8_t u8DockNo)
     }
 }
 
-/*==============================================================================
- * CH_STATE_AUTH_SUCCESS
- * - Authentication with BMS confirmed
- * - Validate charger compatibility
- *============================================================================*/
+/**
+ * @brief CH_STATE_AUTH_SUCCESS — BMS authentication acknowledged.
+ *
+ * Transition: → CH_STATE_PARAM_VALIDATE immediately.
+ */
 static void vTVS_AuthSuccess(uint8_t u8DockNo)
 {
-    TVS_MsgFrameInfo_t sTVSFrame = {0};
-
-    bGetSetTVSBMSData(u8DockNo, &sTVSFrame, GET_PARA);
-
-    /* TODO: Set auth success flags / compatibility check */
-    sTVSFrame.TVS_Tx90_ChargerInfo.u8ACInput = AC_INPUT_VALID;
-
-    bGetSetTVSBMSData(u8DockNo, &sTVSFrame, SET_PARA);
-
     SESSION_SetChargingState(u8DockNo, CH_STATE_PARAM_VALIDATE);
 }
 
-/*==============================================================================
- * CH_STATE_PARAM_VALIDATE
- * - Validate BMS charge profile parameters
- * - Check voltage, current limits before proceeding
- *============================================================================*/
+/**
+ * @brief CH_STATE_PARAM_VALIDATE — Verify BMS profile received and within limits.
+ *
+ * Guards:
+ *   - BMSRxStatus must be true (0x100 and 0x101 frames received from BMS)
+ *
+ * Reads from 0x101:
+ *   u16MaxChargeVoltage, u16MaxChargeCurrent (decoded via 0.001 factor)
+ *
+ * Populates (0x91):
+ *   u16ChargingVoltage = TVS_MAX_VOLTAGE encoded
+ *   u16ChargingCurrent = TVS_MAX_CURRENT encoded
+ *
+ * Transition: → CH_STATE_CONNECTION_CONFIRMED on success.
+ */
 static void vTVS_ValidateParameters(uint8_t u8DockNo)
 {
-    TVS_MsgFrameInfo_t sTVSFrame = {0};
-
-    bGetSetTVSBMSData(u8DockNo, &sTVSFrame, GET_PARA);
-
-    /* TODO: Validate BMS profile parameters */
-    uint8_t u8MaxVol = sTVSFrame.TVS_Rx101_BMSProfile.u8MaxChargeVoltage;
-    uint8_t u8MaxCur = sTVSFrame.TVS_Rx101_BMSProfile.u8MaxChargeCurrent;
-
-    if ((u8MaxVol == 0u) || (u8MaxCur == 0u))
+    if (SESSION_GetBMSRxStatus(u8DockNo) == false)
     {
-        /* Invalid parameters - go to error */
-        SESSION_SetChargingState(u8DockNo, CH_STATE_ERROR);
+        SESSION_SetStartChargingComm(u8DockNo, false);
         return;
     }
 
-    /* Parameters valid - update charge profile */
-    sTVSFrame.TVS_Tx91_ChargeProfile.u8ChargingVoltage = u8MaxVol;
-    sTVSFrame.TVS_Tx91_ChargeProfile.u8ChargingCurrent = u8MaxCur;
+    TVS_MsgFrameInfo_t sFrame = {0};
+    (void)bGetSetTVSBMSData(u8DockNo, &sFrame, GET_PARA);
 
-    bGetSetTVSBMSData(u8DockNo, &sTVSFrame, SET_PARA);
+    float fMaxVoltage = TVS_DECODE_BMS_PROFILE_VOLTAGE(sFrame.TVS_Rx101_BMSProfile.u16MaxChargeVoltage);
+    float fMaxCurrent = TVS_DECODE_BMS_PROFILE_CURRENT(sFrame.TVS_Rx101_BMSProfile.u16MaxChargeCurrent);
 
+    SYS_CONSOLE_PRINT("G%d -> BMS Profile V: %.3f  I: %.3f\r\n",
+                      (int)u8DockNo, (double)fMaxVoltage, (double)fMaxCurrent);
+
+    /* Advertise charger capability back to BMS */
+    // sFrame.TVS_Tx91_ChargeProfile.u16ChargingVoltage = TVS_ENCODE_CHARGER_VOLTAGE(TVS_MAX_VOLTAGE);
+    // sFrame.TVS_Tx91_ChargeProfile.u16ChargingCurrent = TVS_ENCODE_CHARGER_CURRENT(TVS_MAX_CURRENT);
+    sFrame.TVS_Tx90_ChargerInfo.u8ErrorState         = (uint8_t)TVS_CHARGER_ERR_NONE;
+    sFrame.TVS_Tx90_ChargerInfo.u8Output             = (uint8_t)TVS_OUTPUT_OFF;
+
+    SESSION_SetStartChargingComm(u8DockNo, true);
     SESSION_SetChargingState(u8DockNo, CH_STATE_CONNECTION_CONFIRMED);
+    (void)bGetSetTVSBMSData(u8DockNo, &sFrame, SET_PARA);
 }
 
-/*==============================================================================
- * CH_STATE_CONNECTION_CONFIRMED
- * - Physical connector latch confirmed
- * - Ready to proceed to initialization
- *============================================================================*/
+/**
+ * @brief CH_STATE_CONNECTION_CONFIRMED — Validate BMS demand against charger limits.
+ *
+ * Reads from 0x101 (decoded physical values):
+ *   fDemandVoltage, fDemandCurrent, fCutOffCurrent, fPreChargeCurrent
+ *
+ * Stores decoded values in session DB for use by fault/energy monitors.
+ *
+ * Condition: fDemandVoltage > 0 AND fDemandCurrent > 0
+ *            AND both within TVS_MAX_VOLTAGE / TVS_MAX_CURRENT
+ *            → advance to CH_STATE_INITIALIZE.
+ */
 static void vTVS_ConnectionConfirmed(uint8_t u8DockNo)
 {
-    TVS_MsgFrameInfo_t sTVSFrame = {0};
+    TVS_MsgFrameInfo_t sFrame = {0};
+    (void)bGetSetTVSBMSData(u8DockNo, &sFrame, GET_PARA);
 
-    bGetSetTVSBMSData(u8DockNo, &sTVSFrame, GET_PARA);
+    float fDemandVoltage    = TVS_DECODE_BMS_PROFILE_VOLTAGE(sFrame.TVS_Rx101_BMSProfile.u16MaxChargeVoltage);
+    float fDemandCurrent    = TVS_DECODE_BMS_PROFILE_CURRENT(sFrame.TVS_Rx101_BMSProfile.u16MaxChargeCurrent);
+    float fCutOffCurrent    = TVS_DECODE_BMS_PROFILE_CURRENT(sFrame.TVS_Rx101_BMSProfile.u16CutOffChargeCurrent);
+    float fPreChargeCurrent = TVS_DECODE_BMS_PROFILE_CURRENT(sFrame.TVS_Rx101_BMSProfile.u16PreChargeCurrent);
 
-    /* TODO: Confirm connector latch status from BMS */
-    uint8_t u8BMSError = sTVSFrame.TVS_Rx100_BMSStatus.u8ErrorState;
+    SESSION_SetBMSDemandVoltage(u8DockNo, fDemandVoltage);
+    SESSION_SetBMSDemandCurrent(u8DockNo, fDemandCurrent);
 
-    if (u8BMSError != ERROR_NONE)
+    SYS_CONSOLE_PRINT("G%d -> Demand V: %.3f  I: %.3f  CutOff: %.3f  PreChg: %.3f\r\n",
+                      (int)u8DockNo,
+                      (double)fDemandVoltage,
+                      (double)fDemandCurrent,
+                      (double)fCutOffCurrent,
+                      (double)fPreChargeCurrent);
+
+    sFrame.TVS_Tx90_ChargerInfo.u8ErrorState = (uint8_t)TVS_CHARGER_ERR_NONE;
+    sFrame.TVS_Tx90_ChargerInfo.u8Output     = (uint8_t)TVS_OUTPUT_OFF;
+    (void)bGetSetTVSBMSData(u8DockNo, &sFrame, SET_PARA);
+
+    if ((fDemandVoltage > 0.0f) && (fDemandCurrent > 0.0f) &&
+        (fDemandVoltage <= TVS_MAX_VOLTAGE) && (fDemandCurrent <= TVS_MAX_CURRENT))
     {
-        SESSION_SetChargingState(u8DockNo, CH_STATE_ERROR);
-        return;
+        SESSION_SetChargingState(u8DockNo, CH_STATE_INITIALIZE);
     }
-
-    bGetSetTVSBMSData(u8DockNo, &sTVSFrame, SET_PARA);
-
-    SESSION_SetChargingState(u8DockNo, CH_STATE_INITIALIZE);
 }
 
-/*==============================================================================
- * CH_STATE_INITIALIZE
- * - Initialize charger hardware and output stage
- * - Apply charge profile from BMS
- *============================================================================*/
+/**
+ * @brief CH_STATE_INITIALIZE — Gate to pre-charge once BMS reports no error.
+ *
+ * Reads from 0x100:
+ *   u8ErrorState — must be TVS_BMS_ERR_NONE to proceed.
+ *
+ * Transition: BMS OK     → CH_STATE_PRECHARGE
+ *             BMS error  → CH_STATE_CONNECTION_CONFIRMED (retry)
+ */
 static void vTVS_InitializeState(uint8_t u8DockNo)
 {
-    TVS_MsgFrameInfo_t sTVSFrame = {0};
+    TVS_MsgFrameInfo_t sFrame = {0};
+    (void)bGetSetTVSBMSData(u8DockNo, &sFrame, GET_PARA);
 
-    bGetSetTVSBMSData(u8DockNo, &sTVSFrame, GET_PARA);
-
-    /* TODO: Initialize charger output parameters */
-    sTVSFrame.TVS_Tx90_ChargerInfo.u8Output    = OUTPUT_ENABLE;
-    sTVSFrame.TVS_Tx90_ChargerInfo.u8Fan       = FAN_ENABLE;
-    sTVSFrame.TVS_Tx90_ChargerInfo.u8Derating  = DERATING_NONE;
-
-    bGetSetTVSBMSData(u8DockNo, &sTVSFrame, SET_PARA);
-
-    SESSION_SetChargingState(u8DockNo, CH_STATE_PRECHARGE);
+    if (sFrame.TVS_Rx100_BMSStatus.u8ErrorState == (uint8_t)TVS_BMS_ERR_NONE)
+    {
+        SESSION_SetChargingState(u8DockNo, CH_STATE_PRECHARGE);
+    }
+    else
+    {
+        SYS_CONSOLE_PRINT("G%d: BMS error in INIT state (%d), retrying\r\n",
+                          (int)u8DockNo,
+                          (int)sFrame.TVS_Rx100_BMSStatus.u8ErrorState);
+        SESSION_SetChargingState(u8DockNo, CH_STATE_CONNECTION_CONFIRMED);
+    }
 }
 
-/*==============================================================================
- * CH_STATE_PRECHARGE
- * - Apply pre-charge current before main charging
- * - Monitor battery voltage rise
- *============================================================================*/
+/**
+ * @brief CH_STATE_PRECHARGE — Apply BMS pre-charge current and enable output.
+ *
+ * Reads from 0x101:
+ *   u16PreChargeCurrent → encoded into 0x91 u16ChargingCurrent
+ *   u16MaxChargeVoltage → encoded into 0x91 u16ChargingVoltage
+ *
+ * Sets (0x90): Fan ON, Output ON, Derating NONE.
+ * Turns on rectifier via SESSION_SetPMState.
+ *
+ * Transition: → CH_STATE_CHARGING immediately.
+ */
 static void vTVS_PreChargingState(uint8_t u8DockNo)
 {
-    TVS_MsgFrameInfo_t sTVSFrame = {0};
+    TVS_MsgFrameInfo_t sFrame = {0};
+    (void)bGetSetTVSBMSData(u8DockNo, &sFrame, GET_PARA);
 
-    bGetSetTVSBMSData(u8DockNo, &sTVSFrame, GET_PARA);
+    float fPreChargeCurrent = TVS_DECODE_BMS_PROFILE_CURRENT(sFrame.TVS_Rx101_BMSProfile.u16PreChargeCurrent);
+    float fTargetVoltage    = TVS_DECODE_BMS_PROFILE_VOLTAGE(sFrame.TVS_Rx101_BMSProfile.u16MaxChargeVoltage);
 
-    /* TODO: Apply pre-charge current */
-    uint8_t u8PreChargeCur = sTVSFrame.TVS_Rx101_BMSProfile.u8PreChargeCurrent;
-    uint8_t u8BattVoltage  = sTVSFrame.TVS_Rx100_BMSStatus.u8Voltage;
+    sFrame.TVS_Tx91_ChargeProfile.u16ChargingCurrent = TVS_ENCODE_CHARGER_CURRENT(fPreChargeCurrent);
+    sFrame.TVS_Tx91_ChargeProfile.u16ChargingVoltage = TVS_ENCODE_CHARGER_VOLTAGE(fTargetVoltage);
+    sFrame.TVS_Tx90_ChargerInfo.u8Output             = (uint8_t)TVS_OUTPUT_ON;
+    sFrame.TVS_Tx90_ChargerInfo.u8Fan                = (uint8_t)TVS_FAN_ON;
+    sFrame.TVS_Tx90_ChargerInfo.u8Derating           = (uint8_t)TVS_DERATING_NONE;
 
-    sTVSFrame.TVS_Tx91_ChargeProfile.u8ChargingCurrent = u8PreChargeCur;
+    SYS_CONSOLE_PRINT("G%d -> PreCharge I: %.3f  V: %.3f\r\n",
+                      (int)u8DockNo, (double)fPreChargeCurrent, (double)fTargetVoltage);
 
-    /* TODO: Check pre-charge completion threshold */
-    if (u8BattVoltage >= PRE_CHARGE_VOLTAGE_THRESHOLD)
-    {
-        SESSION_SetChargingState(u8DockNo, CH_STATE_CHARGING);
-    }
+    (void)bGetSetTVSBMSData(u8DockNo, &sFrame, SET_PARA);
 
-    bGetSetTVSBMSData(u8DockNo, &sTVSFrame, SET_PARA);
+    SESSION_SetPMState(u8DockNo, RECTIFIER_ON);
+    SESSION_SetChargingState(u8DockNo, CH_STATE_CHARGING);
 }
 
-/*==============================================================================
- * CH_STATE_CHARGING
- * - Main charging loop
- * - Monitor SOC, temperature, errors continuously
- *============================================================================*/
+/**
+ * @brief CH_STATE_CHARGING — Main charging loop: apply demand, report output, monitor.
+ *
+ * Each cycle:
+ *   1. Reads 0x100 (BMS live status): current, voltage, SOC, temp, error
+ *   2. Reads 0x101 (BMS profile): demand V, demand I, cut-off I
+ *   3. Checks cut-off current — if BMS current ≤ cut-off → SHUTDOWN
+ *   4. Applies thermal derating if charger temp ≥ TVS_TEMP_DERATING_THRESHOLD
+ *   5. Encodes demand V and I into 0x91 and writes to live store
+ *   6. Updates session DB with live PM output and SOC
+ *   7. Increments rolling counter in 0x90
+ *   8. Turns on AC and DC relays
+ *
+ * Transition: stays in CH_STATE_CHARGING (stop/fault detected by
+ *             vChargingProcessHandler → Charging_StateMachine)
+ */
 static void vTVS_StartCharging(uint8_t u8DockNo)
 {
-    TVS_MsgFrameInfo_t sTVSFrame = {0};
+    TVS_MsgFrameInfo_t sFrame = {0};
+    (void)bGetSetTVSBMSData(u8DockNo, &sFrame, GET_PARA);
+    float fOutputVoltage = SESSION_GetPmOutputVoltage(u8DockNo);
+    float fOutputCurrent = SESSION_GetPmOutputCurrent(u8DockNo);
 
-    bGetSetTVSBMSData(u8DockNo, &sTVSFrame, GET_PARA);
+    /* --- Apply BMS demand to charger profile (0x91) --- */
+    sFrame.TVS_Tx91_ChargeProfile.u16ChargingCurrent = TVS_ENCODE_CHARGER_CURRENT(fOutputCurrent);
+    sFrame.TVS_Tx91_ChargeProfile.u16ChargingVoltage = TVS_ENCODE_CHARGER_VOLTAGE(fOutputVoltage);
 
-    uint8_t u8SOC         = sTVSFrame.TVS_Rx100_BMSStatus.u8SOC;
-    uint8_t u8Temperature = sTVSFrame.TVS_Rx100_BMSStatus.u8Temperature;
-    uint8_t u8ErrorState  = sTVSFrame.TVS_Rx100_BMSStatus.u8ErrorState;
+    /* --- Rolling counter increment (0x90) --- */
+    sFrame.TVS_Tx90_ChargerInfo.u8Counter++;
 
-    /* TODO: Error check during charging */
-    if (u8ErrorState != ERROR_NONE)
-    {
-        SESSION_SetChargingState(u8DockNo, CH_STATE_ERROR);
-        return;
-    }
+    /* --- Enable relays --- */
+    bGPIO_Operation(DO_AC_RELAY_ON, u8DockNo);
+    bGPIO_Operation(DO_DC_RELAY_ON, u8DockNo);
+    
+    (void)bGetSetTVSBMSData(u8DockNo, &sFrame, SET_PARA);
 
-    /* TODO: Apply derating on high temperature */
-    if (u8Temperature >= TEMP_DERATING_THRESHOLD)
-    {
-        sTVSFrame.TVS_Tx90_ChargerInfo.u8Derating = DERATING_ACTIVE;
-    }
-
-    /* TODO: Check charge complete condition */
-    if (u8SOC >= SOC_CHARGE_COMPLETE)
-    {
-        SESSION_SetChargingState(u8DockNo, CH_STATE_SHUTDOWN);
-    }
-
-    /* Apply max charge current and voltage */
-    sTVSFrame.TVS_Tx91_ChargeProfile.u8ChargingCurrent = sTVSFrame.TVS_Rx101_BMSProfile.u8MaxChargeCurrent;
-    sTVSFrame.TVS_Tx91_ChargeProfile.u8ChargingVoltage = sTVSFrame.TVS_Rx101_BMSProfile.u8MaxChargeVoltage;
-
-    bGetSetTVSBMSData(u8DockNo, &sTVSFrame, SET_PARA);
+    /* Stay in CHARGING — stop/fault path handled by vChargingProcessHandler */
+    SESSION_SetChargingState(u8DockNo, CH_STATE_CHARGING);
 }
 
-/*==============================================================================
- * CH_STATE_SHUTDOWN
- * - Graceful shutdown of charger output
- * - Ramp down current before disconnecting
- *============================================================================*/
+/**
+ * @brief CH_STATE_SHUTDOWN — Safe ramp-down and output disable.
+ *
+ * Actions:
+ *   - Turns off AC and DC relays
+ *   - Turns off rectifier
+ *   - Zeroes charge profile in 0x91
+ *   - Disables output and fan in 0x90
+ *   - Waits TVS_SHUTOFF_DELAY_MS
+ *   - Clears entire live frame
+ *
+ * Transition: → CH_STATE_SESSION_COMPLETE.
+ */
 static void vTVS_Shutdown(uint8_t u8DockNo)
 {
-    TVS_MsgFrameInfo_t sTVSFrame = {0};
+    bGPIO_Operation(DO_AC_RELAY_OFF, u8DockNo);
+    bGPIO_Operation(DO_DC_RELAY_OFF, u8DockNo);
+    SESSION_SetPMState(u8DockNo, RECTIFIER_OFF);
 
-    bGetSetTVSBMSData(u8DockNo, &sTVSFrame, GET_PARA);
+    TVS_MsgFrameInfo_t sFrame = {0};
+    (void)bGetSetTVSBMSData(u8DockNo, &sFrame, GET_PARA);
 
-    /* TODO: Ramp down output and disable charger */
-    sTVSFrame.TVS_Tx91_ChargeProfile.u8ChargingCurrent = 0u;
-    sTVSFrame.TVS_Tx91_ChargeProfile.u8ChargingVoltage = 0u;
-    sTVSFrame.TVS_Tx90_ChargerInfo.u8Output            = OUTPUT_DISABLE;
-    sTVSFrame.TVS_Tx90_ChargerInfo.u8Fan               = FAN_DISABLE;
+    /* Zero out charge profile (0x91) */
+    sFrame.TVS_Tx91_ChargeProfile.u16ChargingCurrent = 0U;
+    sFrame.TVS_Tx91_ChargeProfile.u16ChargingVoltage = 0U;
 
-    bGetSetTVSBMSData(u8DockNo, &sTVSFrame, SET_PARA);
+    /* Safe output state (0x90) */
+    sFrame.TVS_Tx90_ChargerInfo.u8Output   = (uint8_t)TVS_OUTPUT_OFF;
+    sFrame.TVS_Tx90_ChargerInfo.u8Fan      = (uint8_t)TVS_FAN_OFF;
+    sFrame.TVS_Tx90_ChargerInfo.u8Derating = (uint8_t)TVS_DERATING_NONE;
+
+    (void)bGetSetTVSBMSData(u8DockNo, &sFrame, SET_PARA);
+
+    vTaskDelay(TVS_SHUTOFF_DELAY_MS);
+    SESSION_SetStartChargingComm(u8DockNo, false);
+
+    (void)memset(&sFrame, 0, sizeof(sFrame));
+    (void)bGetSetTVSBMSData(u8DockNo, &sFrame, SET_PARA);
 
     SESSION_SetChargingState(u8DockNo, CH_STATE_SESSION_COMPLETE);
 }
 
-/*==============================================================================
- * CH_STATE_SESSION_COMPLETE
- * - Session ended successfully
- * - Reset live data and return to INIT
- *============================================================================*/
+/**
+ * @brief CH_STATE_SESSION_COMPLETE — Post-session cleanup and fault check.
+ *
+ * Transition: Fault present → CH_STATE_ERROR
+ *             No fault      → CH_STATE_INIT
+ */
 static void vTVS_SessionComplete(uint8_t u8DockNo)
 {
-    TVS_MsgFrameInfo_t sTVSFrame = {0};
-
-    /* Clear all live data for this dock */
-    bGetSetTVSBMSData(u8DockNo, &sTVSFrame, SET_PARA);
-
-    /* TODO: Log session complete event */
-
-    SESSION_SetChargingState(u8DockNo, CH_STATE_INIT);
+    if (SESSION_GetSystemFaultBitmap(u8DockNo) != SYSTEM_FAULT_NONE)
+    {
+        SESSION_SetChargingState(u8DockNo, CH_STATE_ERROR);
+    }
+    else
+    {
+        SESSION_SetChargingState(u8DockNo, CH_STATE_INIT);
+    }
 }
 
-/*==============================================================================
- * CH_STATE_ERROR
- * - Handle fault conditions
- * - Disable output, log error, reset state
- *============================================================================*/
+/**
+ * @brief CH_STATE_ERROR — Hold in error state until system fault bitmap clears.
+ *
+ * Transition: Fault cleared → CH_STATE_INIT
+ */
 static void vTVS_SessionError(uint8_t u8DockNo)
 {
-    TVS_MsgFrameInfo_t sTVSFrame = {0};
-
-    bGetSetTVSBMSData(u8DockNo, &sTVSFrame, GET_PARA);
-
-    /* TODO: Log error state and fault source */
-    uint8_t u8ErrorState = sTVSFrame.TVS_Rx100_BMSStatus.u8ErrorState;
-    (void)u8ErrorState; /* TODO: Pass to fault logger */
-
-    /* Safe state - disable all outputs */
-    sTVSFrame.TVS_Tx91_ChargeProfile.u8ChargingCurrent = 0u;
-    sTVSFrame.TVS_Tx91_ChargeProfile.u8ChargingVoltage = 0u;
-    sTVSFrame.TVS_Tx90_ChargerInfo.u8Output            = OUTPUT_DISABLE;
-    sTVSFrame.TVS_Tx90_ChargerInfo.u8Fan               = FAN_DISABLE;
-    sTVSFrame.TVS_Tx90_ChargerInfo.u8ErrorState        = u8ErrorState;
-
-    bGetSetTVSBMSData(u8DockNo, &sTVSFrame, SET_PARA);
-
-    /* TODO: Add error recovery delay or retry logic before reset */
-    SESSION_SetChargingState(u8DockNo, CH_STATE_INIT);
+    if (SESSION_GetSystemFaultBitmap(u8DockNo) == SYSTEM_FAULT_NONE)
+    {
+        SESSION_SetChargingState(u8DockNo, CH_STATE_INIT);
+    }
 }
 
+#endif /* PROTOCOL_TVS_PROP */
+
+
+/* ============================================================
+ * SECTION 3: PROTOCOL-SELECTED STATE MACHINE DISPATCHER
+ * ============================================================ */
+
+/**
+ * @brief  Routes the current charging state to the correct protocol handler.
+ *
+ *         The active protocol (17017-25 or TVS) is selected at compile-time.
+ *         Both protocols expose the same ten state handlers mapped to the
+ *         same CH_State_e values, so the dispatcher is identical for both.
+ *
+ * @param  u8DockNo  Dock index (0 to MAX_DOCKS-1)
+ */
 static void Charging_StateMachine(uint8_t u8DockNo)
 {
-#if 0
+#if (CHARGING_PROTOCOL == PROTOCOL_17017_25)
     switch (SESSION_GetChargingState(u8DockNo))
     {
-    case CH_STATE_INIT: v17017_SendInitReq(u8DockNo); break;
-    case CH_STATE_AUTH_SUCCESS: v17017_AuthSuccess(u8DockNo); break;
-    case CH_STATE_PARAM_VALIDATE: v17017_ValidateParameters(u8DockNo); break;
-    case CH_STATE_CONNECTION_CONFIRMED: v17017_ConnectionConfirmed(u8DockNo); break;
-    case CH_STATE_INITIALIZE: v17017_InitializeState(u8DockNo); break;
-    case CH_STATE_PRECHARGE: v17017_PreChargingState(u8DockNo); break;
-    case CH_STATE_CHARGING: v17017_StartCharging(u8DockNo); break;
-    case CH_STATE_SHUTDOWN: v17017_Shutdown(u8DockNo); break;
-    case CH_STATE_SESSION_COMPLETE: v17017_SessionComplete(u8DockNo); break;
-    case CH_STATE_ERROR: v17017_SessionError(u8DockNo); break;
-    default: SESSION_SetChargingState(u8DockNo, CH_STATE_INIT); break;
+        case CH_STATE_INIT:                 v17017_SendInitReq(u8DockNo);         break;
+        case CH_STATE_AUTH_SUCCESS:         v17017_AuthSuccess(u8DockNo);         break;
+        case CH_STATE_PARAM_VALIDATE:       v17017_ValidateParameters(u8DockNo);  break;
+        case CH_STATE_CONNECTION_CONFIRMED: v17017_ConnectionConfirmed(u8DockNo); break;
+        case CH_STATE_INITIALIZE:           v17017_InitializeState(u8DockNo);     break;
+        case CH_STATE_PRECHARGE:            v17017_PreChargingState(u8DockNo);    break;
+        case CH_STATE_CHARGING:             v17017_StartCharging(u8DockNo);       break;
+        case CH_STATE_SHUTDOWN:             v17017_Shutdown(u8DockNo);            break;
+        case CH_STATE_SESSION_COMPLETE:     v17017_SessionComplete(u8DockNo);     break;
+        case CH_STATE_ERROR:                v17017_SessionError(u8DockNo);        break;
+        default: SESSION_SetChargingState(u8DockNo, CH_STATE_INIT);               break;
+    }
+
+#elif (CHARGING_PROTOCOL == PROTOCOL_TVS_PROP)
+    switch (SESSION_GetChargingState(u8DockNo))
+    {
+        case CH_STATE_INIT:                 vTVS_SendInitReq(u8DockNo);         break;
+        case CH_STATE_AUTH_SUCCESS:         vTVS_AuthSuccess(u8DockNo);         break;
+        case CH_STATE_PARAM_VALIDATE:       vTVS_ValidateParameters(u8DockNo);  break;
+        case CH_STATE_CONNECTION_CONFIRMED: vTVS_ConnectionConfirmed(u8DockNo); break;
+        case CH_STATE_INITIALIZE:           vTVS_InitializeState(u8DockNo);     break;
+        case CH_STATE_PRECHARGE:            vTVS_PreChargingState(u8DockNo);    break;
+        case CH_STATE_CHARGING:             vTVS_StartCharging(u8DockNo);       break;
+        case CH_STATE_SHUTDOWN:             vTVS_Shutdown(u8DockNo);            break;
+        case CH_STATE_SESSION_COMPLETE:     vTVS_SessionComplete(u8DockNo);     break;
+        case CH_STATE_ERROR:                vTVS_SessionError(u8DockNo);        break;
+        default: SESSION_SetChargingState(u8DockNo, CH_STATE_INIT);             break;
     }
 #endif
-    switch (SESSION_GetChargingState(u8DockNo))
-        {
-        case CH_STATE_INIT: vTVS_SendInitReq(u8DockNo); break;
-        case CH_STATE_AUTH_SUCCESS: vTVS_AuthSuccess(u8DockNo); break;
-        case CH_STATE_PARAM_VALIDATE: vTVS_ValidateParameters(u8DockNo); break;
-        case CH_STATE_CONNECTION_CONFIRMED: vTVS_ConnectionConfirmed(u8DockNo); break;
-        case CH_STATE_INITIALIZE: vTVS_InitializeState(u8DockNo); break;
-        case CH_STATE_PRECHARGE: vTVS_PreChargingState(u8DockNo); break;
-        case CH_STATE_CHARGING: vTVS_StartCharging(u8DockNo); break;
-        case CH_STATE_SHUTDOWN: vTVS_Shutdown(u8DockNo); break;
-        case CH_STATE_SESSION_COMPLETE: vTVS_SessionComplete(u8DockNo); break;
-        case CH_STATE_ERROR: vTVS_SessionError(u8DockNo); break;
-        default: SESSION_SetChargingState(u8DockNo, CH_STATE_INIT); break;
-        }
+}
+
+
+/* ============================================================
+ * SECTION 4: PROTOCOL-SELECTED VEHICLE & PM INFO UPDATE
+ * ============================================================ */
+
+/**
+ * @brief  Update session DB with live vehicle demand and SOC values.
+ *
+ *         Only active during CH_STATE_CHARGING.
+ *         For LEVDC: reads demand V/I and SOC from 0x500/0x501.
+ *         For TVS:   reads demand V/I and SOC from 0x101/0x100.
+ *
+ * @param  u8DockNo  Dock index
+ */
+static void vUpdateVehiclePMInfo(uint8_t u8DockNo)
+{
+    if (SESSION_GetChargingState(u8DockNo) != CH_STATE_CHARGING)
+    {
+        return;
+    }
+
+#if (CHARGING_PROTOCOL == PROTOCOL_17017_25)
+    ChargingMsgFrameInfo_t sFrame = {0};
+    (void)bGetSetLevdcBMSData(u8DockNo, &sFrame, GET_PARA);
+
+    float    fDemandVoltage  = (sFrame.LevdcRX_500ID_Info.u16DcOutputVolTarget * FACTOR_0_1);
+    float    fDemandCurrent  = (sFrame.LevdcRX_500ID_Info.u16ReqDcCurrent      * FACTOR_0_1);
+    uint16_t u16EstChrgTime  = sFrame.LevdcRX_501ID_Info.u16EstimatedChargingTime;
+    uint16_t u16CurrentSoc   = sFrame.LevdcRX_501ID_Info.u8ChargingRate;
+
+    SESSION_SetBMSDemandVoltage(u8DockNo, fDemandVoltage);
+    SESSION_SetBMSDemandCurrent(u8DockNo, fDemandCurrent);
+    SESSION_SetPmSetVoltage(u8DockNo, fDemandVoltage);
+    SESSION_SetPmSetCurrent(u8DockNo, fDemandCurrent);
+    SESSION_SetEstimatedChargingTime(u8DockNo, u16EstChrgTime);
+    SESSION_SetCurrentSoc(u8DockNo, u16CurrentSoc);
+
+    if ((SESSION_GetInitialSoc(u8DockNo) == 0U) && (u16CurrentSoc != 0U))
+    {
+        SESSION_SetInitialSoc(u8DockNo, u16CurrentSoc);
+        SYS_CONSOLE_PRINT("G%d: Initial SOC = %d%%\r\n", (int)u8DockNo, (int)u16CurrentSoc);
+    }
+
+#elif (CHARGING_PROTOCOL == PROTOCOL_TVS_PROP)
+    TVS_MsgFrameInfo_t sFrame = {0};
+    (void)bGetSetTVSBMSData(u8DockNo, &sFrame, GET_PARA);
+
+    /* Decode physical values from BMS profile & status */
+    float    fDemandVoltage = TVS_DECODE_BMS_PROFILE_VOLTAGE(sFrame.TVS_Rx101_BMSProfile.u16MaxChargeVoltage);
+    float    fDemandCurrent = TVS_DECODE_BMS_PROFILE_CURRENT(sFrame.TVS_Rx101_BMSProfile.u16MaxChargeCurrent);
+    uint16_t u16CurrentSoc  = sFrame.TVS_Rx100_BMSStatus.u8SOC;
+    int16_t s16BMSTemp   = TVS_DECODE_BMS_TEMPERATURE(sFrame.TVS_Rx100_BMSStatus.u8Temperature);
+
+    SESSION_SetBMSDemandVoltage(u8DockNo, fDemandVoltage);
+    SESSION_SetBMSDemandCurrent(u8DockNo, fDemandCurrent);
+    SESSION_SetCurrentSoc(u8DockNo, u16CurrentSoc);
+    SESSION_SetPmSetVoltage(u8DockNo, fDemandVoltage);
+    SESSION_SetPmSetCurrent(u8DockNo, fDemandCurrent);
+    SESSION_SetBMSTemperature(u8DockNo, (uint8_t)s16BMSTemp);
+
+    if ((SESSION_GetInitialSoc(u8DockNo) == 0U) && (u16CurrentSoc != 0U))
+    {
+        SESSION_SetInitialSoc(u8DockNo, u16CurrentSoc);
+        SYS_CONSOLE_PRINT("G%d: Initial SOC = %d%%\r\n", (int)u8DockNo, (int)u16CurrentSoc);
+    }
+#endif
+
 
 }
 
-/*===============================================================
- * 
- ================================================================*/
+
+/* ============================================================
+ * SECTION 5: PROTOCOL-SELECTED BMS FAULT STATUS
+ * ============================================================ */
+
+/**
+ * @brief  Check BMS-side fault conditions.
+ *
+ *         For LEVDC: evaluates error bits in 0x500 (EnergyTransferError,
+ *                    EvChargingStopControl, BatteryOverVoltage, etc.)
+ *         For TVS:   evaluates BMS_ErrorState in 0x100
+ *                    (0=OK, 1=Stop Charging)
+ *
+ * @param  u8DockNo  Dock index
+ * @return true if BMS fault is active
+ */
+static bool bGetBMSFaultStatus(uint8_t u8DockNo)
+{
+#if (CHARGING_PROTOCOL == PROTOCOL_17017_25)
+    ChargingMsgFrameInfo_t sFrame = {0};
+    if (bGetSetLevdcBMSData(u8DockNo, &sFrame, GET_PARA) == false)
+    {
+        SYS_CONSOLE_PRINT("G%d: BMS data read failed\r\n", (int)u8DockNo);
+        return true;
+    }
+
+    uint32_t u32FaultCode = 0U;
+
+    if (sFrame.LevdcRX_500ID_Info.u8EnergyTransferError)
+    {
+        SYS_CONSOLE_PRINT("G%d: BMS EnergyTransferError\r\n", (int)u8DockNo);
+        SET_BIT(u32FaultCode, BMS_FAULT_ENERGY_TRANSFER_ERROR);
+    }
+    if (sFrame.LevdcRX_500ID_Info.u8EvChargingStopControl)
+    {
+        SYS_CONSOLE_PRINT("G%d: BMS ChargingStopControl\r\n", (int)u8DockNo);
+        SET_BIT(u32FaultCode, BMS_FAULT_CHARGING_STOP_CONTROL);
+    }
+    if (sFrame.LevdcRX_500ID_Info.u8BatteryOverVol)
+    {
+        SYS_CONSOLE_PRINT("G%d: BMS BatteryOverVoltage\r\n", (int)u8DockNo);
+        SET_BIT(u32FaultCode, BMS_FAULT_BATTERY_OVERVOLT);
+    }
+    if (sFrame.LevdcRX_500ID_Info.u8HighBatteryTemp)
+    {
+        SYS_CONSOLE_PRINT("G%d: BMS HighBatteryTemp (warning)\r\n", (int)u8DockNo);
+        SET_BIT(u32FaultCode, BMS_WARN_HIGH_TEMP);
+    }
+    if (sFrame.LevdcRX_500ID_Info.u8BatterVoltageDeviError)
+    {
+        SYS_CONSOLE_PRINT("G%d: BMS VoltageDeviation (warning)\r\n", (int)u8DockNo);
+        SET_BIT(u32FaultCode, BMS_WARN_VOLTAGE_DEVIATION);
+    }
+
+    SESSION_SetBMSFaultBitmap(u8DockNo, u32FaultCode);
+    return ((u32FaultCode & 0x0000FFFFUL) != 0U);
+
+#elif (CHARGING_PROTOCOL == PROTOCOL_TVS_PROP)
+    TVS_MsgFrameInfo_t sFrame = {0};
+    (void)bGetSetTVSBMSData(u8DockNo, &sFrame, GET_PARA);
+
+    if (sFrame.TVS_Rx100_BMSStatus.u8ErrorState == (uint8_t)TVS_BMS_ERR_STOP_CHARGING)
+    {
+        SYS_CONSOLE_PRINT("G%d -> BMS Stop Charging request\r\n", (int)u8DockNo);
+        uint32_t u32FaultCode = 0U;
+        SET_BIT(u32FaultCode, (1U << 0)); // Define appropriate bit for TVS BMS error
+        SESSION_SetBMSFaultBitmap(u8DockNo, u32FaultCode);
+        return true;
+    }
+    return false;
+#endif
+}
+
+
+/* ============================================================
+ * SECTION 6: COMMON FAULT / STOP HANDLING
+ * (protocol-independent — uses session DB and GPIO)
+ * ============================================================ */
+
+/**
+ * @brief  Top-level stop condition check called each task cycle.
+ *
+ *         Checks in order:
+ *           1. User stop (auth command = 0 during charging)
+ *           2. Fault conditions (with cooldown to avoid rapid toggling)
+ *
+ * @param  u8DockNo  Dock index
+ * @return true if a stop/fault condition requires state machine intervention
+ */
+static bool bCheckStopCondition(uint8_t u8DockNo)
+{
+    static uint32_t u32FaultCheckCooldownTick[MAX_DOCKS] = {0};
+    CH_State_e eState = SESSION_GetChargingState(u8DockNo);
+
+    /* 1. User stop command */
+    if ((eState == CH_STATE_CHARGING) && (SESSION_GetAuthenticationCommand(u8DockNo) == 0U))
+    {
+        SYS_CONSOLE_PRINT("[GUN %d] User Stop Command Received\r\n", (int)u8DockNo);
+        SESSION_SetSessionEndReason(u8DockNo, STOP_REASON_MCU_REQUEST);
+        return true;
+    }
+
+    /* 2. Fault check (with cooldown) */
+    if (xTaskGetTickCount() >= u32FaultCheckCooldownTick[u8DockNo])
+    {
+        if (bCheckFaultCondition(u8DockNo) == true)
+        {
+            u32FaultCheckCooldownTick[u8DockNo] = xTaskGetTickCount() +
+                                                   pdMS_TO_TICKS(FAULT_CHECK_COOLDOWN_MS);
+            SESSION_SetSessionEndReason(u8DockNo, STOP_REASON_FAULT);
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * @brief  Evaluate all fault sources and compose system fault bitmap.
+ *
+ *         Fault sources checked:
+ *           - E-Stop GPIO
+ *           - BMS fault (protocol-specific via bGetBMSFaultStatus)
+ *           - PM fault (fault code bitmap from session DB)
+ *           - BMS CAN timeout
+ *           - PM CAN timeout
+ *           - Zero-current fault (sustained low current during charging)
+ *           - Pre-charge timeout
+ *
+ * @param  u8DockNo  Dock index
+ * @return true if any critical fault (bits 0–15 of bitmap) is set
+ */
+static bool bCheckFaultCondition(uint8_t u8DockNo)
+{
+    uint32_t u32SystemFault = 0U;
+
+    if (bCheckEStopFault(u8DockNo))
+    {
+        SET_BIT(u32SystemFault, SYSTEM_FAULT_ESTOP_TRIGGERED);
+    }
+    if (bCheckBMSFault(u8DockNo))
+    {
+        SET_BIT(u32SystemFault, SYSTEM_FAULT_BMS_ERROR);
+    }
+    if (bCheckPMFault(u8DockNo))
+    {
+        SET_BIT(u32SystemFault, SYSTEM_FAULT_PM_ERROR);
+    }
+    if (bCheckBMSStatus(u8DockNo))
+    {
+        SET_BIT(u32SystemFault, SYSTEM_FAULT_BMS_COMMUNICATION_FAILURE);
+    }
+    if (bCheckPMStatus(u8DockNo))
+    {
+        SET_BIT(u32SystemFault, SYSTEM_FAULT_PM_COMMUNICATION_FAILURE);
+    }
+    if (bCheckZeroCurrentFault(u8DockNo))
+    {
+        SET_BIT(u32SystemFault, SYSTEM_FAULT_PM_ZERO_CURRENT);
+    }
+    if (bCheckPrechargeFailure(u8DockNo))
+    {
+        SET_BIT(u32SystemFault, SYSTEM_FAULT_PRECHARGE_FAILURE);
+    }
+
+    SESSION_SetSystemFaultBitmap(u8DockNo, u32SystemFault);
+    return ((u32SystemFault & 0x0000FFFFUL) != 0U);
+}
+
+/** @brief Check Emergency Stop GPIO input. */
+static bool bCheckEStopFault(uint8_t u8DockNo)
+{
+    return (bGPIO_Operation(DI_E_STOP_STATUS, u8DockNo) == true);
+}
+
+/**
+ * @brief  Debounced BMS fault check.
+ *         BMS fault must persist for BMS_FAULT_DEBOUNCE_MS before triggering.
+ */
+static bool bCheckBMSFault(uint8_t u8DockNo)
+{
+    static uint32_t u32BMSFaultTicks[MAX_DOCKS] = {0};
+    uint32_t u32CurrentTick = xTaskGetTickCount();
+    CH_State_e eState = SESSION_GetChargingState(u8DockNo);
+    bool bBMSFault = bGetBMSFaultStatus(u8DockNo);
+
+    if ((bBMSFault == true) && (eState == CH_STATE_CHARGING))
+    {
+        if (u32BMSFaultTicks[u8DockNo] == 0U)
+        {
+            u32BMSFaultTicks[u8DockNo] = u32CurrentTick + pdMS_TO_TICKS(BMS_FAULT_DEBOUNCE_MS);
+        }
+        if (u32CurrentTick >= u32BMSFaultTicks[u8DockNo])
+        {
+            SYS_CONSOLE_PRINT("G%d: BMS fault after %lu ms\r\n", (int)u8DockNo, BMS_FAULT_DEBOUNCE_MS);
+            u32BMSFaultTicks[u8DockNo] = 0U;
+            return true;
+        }
+    }
+    else
+    {
+        u32BMSFaultTicks[u8DockNo] = 0U;
+    }
+    return false;
+}
+
+/**
+ * @brief  Debounced PM fault check.
+ *         PM fault must persist for PM_FAULT_DEBOUNCE_MS before triggering.
+ */
+static bool bCheckPMFault(uint8_t u8DockNo)
+{
+    static uint32_t u32PMFaultTicks[MAX_DOCKS] = {0};
+    uint32_t u32CurrentTick = xTaskGetTickCount();
+    CH_State_e eState = SESSION_GetChargingState(u8DockNo);
+    bool bPMFault = bGetPMFaultStatus(u8DockNo);
+
+    if ((bPMFault == true) && (eState == CH_STATE_CHARGING))
+    {
+        if (u32PMFaultTicks[u8DockNo] == 0U)
+        {
+            u32PMFaultTicks[u8DockNo] = u32CurrentTick + pdMS_TO_TICKS(PM_FAULT_DEBOUNCE_MS);
+        }
+        if (u32CurrentTick >= u32PMFaultTicks[u8DockNo])
+        {
+            SYS_CONSOLE_PRINT("G%d: PM fault after %lu ms\r\n", (int)u8DockNo, PM_FAULT_DEBOUNCE_MS);
+            u32PMFaultTicks[u8DockNo] = 0U;
+            return true;
+        }
+    }
+    else
+    {
+        u32PMFaultTicks[u8DockNo] = 0U;
+    }
+    return false;
+}
+
+/**
+ * @brief  Evaluate PM fault code bitmap from session DB.
+ *         Returns true if any critical (bits 0-15) PM fault is active.
+ */
+static bool bGetPMFaultStatus(uint8_t u8DockNo)
+{
+    uint32_t u32FaultCode    = SESSION_GetPMFaultCode(u8DockNo);
+    uint32_t u32PMFaultBitmap = 0U;
+
+    if (u32FaultCode & (1U << 0))  { SET_BIT(u32PMFaultBitmap, PM_FAULT_INPUT_UNDERVOLT);
+        SYS_CONSOLE_PRINT("G%d: PM Input Undervoltage\r\n", (int)u8DockNo); }
+    if (u32FaultCode & (1U << 1))  { SET_BIT(u32PMFaultBitmap, PM_FAULT_PHASE_LOSS);
+        SYS_CONSOLE_PRINT("G%d: PM Phase Loss\r\n", (int)u8DockNo); }
+    if (u32FaultCode & (1U << 2))  { SET_BIT(u32PMFaultBitmap, PM_FAULT_INPUT_OVERVOLT);
+        SYS_CONSOLE_PRINT("G%d: PM Input Overvoltage\r\n", (int)u8DockNo); }
+    if (u32FaultCode & (1U << 3))  { SET_BIT(u32PMFaultBitmap, PM_FAULT_OUTPUT_OVERVOLT);
+        SYS_CONSOLE_PRINT("G%d: PM Output Overvoltage\r\n", (int)u8DockNo); }
+    if (u32FaultCode & (1U << 4))  { SET_BIT(u32PMFaultBitmap, PM_FAULT_OUTPUT_OVERCURRENT);
+        SYS_CONSOLE_PRINT("G%d: PM Output Overcurrent\r\n", (int)u8DockNo); }
+    if (u32FaultCode & (1U << 12)) { SET_BIT(u32PMFaultBitmap, PM_WARN_OUTPUT_UNDERVOLT);
+        SYS_CONSOLE_PRINT("G%d: PM Warn Output Undervolt\r\n", (int)u8DockNo); }
+    if (u32FaultCode & (1U << 13)) { SET_BIT(u32PMFaultBitmap, PM_WARN_OUTPUT_OVERVOLT);
+        SYS_CONSOLE_PRINT("G%d: PM Warn Output Overvolt\r\n", (int)u8DockNo); }
+    if (u32FaultCode & (1U << 14)) { SET_BIT(u32PMFaultBitmap, PM_WARN_POWER_LIMIT);
+        SYS_CONSOLE_PRINT("G%d: PM Warn Power Limit\r\n", (int)u8DockNo); }
+
+    SESSION_SetPMFaultBitmap(u8DockNo, u32PMFaultBitmap);
+    return ((u32PMFaultBitmap & 0x0000FFFFUL) != 0U);
+}
+
+/**
+ * @brief  BMS CAN communication timeout monitor.
+ *         Sets BMSRxStatus false if no frame received within BMS_COMMS_TIMEOUT_MS.
+ *         Returns true (fault) only during active charging.
+ */
+static bool bCheckBMSStatus(uint8_t u8DockNo)
+{
+    bool bRet = false;
+    uint32_t u32CurrentTick    = xTaskGetTickCount();
+    uint32_t u32LastBMSRxTick  = SESSION_GetBMSLastRxTime(u8DockNo);
+    CH_State_e eState          = SESSION_GetChargingState(u8DockNo);
+    uint32_t u32ElapsedMs      = (u32CurrentTick - u32LastBMSRxTick);
+
+    if (u32ElapsedMs >= BMS_COMMS_TIMEOUT_MS)
+    {
+        if (SESSION_GetBMSRxStatus(u8DockNo) == true)
+        {
+            SESSION_SetBMSRxStatus(u8DockNo, false);
+            SYS_CONSOLE_PRINT("G%d: BMS comms timeout (%lu ms)\r\n", (int)u8DockNo, u32ElapsedMs);
+        }
+        if (eState == CH_STATE_CHARGING) { bRet = true; }
+    }
+    else
+    {
+        if (u32LastBMSRxTick == 0U)
+        {
+            SESSION_SetBMSRxStatus(u8DockNo, false);
+        }
+        else if (SESSION_GetBMSRxStatus(u8DockNo) == false)
+        {
+            SESSION_SetBMSRxStatus(u8DockNo, true);
+            SYS_CONSOLE_PRINT("G%d: BMS comms restored (%lu ms)\r\n", (int)u8DockNo, u32ElapsedMs);
+        }
+    }
+    return bRet;
+}
+
+/**
+ * @brief  PM CAN communication timeout monitor.
+ *         Sets PMRxStatus false if no frame received within PM_COMMS_TIMEOUT_MS.
+ *         Returns true (fault) only during active charging.
+ */
+static bool bCheckPMStatus(uint8_t u8DockNo)
+{
+    bool bRet = false;
+    uint32_t u32CurrentTick   = xTaskGetTickCount();
+    uint32_t u32LastPMRxTick  = SESSION_GetPMLastRxTime(u8DockNo);
+    CH_State_e eState         = SESSION_GetChargingState(u8DockNo);
+    uint32_t u32ElapsedMs     = (u32CurrentTick - u32LastPMRxTick);
+
+    if (u32ElapsedMs >= PM_COMMS_TIMEOUT_MS)
+    {
+        if (SESSION_GetPMRxStatus(u8DockNo) == true)
+        {
+            SESSION_SetPMRxStatus(u8DockNo, false);
+            SYS_CONSOLE_PRINT("G%d: PM comms timeout (%lu ms)\r\n", (int)u8DockNo, u32ElapsedMs);
+        }
+        if (eState == CH_STATE_CHARGING) { bRet = true; }
+    }
+    else
+    {
+        if (u32LastPMRxTick == 0U)
+        {
+            SESSION_SetPMRxStatus(u8DockNo, false);
+        }
+        else if (SESSION_GetPMRxStatus(u8DockNo) == false)
+        {
+            SESSION_SetPMRxStatus(u8DockNo, true);
+            SYS_CONSOLE_PRINT("G%d: PM comms restored (%lu ms)\r\n", (int)u8DockNo, u32ElapsedMs);
+        }
+    }
+    return bRet;
+}
+
+/**
+ * @brief  Zero-current fault — sustained low current during charging.
+ *         PM output current below ZERO_CURRENT_THRESHOLD_A for
+ *         ZERO_CURRENT_FAULT_THRESHOLD_MS triggers fault.
+ */
+static bool bCheckZeroCurrentFault(uint8_t u8DockNo)
+{
+    static uint32_t u32ZeroCurrentTicks[MAX_DOCKS] = {0};
+    uint32_t u32CurrentTick = xTaskGetTickCount();
+    float fCurrent = SESSION_GetPmOutputCurrent(u8DockNo);
+    CH_State_e eState = SESSION_GetChargingState(u8DockNo);
+
+    if ((eState == CH_STATE_CHARGING) && (fCurrent < ZERO_CURRENT_THRESHOLD_A))
+    {
+        if (u32ZeroCurrentTicks[u8DockNo] == 0U)
+        {
+            u32ZeroCurrentTicks[u8DockNo] = u32CurrentTick + pdMS_TO_TICKS(ZERO_CURRENT_FAULT_THRESHOLD_MS);
+        }
+        if (u32CurrentTick > u32ZeroCurrentTicks[u8DockNo])
+        {
+            SYS_CONSOLE_PRINT("G%d: Zero current fault (I=%.2fA)\r\n",
+                              (int)u8DockNo, (double)fCurrent);
+            u32ZeroCurrentTicks[u8DockNo] = 0U;
+            return true;
+        }
+    }
+    else
+    {
+        u32ZeroCurrentTicks[u8DockNo] = 0U;
+    }
+    return false;
+}
+
+/**
+ * @brief  Pre-charge timeout — session stuck in pre-charge flow too long.
+ *         Fault triggers if not in CHARGING state and AUTH is active
+ *         for longer than PRECHARGE_FAIL_THRESHOLD_MS.
+ */
+static bool bCheckPrechargeFailure(uint8_t u8DockNo)
+{
+    static uint32_t u32PrechargeFailureTicks[MAX_DOCKS] = {0};
+    uint32_t u32CurrentTick = xTaskGetTickCount();
+
+    /* Only active when auth command is present but not yet charging */
+    if ((SESSION_GetAuthenticationCommand(u8DockNo) == 0U) ||
+        (SESSION_GetChargingState(u8DockNo) == CH_STATE_CHARGING))
+    {
+        u32PrechargeFailureTicks[u8DockNo] = 0U;
+        return false;
+    }
+
+    if (u32PrechargeFailureTicks[u8DockNo] == 0U)
+    {
+        u32PrechargeFailureTicks[u8DockNo] = u32CurrentTick + pdMS_TO_TICKS(PRECHARGE_FAIL_THRESHOLD_MS);
+        return false;
+    }
+
+    if (xTaskGetTickCount() >= u32PrechargeFailureTicks[u8DockNo])
+    {
+        SYS_CONSOLE_PRINT("G%d: Pre-charge failure timeout\r\n", (int)u8DockNo);
+        u32PrechargeFailureTicks[u8DockNo] = 0U;
+        return true;
+    }
+    return false;
+}
+
+
+/* ============================================================
+ * SECTION 7: COMMON ENERGY & TIME CALCULATION
+ * ============================================================ */
+
+/**
+ * @brief  Calculate and accumulate energy delivered during charging session.
+ *
+ *         Runs every ENERGY_CALC_INTERVAL_MS during CH_STATE_CHARGING.
+ *         Energy (kWh) = (V × I × dt) / (3600 × 1000)
+ *         Resets energy counter at CH_STATE_PRECHARGE (session start).
+ *         Logs final energy at CH_STATE_SESSION_COMPLETE.
+ *
+ * @param  u8DockNo  Dock index
+ */
+static void vEnergyTimeCalculation(uint8_t u8DockNo)
+{
+    static uint32_t u32PreviousTick[MAX_DOCKS] = {0};
+    const float fMinValidVoltage = 5.0f;
+    const float fMinValidCurrent = 1.0f;
+    CH_State_e eLiveStage = SESSION_GetChargingState(u8DockNo);
+
+    if (eLiveStage == CH_STATE_CHARGING)
+    {
+        uint32_t u32CurrentTick = xTaskGetTickCount();
+        if ((u32PreviousTick[u8DockNo] + pdMS_TO_TICKS(ENERGY_CALC_INTERVAL_MS)) <= u32CurrentTick)
+        {
+            u32PreviousTick[u8DockNo] = u32CurrentTick;
+
+            float fVoltage   = SESSION_GetPmOutputVoltage(u8DockNo);
+            float fCurrent   = SESSION_GetPmOutputCurrent(u8DockNo);
+            float fPowerWatt = fVoltage * fCurrent;
+            SESSION_SetOutputPower(u8DockNo, fPowerWatt);
+
+            if ((fVoltage > fMinValidVoltage) && (fCurrent > fMinValidCurrent))
+            {
+                float fDeltaKwh  = (fPowerWatt / 3600.0f) / FACTOR_1000_F;
+                float fNewEnergy = (float)SESSION_GetEnergyDelivered(u8DockNo) + fDeltaKwh;
+                SESSION_SetEnergyDelivered(u8DockNo, fNewEnergy);
+            }
+            else
+            {
+                SYS_CONSOLE_PRINT("[Gun %d] Invalid V/I (V=%.1f, I=%.1f)\r\n",
+                                  (int)u8DockNo, (double)fVoltage, (double)fCurrent);
+            }
+        }
+    }
+    else if (eLiveStage == CH_STATE_PRECHARGE)
+    {
+        SESSION_SetEnergyDelivered(u8DockNo, 0.0f);
+        u32PreviousTick[u8DockNo] = 0U;
+        SYS_CONSOLE_PRINT("[Gun %d] Session started — energy counter reset\r\n", (int)u8DockNo);
+    }
+    else if (eLiveStage == CH_STATE_SESSION_COMPLETE)
+    {
+        float fFinalEnergy = (float)SESSION_GetEnergyDelivered(u8DockNo);
+        SYS_CONSOLE_PRINT("[Gun %d] Session ended. Energy = %.3f kWh\r\n",
+                          (int)u8DockNo, (double)fFinalEnergy);
+        u32PreviousTick[u8DockNo] = 0U;
+    }
+}
+
+
+/* ============================================================
+ * SECTION 8: COMMON STATE HANDLER & TASK
+ * ============================================================ */
+
+/**
+ * @brief  Per-dock charging process handler called each task cycle.
+ *
+ *         Execution order:
+ *           1. Print system telemetry (rate-limited)
+ *           2. Update system state (LED, session lifecycle)
+ *           3. Update vehicle/PM demand info in session DB
+ *           4. Update energy accumulation
+ *           5. Evaluate stop conditions — force SHUTDOWN or ERROR if triggered
+ */
 static void vChargingProcessHandler(uint8_t u8DockNo)
 {
     vPrintSystemData(u8DockNo);
     updateSystemState(u8DockNo);
     vUpdateVehiclePMInfo(u8DockNo);
     vEnergyTimeCalculation(u8DockNo);
+
     CH_State_e eState = SESSION_GetChargingState(u8DockNo);
-    bool bStop = bCheckStopCondition(u8DockNo);
-    if (bStop == true)
+
+    if (bCheckStopCondition(u8DockNo) == true)
     {
         if ((eState == CH_STATE_CHARGING) || (eState == CH_STATE_PRECHARGE))
         {
-            SYS_CONSOLE_PRINT("[GUN %d] Fault Stop, fault Code: %d .\r\n", u8DockNo, SESSION_GetSystemFaultBitmap(u8DockNo));
+            SYS_CONSOLE_PRINT("[GUN %d] Fault Stop. FaultCode: 0x%08lX\r\n",
+                              (int)u8DockNo,
+                              SESSION_GetSystemFaultBitmap(u8DockNo));
             SESSION_SetChargingState(u8DockNo, CH_STATE_SHUTDOWN);
             SESSION_SetAuthenticationCommand(u8DockNo, 0U);
         }
@@ -765,136 +1474,34 @@ static void vChargingProcessHandler(uint8_t u8DockNo)
         }
     }
 }
-/* -----------------------
- * Vehicle & Power Module Update
- * ----------------------- */
-static void vUpdateVehiclePMInfo(uint8_t u8DockNo)
-{
-    float fDemandVoltage = 0U;
-    float fDemandCurrent = 0U;
-    uint16_t u16EstChrgTime = 0U;
-    uint16_t u16CurrentSoc = 0U;
-    /* Check if charging is active */
-    CH_State_e eLiveStage = SESSION_GetChargingState(u8DockNo);
-    if (eLiveStage != CH_STATE_CHARGING)
-        return;
-
-    ChargingMsgFrameInfo_t sChargingLiveInfo = {0};
-    (void)bGetSetLevdcBMSData(u8DockNo, &sChargingLiveInfo, GET_PARA);
-
-    fDemandVoltage = (sChargingLiveInfo.LevdcRX_500ID_Info.u16DcOutputVolTarget * FACTOR_0_1);
-    fDemandCurrent = (sChargingLiveInfo.LevdcRX_500ID_Info.u16ReqDcCurrent * FACTOR_0_1);
-    u16EstChrgTime = sChargingLiveInfo.LevdcRX_501ID_Info.u16EstimatedChargingTime;
-    u16CurrentSoc = sChargingLiveInfo.LevdcRX_501ID_Info.u8ChargingRate;
-
-    SESSION_SetBMSDemandVoltage(u8DockNo, fDemandVoltage);
-    SESSION_SetBMSDemandCurrent(u8DockNo, fDemandCurrent);
-
-    /* Common updates */
-    SESSION_SetEstimatedChargingTime(u8DockNo, u16EstChrgTime);
-    SESSION_SetCurrentSoc(u8DockNo, u16CurrentSoc);
-
-    /* Initialize initial SOC if not set */
-    if (SESSION_GetInitialSoc(u8DockNo) == 0U && u16CurrentSoc != 0)
-    {
-        SESSION_SetInitialSoc(u8DockNo, u16CurrentSoc);
-        SYS_CONSOLE_PRINT("GunNo: %d Initial SOC: %d\r\n", u8DockNo, u16CurrentSoc);
-    }
-}
 
 /**
- * @brief Perform manual energy and time calculation for charging session
+ * @brief  Update LED and session lifecycle flags on state change.
  *
- * @details
- * This function calculates energy using V * I over time (1-second interval).
- * It updates session energy, total energy, and charging time.
- *
- * @param u8DockNo Gun index
- */
-static void vEnergyTimeCalculation(uint8_t u8DockNo)
-{
-    static uint32_t u32PreviousTick[MAX_DOCKS] = {0};
-    const float fMinValidVoltage = 5.0f;
-    const float fMinValidCurrent = 1.0f;
-    
-    CH_State_e eLiveStage = SESSION_GetChargingState(u8DockNo);
-
-    /* ======================= CHARGING ACTIVE ======================= */
-    if (eLiveStage == CH_STATE_CHARGING)
-    {
-        uint32_t u32CurrentTick = xTaskGetTickCount();
-
-        /* Execute every 1 second */
-        if ((u32PreviousTick[u8DockNo] + pdMS_TO_TICKS(1000U)) <= u32CurrentTick)
-        {
-            u32PreviousTick[u8DockNo] = u32CurrentTick;
-
-            float fVoltage = SESSION_GetPmOutputVoltage(u8DockNo);
-            float fCurrent = SESSION_GetPmOutputCurrent(u8DockNo);
-            /* Power (W) = V * I */
-            float fPowerWatt = fVoltage * fCurrent;
-            SESSION_SetOutputPower(u8DockNo, fPowerWatt);
-            if ((fVoltage > fMinValidVoltage) && (fCurrent > fMinValidCurrent))
-            {
-                /* Energy for 1 second: Wh = W / 3600 */
-                float fDeltaWh = fPowerWatt / 3600.0f;
-                /* Convert Wh → kWh */
-                float fDeltaKwh = fDeltaWh / FACTOR_1000_F;
-                float fTotalEnergy = SESSION_GetEnergyDelivered(u8DockNo);
-                float fNewEnergy = fTotalEnergy + fDeltaKwh;
-
-                SESSION_SetEnergyDelivered(u8DockNo, fNewEnergy);
-            }
-            else
-            {
-                SYS_CONSOLE_PRINT("[Gun %d] Invalid V/I (V=%d, I=%d)\r\n", u8DockNo, fVoltage, fCurrent);
-            }
-        }
-    }
-
-    /* ======================= SESSION START ======================= */
-    else if (eLiveStage == CH_STATE_PRECHARGE)
-    {
-        float fStartEnergy = 0.0f;
-        SESSION_SetEnergyDelivered(u8DockNo, fStartEnergy);
-        u32PreviousTick[u8DockNo] = 0U;
-        SYS_CONSOLE_PRINT("[Gun %d] Session started", u8DockNo);
-    }
-
-    /* ======================= SESSION END ======================= */
-    else if (eLiveStage == CH_STATE_SESSION_COMPLETE)
-    {
-        float fFinalEnergy = SESSION_GetEnergyDelivered(u8DockNo);
-        SYS_CONSOLE_PRINT("[Gun %d] Session ended. Energy = %.3f kWh\r\n", u8DockNo, fFinalEnergy);
-        u32PreviousTick[u8DockNo] = 0U;
-    }
-    else
-    {
-        // Do nothing 
-    }
-}
-/**
- * @brief Update system state based on charging state machine
- *
- * @param u8DockNo Dock/Gun index
+ *         Detects state transitions and:
+ *           - Sets LED color/blink pattern per state
+ *           - Resets BMS data on INIT
+ *           - Tracks session-active flag
+ *           - Triggers session cleanup (SESSION_ResetSession) when
+ *             session exits active states
  */
 static void updateSystemState(uint8_t u8DockNo)
 {
-    static uint8_t bSessionActive[MAX_DOCKS] = {0};
-    static uint8_t u8PrvLiveState[MAX_DOCKS] = {CH_STATE_INIT};
+    static uint8_t   bSessionActive[MAX_DOCKS]  = {0};
+    static uint8_t   u8PrvLiveState[MAX_DOCKS]  = {CH_STATE_INIT};
     CH_State_e eState = SESSION_GetChargingState(u8DockNo);
 
     if (eState != u8PrvLiveState[u8DockNo])
     {
+        u8PrvLiveState[u8DockNo] = (uint8_t)eState;
+
         switch (eState)
         {
-        /* ================= INIT ================= */
         case CH_STATE_INIT:
             vSetLedState(u8DockNo, LED_BLUE, LED_STATE_BLINK);
             SESSION_ResetBMSData(u8DockNo);
             break;
 
-        /* ================= PRE-CHARGING FLOW ================= */
         case CH_STATE_AUTH_SUCCESS:
         case CH_STATE_PARAM_VALIDATE:
         case CH_STATE_CONNECTION_CONFIRMED:
@@ -908,985 +1515,220 @@ static void updateSystemState(uint8_t u8DockNo)
             bSessionActive[u8DockNo] = 1U;
             break;
 
-        /* ================= ACTIVE CHARGING ================= */
         case CH_STATE_CHARGING:
             vSetLedState(u8DockNo, LED_GREEN, LED_STATE_STEADY);
             bSessionActive[u8DockNo] = 1U;
             break;
 
-        /* ================= SHUTDOWN / COMPLETE ================= */
         case CH_STATE_SHUTDOWN:
         case CH_STATE_SESSION_COMPLETE:
             vSetLedState(u8DockNo, LED_GREEN, LED_STATE_BLINK);
             break;
 
-        /* ================= ERROR ================= */
         case CH_STATE_ERROR:
             vSetLedState(u8DockNo, LED_RED, LED_STATE_STEADY);
             break;
 
-        /* ================= DEFAULT ================= */
         default:
-            SYS_CONSOLE_PRINT("Unknown state for Gun %d: %d\r\n", u8DockNo, eState);
+            SYS_CONSOLE_PRINT("G%d: Unknown state %d\r\n", (int)u8DockNo, (int)eState);
             vSetLedState(u8DockNo, LED_RED, LED_STATE_BLINK);
             break;
         }
 
-        /* ================= SESSION CLEANUP ================= */
-        if ((eState != CH_STATE_AUTH_SUCCESS) &&
-            (eState != CH_STATE_PARAM_VALIDATE) &&
-            (eState != CH_STATE_CONNECTION_CONFIRMED) &&
-            (eState != CH_STATE_INITIALIZE) &&
-            (eState != CH_STATE_PRECHARGE) &&
-            (eState != CH_STATE_CHARGING) &&
-            bSessionActive[u8DockNo])
-        {
-            SYS_CONSOLE_PRINT("Session cleanup for Gun %d\r\n", u8DockNo);
+        /* Session cleanup: reset session once it exits active states */
+        bool bIsActiveState = ((eState == CH_STATE_AUTH_SUCCESS)         ||
+                               (eState == CH_STATE_PARAM_VALIDATE)       ||
+                               (eState == CH_STATE_CONNECTION_CONFIRMED) ||
+                               (eState == CH_STATE_INITIALIZE)           ||
+                               (eState == CH_STATE_PRECHARGE)            ||
+                               (eState == CH_STATE_CHARGING));
 
+        if ((!bIsActiveState) && (bSessionActive[u8DockNo] != 0U))
+        {
+            SYS_CONSOLE_PRINT("G%d: Session cleanup\r\n", (int)u8DockNo);
             bSessionActive[u8DockNo] = 0U;
             SESSION_ResetSession(u8DockNo);
         }
     }
 }
 
+/**
+ * @brief  CHARGING_TASK — Main FreeRTOS task loop.
+ *         Iterates over all docks each cycle, calling the process handler
+ *         followed by the state machine dispatcher.
+ */
+static void CHARGING_TASK(void *pvParameters)
+{
+    (void)pvParameters;
+    SYS_CONSOLE_PRINT("CHARGING_TASK started\r\n");
 
+    for (;;)
+    {
+        for (uint8_t u8DockNo = DOCK_1; u8DockNo < MAX_DOCKS; u8DockNo++)
+        {
+            vChargingProcessHandler(u8DockNo);
+            Charging_StateMachine(u8DockNo);
+        }
+        vTaskDelay(pdMS_TO_TICKS(CHARGING_TASK_DELAY_MS));
+    }
+}
+
+
+/* ============================================================
+ * SECTION 9: LED CONTROL
+ * ============================================================ */
+
+/**
+ * @brief  Set LED color and blink/steady state for a dock.
+ *
+ * @param  u8DockNo  Dock index
+ * @param  ledColor  LED_RED, LED_GREEN, or LED_BLUE
+ * @param  ledState  LED_STATE_STEADY or LED_STATE_BLINK
+ */
 void vSetLedState(uint8_t u8DockNo, uint8_t ledColor, uint8_t ledState)
 {
+    /* TODO: Connect to hardware LED driver */
+    (void)u8DockNo;
     switch (ledColor)
     {
-    case LED_RED:
-        break;
-    case LED_GREEN:
-        break;
-    case LED_BLUE:
-        break;
-    default:
-        // Invalid LED color
-        break;
+    case LED_RED:   /* TODO: set red LED */   break;
+    case LED_GREEN: /* TODO: set green LED */ break;
+    case LED_BLUE:  /* TODO: set blue LED */  break;
+    default:                                  break;
     }
-}
-
-static bool bCheckStopCondition(uint8_t u8DockNo)
-{
-    static uint32_t u32FaultCheckCooldownTick[MAX_DOCKS] = {0};
-    CH_State_e eState = SESSION_GetChargingState(u8DockNo);
-    // 1. User stop
-    if ((eState == CH_STATE_CHARGING) && (SESSION_GetAuthenticationCommand(u8DockNo) == 0U))
-    {
-        SYS_CONSOLE_PRINT("[GUN %d] User Stop Command Received\r\n", u8DockNo);
-        SESSION_SetSessionEndReason(u8DockNo, STOP_REASON_MCU_REQUEST);
-        return true;
-    }
-
-    // 2. Fault Condition
-    if (xTaskGetTickCount() >= u32FaultCheckCooldownTick[u8DockNo])
-    {
-        if (bCheckFaultCondition(u8DockNo) == true)
-        {
-            u32FaultCheckCooldownTick[u8DockNo] = xTaskGetTickCount() + pdMS_TO_TICKS(FAULT_CHECK_COOLDOWN_MS);
-            SESSION_SetSessionEndReason(u8DockNo, STOP_REASON_FAULT);
-            return true;
-        }
-    }
-    return false;
-}
-static bool bCheckFaultCondition(uint8_t u8DockNo)
-{
-    uint32_t u32SystemFault = 0;
-
-    /* -------- Critical Faults -------- */
-
-    if (bCheckEStopFault(u8DockNo))
-    {
-        SET_BIT(u32SystemFault, SYSTEM_FAULT_ESTOP_TRIGGERED);
-    }
-
-    if (bCheckBMSFault(u8DockNo))
-    {
-        SET_BIT(u32SystemFault, SYSTEM_FAULT_BMS_ERROR);
-    }
-
-    if (bCheckPMFault(u8DockNo))
-    {
-        SET_BIT(u32SystemFault, SYSTEM_FAULT_PM_ERROR);
-    }
-
-    if (bCheckBMSStatus(u8DockNo))
-    {
-        SET_BIT(u32SystemFault, SYSTEM_FAULT_BMS_COMMUNICATION_FAILURE);
-    }
-
-    if (bCheckPMStatus(u8DockNo))
-    {
-        SET_BIT(u32SystemFault, SYSTEM_FAULT_PM_COMMUNICATION_FAILURE);
-    }
-
-    if (bCheckZeroCurrentFault(u8DockNo))
-    {
-        SET_BIT(u32SystemFault, SYSTEM_FAULT_PM_ZERO_CURRENT);
-    }
-
-    if (bCheckPrechargeFailure(u8DockNo))
-    {
-        SET_BIT(u32SystemFault, SYSTEM_FAULT_PRECHARGE_FAILURE);
-    }
-
-    /* Store complete bitmap */
-    SESSION_SetSystemFaultBitmap(u8DockNo, u32SystemFault);
-
-    /* Return TRUE if any critical fault (0–15 bits set) */
-    if (u32SystemFault & 0x0000FFFF)
-    {
-        return true;
-    }
-
-    return false;
-}
-
-static bool bCheckEStopFault(uint8_t u8DockNo)
-{
-    if (bGPIO_Operation(DI_E_STOP_STATUS, u8DockNo) == true)
-    {
-        return true;
-    }
-    return false;
+    (void)ledState;
 }
 
 
+/* ============================================================
+ * SECTION 10: DEBUG / TELEMETRY PRINT FUNCTIONS
+ * ============================================================ */
 
-static bool bCheckBMSFault(uint8_t u8DockNo)
+/**
+ * @brief  Rate-limited system telemetry printer.
+ *         Prints every PRINT_INTERVAL_MS or on state change.
+ */
+static void vPrintSystemData(uint8_t u8DockNo)
 {
-    static uint32_t u32BMSFaultTicks[MAX_DOCKS] = {0};
-    const uint32_t u32FaultThresholdMs = 2000U; // 2 second threshold
-    uint32_t u32CurrentTick = xTaskGetTickCount();
-    CH_State_e eState = SESSION_GetChargingState(u8DockNo);
-    bool bBMSFault = bGetBMSFaultStatus(u8DockNo);
-    if ((bBMSFault == true) && (eState == CH_STATE_CHARGING))
+    static uint32_t   u32NextPrintTick[MAX_DOCKS]   = {0};
+    static CH_State_e prevChargingState[MAX_DOCKS]  = {CH_STATE_INIT};
+
+    uint32_t u32CurrentTick  = xTaskGetTickCount();
+    CH_State_e eState        = SESSION_GetChargingState(u8DockNo);
+
+    if ((u32CurrentTick > u32NextPrintTick[u8DockNo]) ||
+        (eState != prevChargingState[u8DockNo]))
     {
-        if (u32BMSFaultTicks[u8DockNo] == 0U)
-        {
-            u32BMSFaultTicks[u8DockNo] = u32CurrentTick;
-        }
+        prevChargingState[u8DockNo] = eState;
+        u32NextPrintTick[u8DockNo]  = u32CurrentTick + pdMS_TO_TICKS(PRINT_INTERVAL_MS);
 
-        uint32_t u32ElapsedMs = (u32CurrentTick - u32BMSFaultTicks[u8DockNo]) * portTICK_PERIOD_MS;
-        if (u32ElapsedMs >= u32FaultThresholdMs)
-        {
-            SYS_CONSOLE_PRINT("BMS fault triggered for Gun %d after %lu ms\r\n", u8DockNo, u32ElapsedMs);
-            u32BMSFaultTicks[u8DockNo] = 0U;
-            return true;
-        }
-    }
-    else
-    {
-        u32BMSFaultTicks[u8DockNo] = 0U;
-    }
-    return false;
-}
-
-/* Dependent function for BMS fault status */
-static bool bGetBMSFaultStatus(uint8_t u8DockNo)
-{
-    TVS_MsgFrameInfo_t sTVSFrame = {0};
-    (void)bGetSetTVSBMSData(u8DockNo, &sTVSFrame, GET_PARA);
-
-    uint8_t u8BMSError    = sTVSFrame.TVS_Rx100_BMSStatus.u8ErrorState;
-     /* --- Error / stop check --- */
-    if (u8BMSError == TVS_BMS_ERR_STOP_CHARGING)
-    {
-        SYS_CONSOLE_PRINT("G%d -> BMS Stop Charging request\r\n", (int)u8DockNo);
-        return true;
-    }
-#if 0
-    ChargingMsgFrameInfo_t sChargingLiveInfo = {0};
-    uint32_t u32FaultCode = 0;
-
-    if (bGetSetLevdcBMSData(u8DockNo, &sChargingLiveInfo, GET_PARA) == false)
-    {
-        SYS_CONSOLE_PRINT("MAIN: [Dock %d] BMS data read failed\r\n", u8DockNo);
-        return true;
-    }
-
-    /* -------- Critical Faults -------- */
-
-    if (sChargingLiveInfo.LevdcRX_500ID_Info.u8EnergyTransferError)
-    {
-        SYS_CONSOLE_PRINT("MAIN: [Dock %d] EnergyTransferError\r\n", u8DockNo);
-        SET_BIT(u32FaultCode, BMS_FAULT_ENERGY_TRANSFER_ERROR);
-    }
-
-    // if (sChargingLiveInfo.LevdcRX_500ID_Info.u8EvConStatus)
-    // {
-    //     SYS_CONSOLE_PRINT("MAIN: [Dock %d] EvConStatus\r\n", u8DockNo);
-    //     SET_BIT(u32FaultCode, BMS_FAULT_EV_CON_STATUS);
-    // }
-
-    if (sChargingLiveInfo.LevdcRX_500ID_Info.u8EvChargingStopControl)
-    {
-        SYS_CONSOLE_PRINT("MAIN: [Dock %d] ChargingStopControl\r\n", u8DockNo);
-        SET_BIT(u32FaultCode, BMS_FAULT_CHARGING_STOP_CONTROL);
-    }
-
-    if (sChargingLiveInfo.LevdcRX_500ID_Info.u8BatteryOverVol)
-    {
-        SYS_CONSOLE_PRINT("MAIN: [Dock %d] BatteryOverVoltage\r\n", u8DockNo);
-        SET_BIT(u32FaultCode, BMS_FAULT_BATTERY_OVERVOLT);
-    }
-
-    /* -------- Warnings -------- */
-
-    if (sChargingLiveInfo.LevdcRX_500ID_Info.u8HighBatteryTemp)
-    {
-        SYS_CONSOLE_PRINT("MAIN: [Dock %d] HighBatteryTemp\r\n", u8DockNo);
-        SET_BIT(u32FaultCode, BMS_WARN_HIGH_TEMP);
-    }
-
-    if (sChargingLiveInfo.LevdcRX_500ID_Info.u8BatterVoltageDeviError)
-    {
-        SYS_CONSOLE_PRINT("MAIN: [Dock %d] VoltageDeviation\r\n", u8DockNo);
-        SET_BIT(u32FaultCode, BMS_WARN_VOLTAGE_DEVIATION);
-    }
-
-    /* Store final fault bitmap */
-    SESSION_SetBMSFaultBitmap(u8DockNo, u32FaultCode);
-
-    /* Return TRUE if any critical fault */
-    if (u32FaultCode & 0x0000FFFF)
-    {
-        return true;
-    }
-#endif
-    return false;
-}
-
-static bool bCheckPMFault(uint8_t u8DockNo)
-{
-    static uint32_t u32PMFaultTicks[MAX_DOCKS] = {0};
-    const uint32_t u32FaultThresholdMs = 2000U; // 2 second threshold
-    uint32_t u32CurrentTick = xTaskGetTickCount();
-    CH_State_e eState = SESSION_GetChargingState(u8DockNo);
-    bool bPMFault = bGetPMFaultStatus(u8DockNo);
-    if ((bPMFault == true) && (eState == CH_STATE_CHARGING))
-    {
-        if (u32PMFaultTicks[u8DockNo] == 0U)
-        {
-            u32PMFaultTicks[u8DockNo] = u32CurrentTick;
-        }
-        
-        uint32_t u32ElapsedMs = (u32CurrentTick - u32PMFaultTicks[u8DockNo]) * portTICK_PERIOD_MS;
-        if (u32ElapsedMs >= u32FaultThresholdMs)
-        {
-            SYS_CONSOLE_PRINT("PM fault triggered for Gun %d after %lu ms\r\n", u8DockNo, u32ElapsedMs);
-            u32PMFaultTicks[u8DockNo] = 0U;
-            return true;
-        }
-    }
-    else
-    {
-        u32PMFaultTicks[u8DockNo] = 0U;
-    }
-    return false;
-}
-static bool bGetPMFaultStatus(uint8_t u8DockNo)
-{
-    uint32_t u32FaultCode = SESSION_GetPMFaultCode(u8DockNo);
-    uint32_t u32PMFaultBitmap = 0;
-
-    /* -------- Critical Faults (0–15) -------- */
-
-    if (u32FaultCode & (1U << 0))
-    {
-        SYS_CONSOLE_PRINT("MAIN: [Dock %d] PM Critical Fault: Module input undervoltage\r\n", u8DockNo);
-        SET_BIT(u32PMFaultBitmap, PM_FAULT_INPUT_UNDERVOLT);
-    }
-
-    if (u32FaultCode & (1U << 1))
-    {
-        SYS_CONSOLE_PRINT("MAIN: [Dock %d] PM Critical Fault: Module input phase loss\r\n", u8DockNo);
-        SET_BIT(u32PMFaultBitmap, PM_FAULT_PHASE_LOSS);
-    }
-
-    if (u32FaultCode & (1U << 2))
-    {
-        SYS_CONSOLE_PRINT("MAIN: [Dock %d] PM Critical Fault: Module input overvoltage\r\n", u8DockNo);
-        SET_BIT(u32PMFaultBitmap, PM_FAULT_INPUT_OVERVOLT);
-    }
-
-    if (u32FaultCode & (1U << 3))
-    {
-        SYS_CONSOLE_PRINT("MAIN: [Dock %d] PM Critical Fault: Module output overvoltage\r\n", u8DockNo);
-        SET_BIT(u32PMFaultBitmap, PM_FAULT_OUTPUT_OVERVOLT);
-    }
-
-    if (u32FaultCode & (1U << 4))
-    {
-        SYS_CONSOLE_PRINT("MAIN: [Dock %d] PM Critical Fault: Module output overcurrent\r\n", u8DockNo);
-        SET_BIT(u32PMFaultBitmap, PM_FAULT_OUTPUT_OVERCURRENT);
-    }
-
-    if (u32FaultCode & (1U << 5))
-    {
-        SYS_CONSOLE_PRINT("MAIN: [Dock %d] PM Critical Fault: Module temperature high\r\n", u8DockNo);
-        SET_BIT(u32PMFaultBitmap, PM_FAULT_OVER_TEMP);
-    }
-
-    if (u32FaultCode & (1U << 6))
-    {
-        SYS_CONSOLE_PRINT("MAIN: [Dock %d] PM Critical Fault: Module fan fault\r\n", u8DockNo);
-        SET_BIT(u32PMFaultBitmap, PM_FAULT_FAN_FAULT);
-    }
-
-    if (u32FaultCode & (1U << 7))
-    {
-        SYS_CONSOLE_PRINT("MAIN: [Dock %d] PM Critical Fault: Module hardware fault\r\n", u8DockNo);
-        SET_BIT(u32PMFaultBitmap, PM_FAULT_HW_FAULT);
-    }
-
-    if (u32FaultCode & (1U << 8))
-    {
-        SYS_CONSOLE_PRINT("MAIN: [Dock %d] PM Critical Fault: Bus exception\r\n", u8DockNo);
-        SET_BIT(u32PMFaultBitmap, PM_FAULT_BUS_EXCEPTION);
-    }
-
-    if (u32FaultCode & (1U << 9))
-    {
-        SYS_CONSOLE_PRINT("MAIN: [Dock %d] PM Critical Fault: SCI communication exception\r\n", u8DockNo);
-        SET_BIT(u32PMFaultBitmap, PM_FAULT_SCI_EXCEPTION);
-    }
-
-    if (u32FaultCode & (1U << 10))
-    {
-        SYS_CONSOLE_PRINT("MAIN: [Dock %d] PM Critical Fault: Discharge fault\r\n", u8DockNo);
-        SET_BIT(u32PMFaultBitmap, PM_FAULT_DISCHARGE_FAULT);
-    }
-
-    if (u32FaultCode & (1U << 11))
-    {
-        SYS_CONSOLE_PRINT("MAIN: [Dock %d] PM Critical Fault: PFC shutdown due to exception\r\n", u8DockNo);
-        SET_BIT(u32PMFaultBitmap, PM_FAULT_PFC_SHUTDOWN);
-    }
-
-    /* -------- Non-Critical Faults / Warnings (16–31) -------- */
-
-    if (u32FaultCode & (1U << 12))
-    {
-        SYS_CONSOLE_PRINT("MAIN: [Dock %d] PM Warning: Output undervoltage\r\n", u8DockNo);
-        SET_BIT(u32PMFaultBitmap, PM_WARN_OUTPUT_UNDERVOLT);
-    }
-
-    if (u32FaultCode & (1U << 13))
-    {
-        SYS_CONSOLE_PRINT("MAIN: [Dock %d] PM Warning: Output overvoltage\r\n", u8DockNo);
-        SET_BIT(u32PMFaultBitmap, PM_WARN_OUTPUT_OVERVOLT);
-    }
-
-    if (u32FaultCode & (1U << 14))
-    {
-        SYS_CONSOLE_PRINT("MAIN: [Dock %d] PM Warning: Power limit due to high\r\n", u8DockNo);
-        SET_BIT(u32PMFaultBitmap, PM_WARN_POWER_LIMIT);
-    }
-
-    /* Store final bitmap */
-    SESSION_SetPMFaultBitmap(u8DockNo, u32PMFaultBitmap);
-
-    /* Return TRUE if any critical fault (0–15 bits) */
-    if (u32PMFaultBitmap & 0x0000FFFF)
-    {
-        return true;
-    }
-
-    return false;
-}
-
-static bool bCheckBMSStatus(uint8_t u8DockNo)
-{
-    bool bRet = false;
-    const uint32_t u32FaultThresholdMs = 10000U; // 10 second threshold
-    uint32_t u32CurrentTick = xTaskGetTickCount();
-    uint32_t u32LastBMSRxTick = SESSION_GetBMSLastRxTime(u8DockNo);
-    CH_State_e eState = SESSION_GetChargingState(u8DockNo);
-    uint32_t u32ElapsedMs = (u32CurrentTick - u32LastBMSRxTick);
-
-    if (u32ElapsedMs >= u32FaultThresholdMs)
-    {
-        if (SESSION_GetBMSRxStatus(u8DockNo) == true)
-        {
-            SESSION_SetBMSRxStatus(u8DockNo, false);
-            SYS_CONSOLE_PRINT("BMS communication timeout for Gun %d: Last Rx %lu ms ago\r\n", u8DockNo, u32ElapsedMs);
-        }
+        vPrintStateAndDeviceInfo(u8DockNo);
         if (eState == CH_STATE_CHARGING)
         {
-            bRet = true;
-        }
-    }
-    else 
-    {
-        if (u32LastBMSRxTick == 0)
-        {
-            SESSION_SetBMSRxStatus(u8DockNo, false);
-        }
-        else if (SESSION_GetBMSRxStatus(u8DockNo) == false)
-        {
-            SESSION_SetBMSRxStatus(u8DockNo, true);
-            SYS_CONSOLE_PRINT("BMS communication restored for Gun %d: Last Rx %lu ms ago\r\n", u8DockNo, u32ElapsedMs);
-        }
-    }
-    return bRet;
-}
-
-static bool bCheckPMStatus(uint8_t u8DockNo)
-{
-    bool bRet = false;
-    const uint32_t u32FaultThresholdMs = 10000U; // 10 second threshold
-    uint32_t u32CurrentTick = xTaskGetTickCount();
-    uint32_t u32LastPMRxTick = SESSION_GetPMLastRxTime(u8DockNo);
-    CH_State_e eState = SESSION_GetChargingState(u8DockNo);
-    uint32_t u32ElapsedMs = (u32CurrentTick - u32LastPMRxTick);
-
-    if (u32ElapsedMs >= u32FaultThresholdMs)
-    {
-        if (SESSION_GetPMRxStatus(u8DockNo) == true)
-        {
-            SESSION_SetPMRxStatus(u8DockNo, false);
-            SYS_CONSOLE_PRINT("PM communication timeout for Gun %d: Last Rx %lu ms ago\r\n", u8DockNo, u32ElapsedMs);
-        }
-        if (eState == CH_STATE_CHARGING)
-        {
-            bRet = true;
-        }
-    }
-    else 
-    {
-        if (u32LastPMRxTick == 0)
-        {
-            SESSION_SetPMRxStatus(u8DockNo, false);
-        }
-        else if (SESSION_GetPMRxStatus(u8DockNo) == false)
-        {
-            SESSION_SetPMRxStatus(u8DockNo, true);
-            SYS_CONSOLE_PRINT("PM communication restored for Gun %d: Last Rx %lu ms ago\r\n", u8DockNo, u32ElapsedMs);
-        }
-    }
-    return bRet;
-}
-
-static bool bCheckZeroCurrentFault(uint8_t u8DockNo)
-{
-    static uint32_t u32ZeroCurrentTicks[MAX_DOCKS] = {0};
-    const uint32_t u32FaultThresholdMs = 30000U; // 30 second threshold
-    uint32_t u32CurrentTick = xTaskGetTickCount();
-    const float fZeroCurrentThreshold = 0.5f; // Threshold to consider as zero current
-    float fCurrent = SESSION_GetPmOutputCurrent(u8DockNo);
-    CH_State_e eState = SESSION_GetChargingState(u8DockNo);
-    
-    if ((eState == CH_STATE_CHARGING) && (fCurrent < fZeroCurrentThreshold)) // Threshold for zero current fault
-    {
-        if (u32ZeroCurrentTicks[u8DockNo] == 0U)
-        {
-            u32ZeroCurrentTicks[u8DockNo] = u32CurrentTick;
-        }
-        
-        uint32_t u32ElapsedMs = (xu32CurrentTick - u32ZeroCurrentTicks[u8DockNo]);
-        if (u32ElapsedMs >= u32FaultThresholdMs)
-        {
-            SYS_CONSOLE_PRINT("Zero current fault detected for Gun %d after %lu ms: Current = %.2f A\r\n", u8DockNo, u32ElapsedMs, fCurrent);
-            u32ZeroCurrentTicks[u8DockNo] = 0U;
-            return true;
-        }
-    }
-    else
-    {
-        u32ZeroCurrentTicks[u8DockNo] = 0U;
-    }
-    return false;
-}
-
-static bool bCheckPrechargeFailure(uint8_t u8DockNo)
-{
-    static uint32_t u32PrechargeFailureTicks[MAX_DOCKS] = {0};
-    const uint32_t u32FaultThresholdMs = 30000U; // 30 seconds
-    uint32_t u32CurrentTick = xTaskGetTickCount();
-    if ((SESSION_GetAuthenticationCommand(u8DockNo) == 0U) ||
-        (SESSION_GetChargingState(u8DockNo) == CH_STATE_CHARGING)){ // Only check during precharge phase
-        u32PrechargeFailureTicks[u8DockNo] = 0U;
-        return false;
-    }
-
-    if (u32PrechargeFailureTicks[u8DockNo] == 0U) {
-        u32PrechargeFailureTicks[u8DockNo] = u32CurrentTick + pdMS_TO_TICKS(u32FaultThresholdMs);
-        return false;
-    }
-
-    if (xTaskGetTickCount() >= u32PrechargeFailureTicks[u8DockNo]) {
-        SYS_CONSOLE_PRINT("Precharge failure detected for Dock %d\r\n", u8DockNo);
-        u32PrechargeFailureTicks[u8DockNo] = 0U;
-        return true;
-    }
-    return false;
-}
-
-void vPrintSystemData(uint8_t dockNo)
-{
-    uint32_t currentTick = xTaskGetTickCount();
-    static uint32_t u32NextPrintTick[MAX_DOCKS] = {0};
-    const uint32_t printIntervalTicks = pdMS_TO_TICKS(10000U); // 10 seconds
-    CH_State_e chargingState = SESSION_GetChargingState(dockNo);
-    static CH_State_e prevChargingState[MAX_DOCKS] = {CH_STATE_INIT};
-    /* Check if interval elapsed (overflow safe) */
-    if (currentTick > u32NextPrintTick[dockNo] || chargingState != prevChargingState[dockNo])
-    {
-        prevChargingState[dockNo] = chargingState;
-        u32NextPrintTick[dockNo] = currentTick + printIntervalTicks;
-        /* Print all system info */
-        vPrintStateAndDeviceInfo(dockNo);
-        if (chargingState == CH_STATE_CHARGING)
-        {
-            vPrintChargingInfo(dockNo);
+            vPrintChargingInfo(u8DockNo);
         }
     }
 }
-static void vPrintStateAndDeviceInfo(uint8_t dockNo)
+
+/** @brief Print state, auth, BMS/PM connectivity, and fault bitmaps. */
+static void vPrintStateAndDeviceInfo(uint8_t u8DockNo)
 {
-    uint8_t bmsStatus = SESSION_GetBMSRxStatus(dockNo);
-    uint8_t pmStatus  = SESSION_GetPMRxStatus(dockNo);
-
-    CH_State_e chargingState = SESSION_GetChargingState(dockNo);
-    uint32_t authCmd       = SESSION_GetAuthenticationCommand(dockNo);
-    uint32_t sysFault      = SESSION_GetSystemFaultBitmap(dockNo);
-    uint32_t bmsFault      = SESSION_GetBMSFaultBitmap(dockNo);
-    uint32_t pmFault       = SESSION_GetPMFaultBitmap(dockNo);
-
     SYS_CONSOLE_PRINT(
-        "\r\n================ CHARGING INFO - Dock %d ================\r\n"
-        "Charging State        : %s\r\n"
-        "Authentication Cmd    : %lu\r\n"
-        "BMS Status            : %s\r\n"
-        "PM Status             : %s\r\n"
-        "System Fault Bitmap   : 0x%08lX\r\n"
-        "BMS Fault Bitmap      : 0x%08lX\r\n"
-        "PM Fault Bitmap       : 0x%08lX\r\n"
+        "\r\n================ CHARGING INFO - Dock %d [%s] ================\r\n"
+        "Auth Cmd       : %lu\r\n"
+        "BMS Status     : %s\r\n"
+        "PM Status      : %s\r\n"
+        "System Fault   : 0x%08lX\r\n"
+        "BMS Fault      : 0x%08lX\r\n"
+        "PM Fault       : 0x%08lX\r\n"
         "=======================================================\r\n",
-        dockNo,
-        CH_GetStateString(chargingState),
-        authCmd,
-        bmsStatus ? "Connected" : "Disconnected",
-        pmStatus  ? "Connected" : "Disconnected",
-        sysFault,
-        bmsFault,
-        pmFault
+        (int)u8DockNo,
+        CH_GetStateString(SESSION_GetChargingState(u8DockNo)),
+        SESSION_GetAuthenticationCommand(u8DockNo),
+        SESSION_GetBMSRxStatus(u8DockNo) ? "Connected" : "Disconnected",
+        SESSION_GetPMRxStatus(u8DockNo)  ? "Connected" : "Disconnected",
+        SESSION_GetSystemFaultBitmap(u8DockNo),
+        SESSION_GetBMSFaultBitmap(u8DockNo),
+        SESSION_GetPMFaultBitmap(u8DockNo)
     );
 }
 
+/** @brief Print live charging metrics (SOC, V, I, energy). */
 static void vPrintChargingInfo(uint8_t u8DockNo)
 {
-    uint16_t u16CurrentSOC = SESSION_GetCurrentSoc(u8DockNo);
-    uint16_t u16InitialSOC = SESSION_GetInitialSoc(u8DockNo);
-    float fDemandVoltage = (float)SESSION_GetBMSDemandVoltage(u8DockNo);
-    float fDemandCurrent = SESSION_GetBMSDemandCurrent(u8DockNo);
-    float fOutputVoltage = (float)SESSION_GetPmOutputVoltage(u8DockNo);
-    float fOutputCurrent = (float)SESSION_GetPmOutputCurrent(u8DockNo);
-    uint16_t u16SessionTime = 0;//SESSION_GetSessionTime(u8DockNo);
-    float fSessionEnergy = (float)SESSION_GetEnergyDelivered(u8DockNo);
-
-    SYS_CONSOLE_PRINT("====================== CHARGING INFO - Dock %d ======================\r\n", u8DockNo);
-    SYS_CONSOLE_PRINT("Demand : [Voltage: %4.0f V] [Current: %4.0f A]\r\n", fDemandVoltage, fDemandCurrent);
-    SYS_CONSOLE_PRINT("Output : [Voltage: %4.0f V] [Current: %4.0f A]\r\n", fOutputVoltage, fOutputCurrent);
-    SYS_CONSOLE_PRINT("SOC : %3d%% (Initial: %3d%%)\r\n", u16CurrentSOC, u16InitialSOC);
-    SYS_CONSOLE_PRINT("Energy : %6.2f Wh\r\n", fSessionEnergy);
-    SYS_CONSOLE_PRINT("===================================================================\r\n");
+    SYS_CONSOLE_PRINT(
+        "=================== CHARGING METRICS - Dock %d ===================\r\n"
+        "Demand  : V=%4.0f V   I=%4.0f A\r\n"
+        "Output  : V=%4.0f V   I=%4.0f A\r\n"
+        "SOC     : %3d%% (Initial: %3d%%)\r\n"
+        "Energy  : %6.3f kWh\r\n"
+        "===================================================================\r\n",
+        (int)u8DockNo,
+        (double)SESSION_GetBMSDemandVoltage(u8DockNo),
+        (double)SESSION_GetBMSDemandCurrent(u8DockNo),
+        (double)SESSION_GetPmOutputVoltage(u8DockNo),
+        (double)SESSION_GetPmOutputCurrent(u8DockNo),
+        (int)SESSION_GetCurrentSoc(u8DockNo),
+        (int)SESSION_GetInitialSoc(u8DockNo),
+        (double)SESSION_GetEnergyDelivered(u8DockNo)
+    );
 }
 
-static const char* CH_GetStateString(CH_State_e state)
+/** @brief Convert CH_State_e to human-readable string for debug output. */
+static const char *CH_GetStateString(CH_State_e state)
 {
-    switch(state)
+    switch (state)
     {
-        case CH_STATE_INIT: return "INIT";
-        case CH_STATE_AUTH_SUCCESS: return "AUTH_SUCCESS";
-        case CH_STATE_PARAM_VALIDATE: return "PARAM_VALIDATE";
-        case CH_STATE_CONNECTION_CONFIRMED: return "CONNECTION_CONFIRMED";
-        case CH_STATE_INITIALIZE: return "INITIALIZE";
-        case CH_STATE_PRECHARGE: return "PRECHARGE";
-        case CH_STATE_CHARGING: return "CHARGING";
-        case CH_STATE_SHUTDOWN: return "SHUTDOWN";
-        case CH_STATE_SESSION_COMPLETE: return "SESSION_COMPLETE";
-        case CH_STATE_ERROR: return "ERROR";
-        default: return "UNKNOWN";
-    }
-}
-//////////////////////////////////////////////////////////////////////////////////
-
-
-/*==============================================================================
- * TVS CAN Signal Resolution & Offset Factors
- *============================================================================*/
-#define TVS_FACTOR_CURRENT_0x91        0.015625f   /* 0x91 CHARGER_Current resolution      */
-#define TVS_FACTOR_VOLTAGE_0x91        0.015625f   /* 0x91 CHARGER_TerminalVoltage res      */
-#define TVS_FACTOR_BMS_PROFILE         0.001f      /* 0x101 BMS profile signals resolution  */
-
-#define TVS_OFFSET_AC_INPUT            50          /* CHARGER_ACInput offset = 50V          */
-#define TVS_OFFSET_TEMPERATURE         50          /* CHARGER_Temperature offset = -50°C    */
-#define TVS_OFFSET_BMS_TEMPERATURE     30          /* BMS_Temperature offset = -30°C        */
-
-/*==============================================================================
- * TVS Charger Limits
- *============================================================================*/
-#define TVS_MAX_VOLTAGE                 128.0f      /* V  - BMS_Voltage max         */
-#define TVS_MAX_CURRENT                 65.535f     /* A  - BMS profile max         */
-#define TVS_MIN_AC_INPUT                50          /* V  - AC input min (offset)   */
-#define TVS_MAX_AC_INPUT                305         /* V  - AC input max            */
-#define TVS_SHUTOFF_DELAY_MS            pdMS_TO_TICKS(500)
-
-/*==============================================================================
- * TVS Byte 4 Bitfield Mask helpers (ErrorState=bits0-3, Fan=bit4, Output=bit5, Derating=bit6)
- *============================================================================*/
-#define TVS_BYTE4_ERR_MASK              0x0Fu
-#define TVS_BYTE4_FAN_MASK              0x10u
-#define TVS_BYTE4_OUTPUT_MASK           0x20u
-#define TVS_BYTE4_DERATING_MASK         0x40u
-
-
-
-/*==============================================================================
- * Static Live Data Store
- *============================================================================*/
- TVS_MsgFrameInfo_t TVS_LiveInfo[MAX_DOCKS];
-
-/*==============================================================================
- * Compile-time size assertions
- *============================================================================*/
-static_assert(sizeof(TVS_Tx90_Info_t)          == 8U, "TVS_Tx90_Info_t must be 8 bytes");
-static_assert(sizeof(TVS_Tx91_ChargeProfile_t) == 8U, "TVS_Tx91_ChargeProfile_t must be 8 bytes");
-static_assert(sizeof(TVS_Tx92_FMVersionInfo_t) == 8U, "TVS_Tx92_FMVersionInfo_t must be 8 bytes");
-static_assert(sizeof(TVS_Rx100_Status_t)       == 8U, "TVS_Rx100_Status_t must be 8 bytes");
-static_assert(sizeof(TVS_Rx101_Profile_t)      == 8U, "TVS_Rx101_Profile_t must be 8 bytes");
-
-/*==============================================================================
- * Signal Encode / Decode Helpers
- *============================================================================*/
-
-/* Encode physical -> raw */
-#define TVS_ENCODE_CHARGER_CURRENT(phys)     ((uint16_t)((phys) / TVS_FACTOR_CURRENT_0x91))
-#define TVS_ENCODE_CHARGER_VOLTAGE(phys)     ((uint16_t)((phys) / TVS_FACTOR_VOLTAGE_0x91))
-#define TVS_ENCODE_AC_INPUT(phys)            ((uint8_t)((phys)  - TVS_OFFSET_AC_INPUT))
-#define TVS_ENCODE_TEMPERATURE(phys)         ((uint8_t)((phys)  + TVS_OFFSET_TEMPERATURE))
-#define TVS_ENCODE_BMS_TEMPERATURE(phys)     ((uint8_t)((phys)  + TVS_OFFSET_BMS_TEMPERATURE))
-
-/* Decode raw -> physical */
-#define TVS_DECODE_CHARGER_CURRENT(raw)      ((float)(raw) * TVS_FACTOR_CURRENT_0x91)
-#define TVS_DECODE_CHARGER_VOLTAGE(raw)      ((float)(raw) * TVS_FACTOR_VOLTAGE_0x91)
-#define TVS_DECODE_BMS_PROFILE_CURRENT(raw)  ((float)(raw) * TVS_FACTOR_BMS_PROFILE)
-#define TVS_DECODE_BMS_PROFILE_VOLTAGE(raw)  ((float)(raw) * TVS_FACTOR_BMS_PROFILE)
-#define TVS_DECODE_AC_INPUT(raw)             ((uint16_t)(raw) + TVS_OFFSET_AC_INPUT)
-#define TVS_DECODE_TEMPERATURE(raw)          ((int16_t)(raw)  - TVS_OFFSET_TEMPERATURE)
-#define TVS_DECODE_BMS_TEMPERATURE(raw)      ((int16_t)(raw)  - TVS_OFFSET_BMS_TEMPERATURE)
-
-/*==============================================================================
- * GET/SET Function
- *============================================================================*/
-bool bGetSetTVSBMSData(uint8_t u8DockNo,
-                    TVS_MsgFrameInfo_t *psData,
-                    uint8_t u8Operation)
-{
-    bool bRet = false;
-
-    if ((psData == NULL) || (u8DockNo >= MAX_DOCKS)) {
-        return false;
-    }
-
-    taskENTER_CRITICAL();
-    switch (u8Operation)
-    {
-        case SET_PARA: {
-            memcpy((void *)&TVS_LiveInfo[u8DockNo],
-                   (const void *)psData,
-                   sizeof(TVS_MsgFrameInfo_t));
-            bRet = true;
-        }
-        break;
-        case GET_PARA: {
-            memcpy((void *)psData,
-                   (const void *)&TVS_LiveInfo[u8DockNo],
-                   sizeof(TVS_MsgFrameInfo_t));
-            bRet = true;
-        }
-        break;
-        default: {
-            bRet = false;
-        }
-        break;
-    }
-    taskEXIT_CRITICAL();
-    return bRet;
-}
-
-/*==============================================================================
- * State Function Prototypes
- *============================================================================*/
-static void vTVS_SendInitReq         (uint8_t u8DockNo);
-static void vTVS_AuthSuccess         (uint8_t u8DockNo);
-static void vTVS_ValidateParameters  (uint8_t u8DockNo);
-static void vTVS_ConnectionConfirmed (uint8_t u8DockNo);
-static void vTVS_InitializeState     (uint8_t u8DockNo);
-static void vTVS_PreChargingState    (uint8_t u8DockNo);
-static void vTVS_StartCharging       (uint8_t u8DockNo);
-static void vTVS_Shutdown            (uint8_t u8DockNo);
-static void vTVS_SessionComplete     (uint8_t u8DockNo);
-static void vTVS_SessionError        (uint8_t u8DockNo);
-
-/*==============================================================================
- * CH_STATE_INIT
- * - Populate charger identity and FW version
- * - Send initial frame to BMS
- * - Wait for authentication command from BMS
- *============================================================================*/
-static void vTVS_SendInitReq(uint8_t u8DockNo)
-{
-    TVS_MsgFrameInfo_t sTVSFrame = {0};
-    (void)bGetSetTVSBMSData(u8DockNo, &sTVSFrame, GET_PARA);
-    /* Charger identity */
-    sTVSFrame.TVS_Tx90_ChargerInfo.u8ChargerType  = TVS_CHARGER_TYPE_3KW_DELTA_OFFBOARD;
-    sTVSFrame.TVS_Tx90_ChargerInfo.u8ErrorState   = TVS_CHARGER_ERR_NONE;
-    sTVSFrame.TVS_Tx90_ChargerInfo.u8Fan          = TVS_FAN_OFF;
-    sTVSFrame.TVS_Tx90_ChargerInfo.u8Output       = TVS_OUTPUT_OFF;
-    sTVSFrame.TVS_Tx90_ChargerInfo.u8Derating     = TVS_DERATING_NONE;
-
-    /* Firmware version */
-    sTVSFrame.TVS_Tx92_FMVersionInfo.u8FWVersionMajor     = FW_VERSION_MAJOR;
-    sTVSFrame.TVS_Tx92_FMVersionInfo.u8FWVersionMinor     = FW_VERSION_MINOR;
-    sTVSFrame.TVS_Tx92_FMVersionInfo.u8FWVersionIteration = FW_VERSION_ITERATION;
-    sTVSFrame.TVS_Tx92_FMVersionInfo.u8FWChargerType      = FW_CHARGER_TYPE;
-    sTVSFrame.TVS_Tx92_FMVersionInfo.u8FWReleaseDateDD    = FW_RELEASE_DATE_DD;
-    sTVSFrame.TVS_Tx92_FMVersionInfo.u8FWReleaseDateMM    = FW_RELEASE_DATE_MM;
-    sTVSFrame.TVS_Tx92_FMVersionInfo.u8FWReleaseDateY1Y2  = FW_RELEASE_DATE_Y1Y2;
-    sTVSFrame.TVS_Tx92_FMVersionInfo.u8FWReleaseDateY3Y4  = FW_RELEASE_DATE_Y3Y4;
-
-    (void)bGetSetTVSBMSData(u8DockNo, &sTVSFrame, SET_PARA);
-
-    /* Advance only when BMS sends auth command */
-    if (SESSION_GetAuthenticationCommand(u8DockNo) == 1U)
-    {
-        SESSION_SetChargingState(u8DockNo, CH_STATE_AUTH_SUCCESS);
+    case CH_STATE_INIT:                 return "INIT";
+    case CH_STATE_AUTH_SUCCESS:         return "AUTH_SUCCESS";
+    case CH_STATE_PARAM_VALIDATE:       return "PARAM_VALIDATE";
+    case CH_STATE_CONNECTION_CONFIRMED: return "CONNECTION_CONFIRMED";
+    case CH_STATE_INITIALIZE:           return "INITIALIZE";
+    case CH_STATE_PRECHARGE:            return "PRECHARGE";
+    case CH_STATE_CHARGING:             return "CHARGING";
+    case CH_STATE_SHUTDOWN:             return "SHUTDOWN";
+    case CH_STATE_SESSION_COMPLETE:     return "SESSION_COMPLETE";
+    case CH_STATE_ERROR:                return "ERROR";
+    default:                            return "UNKNOWN";
     }
 }
 
-/*==============================================================================
- * CH_STATE_AUTH_SUCCESS
- * - Authentication acknowledged
- * - Immediately advance to parameter validation
- *============================================================================*/
-static void vTVS_AuthSuccess(uint8_t u8DockNo)
-{
-    SESSION_SetChargingState(u8DockNo, CH_STATE_PARAM_VALIDATE);
-}
 
-/*==============================================================================
- * CH_STATE_PARAM_VALIDATE
- * - Wait for first valid BMS Rx frame (0x100 + 0x101)
- * - Populate charger capability frame (0x90 + 0x91)
- * - Validate BMS demand against charger limits
- *============================================================================*/
-static void vTVS_ValidateParameters(uint8_t u8DockNo)
+/* ============================================================
+ * SECTION 11: PUBLIC API
+ * ============================================================ */
+
+/**
+ * @brief  Initialize and start the CHARGING_TASK FreeRTOS task.
+ *
+ * @return true  - Task created successfully
+ * @return false - Task creation failed
+ */
+bool ChargingTask_Init(void)
 {
-    if (SESSION_GetBMSRxStatus(u8DockNo) == false)
+    bool bStatus = false;
+
+    BaseType_t xTaskStatus = xTaskCreate(CHARGING_TASK,
+                                         CHARGING_TASK_NAME,
+                                         CHARGING_TASK_STACK_SIZE_WORDS,
+                                         NULL,
+                                         CHARGING_TASK_PRIORITY,
+                                         &xCHARGING_TASK);
+    if (xTaskStatus == pdPASS)
     {
-        SESSION_SetStartChargingComm(u8DockNo, false);
-        return;
-    }
-
-    TVS_MsgFrameInfo_t sTVSFrame = {0};
-    (void)bGetSetTVSBMSData(u8DockNo, &sTVSFrame, GET_PARA);
-
-    /* Decode BMS profile — physical values */
-    float fDemandVoltage = TVS_DECODE_BMS_PROFILE_VOLTAGE(sTVSFrame.TVS_Rx101_BMSProfile.u16MaxChargeVoltage);
-    float fDemandCurrent = TVS_DECODE_BMS_PROFILE_CURRENT(sTVSFrame.TVS_Rx101_BMSProfile.u16MaxChargeCurrent);
-
-    SYS_CONSOLE_PRINT("G%d -> BMS Profile V: %.3f  I: %.3f\r\n",
-                      (int)u8DockNo, (double)fDemandVoltage, (double)fDemandCurrent);
-
-    sTVSFrame.TVS_Tx90_ChargerInfo.u8ErrorState = TVS_CHARGER_ERR_NONE;
-    sTVSFrame.TVS_Tx90_ChargerInfo.u8Output     = TVS_OUTPUT_OFF;
-
-    SESSION_SetStartChargingComm(u8DockNo, true);
-    SESSION_SetChargingState(u8DockNo, CH_STATE_CONNECTION_CONFIRMED);
-    (void)bGetSetTVSBMSData(u8DockNo, &sTVSFrame, SET_PARA);
-}
-
-/*==============================================================================
- * CH_STATE_CONNECTION_CONFIRMED
- * - Read BMS demanded voltage / current (0x101)
- * - Validate against charger hardware limits
- * - Advance to INITIALIZE when within limits
- *============================================================================*/
-static void vTVS_ConnectionConfirmed(uint8_t u8DockNo)
-{
-    TVS_MsgFrameInfo_t sTVSFrame = {0};
-    (void)bGetSetTVSBMSData(u8DockNo, &sTVSFrame, GET_PARA);
-
-    /* Decode physical values from BMS profile */
-    float fDemandVoltage   = TVS_DECODE_BMS_PROFILE_VOLTAGE(sTVSFrame.TVS_Rx101_BMSProfile.u16MaxChargeVoltage);
-    float fDemandCurrent   = TVS_DECODE_BMS_PROFILE_CURRENT(sTVSFrame.TVS_Rx101_BMSProfile.u16MaxChargeCurrent);
-
-    /* Store in session */
-    SESSION_SetBMSDemandVoltage(u8DockNo, fDemandVoltage);
-    SESSION_SetBMSDemandCurrent(u8DockNo, fDemandCurrent);
-
-    SYS_CONSOLE_PRINT("G%d -> Demand V: %.3f  I: %.3f\r\n",
-                      (int)u8DockNo,
-                      (double)fDemandVoltage,
-                      (double)fDemandCurrent);
-
-    /* Charger error clear */
-    sTVSFrame.TVS_Tx90_ChargerInfo.u8ErrorState = TVS_CHARGER_ERR_NONE;
-    sTVSFrame.TVS_Tx90_ChargerInfo.u8Output     = TVS_OUTPUT_OFF;
-
-    (void)bGetSetTVSBMSData(u8DockNo, &sTVSFrame, SET_PARA);
-
-    /* Validate limits */
-    if ((fDemandVoltage <= TVS_MAX_VOLTAGE) && (fDemandCurrent <= TVS_MAX_CURRENT) &&
-        (fDemandVoltage != 0.0f) && (fDemandCurrent != 0.0f))
-    {
-        SESSION_SetChargingState(u8DockNo, CH_STATE_INITIALIZE);
-    }
-}
-
-/*==============================================================================
- * CH_STATE_INITIALIZE
- * - Wait for BMS ready signal (BMS_ErrorState == NO_ERROR)
- * - Gate to PRECHARGE once BMS is ready
- *============================================================================*/
-static void vTVS_InitializeState(uint8_t u8DockNo)
-{
-    TVS_MsgFrameInfo_t sTVSFrame = {0};
-    (void)bGetSetTVSBMSData(u8DockNo, &sTVSFrame, GET_PARA);
-
-    uint8_t u8BMSError = sTVSFrame.TVS_Rx100_BMSStatus.u8ErrorState;
-
-    if (u8BMSError == TVS_BMS_ERR_NONE)
-    {
-        SESSION_SetChargingState(u8DockNo, CH_STATE_PRECHARGE);
+        SYS_CONSOLE_PRINT("CHARGING_TASK created [Protocol: %s]\r\n",
+#if (CHARGING_PROTOCOL == PROTOCOL_17017_25)
+                          "LEVDC ISO 17017-25"
+#else
+                          "TVS Proprietary"
+#endif
+        );
+        vChargingCommunicationInit();
+        bStatus = true;
     }
     else
     {
-        /* BMS not ready — stay in CONNECTION_CONFIRMED */
-        SESSION_SetChargingState(u8DockNo, CH_STATE_CONNECTION_CONFIRMED);
+        SYS_CONSOLE_PRINT("CHARGING_TASK creation FAILED\r\n");
     }
-}
-
-/*==============================================================================
- * CH_STATE_PRECHARGE
- * - Apply pre-charge current from BMS profile (0x101 BMS_PreChargeCurrent)
- * - Turn on charger output
- * - Advance to CHARGING
- *============================================================================*/
-static void vTVS_PreChargingState(uint8_t u8DockNo)
-{
-    TVS_MsgFrameInfo_t sTVSFrame = {0};
-    (void)bGetSetTVSBMSData(u8DockNo, &sTVSFrame, GET_PARA);
-
-    /* Enable charger output and fan */
-    sTVSFrame.TVS_Tx90_ChargerInfo.u8Output   = TVS_OUTPUT_ON;
-    sTVSFrame.TVS_Tx90_ChargerInfo.u8Fan      = TVS_FAN_ON;
-    sTVSFrame.TVS_Tx90_ChargerInfo.u8Derating = TVS_DERATING_NONE;
-
-    (void)bGetSetTVSBMSData(u8DockNo, &sTVSFrame, SET_PARA);
-
-    SESSION_SetPMState(u8DockNo, RECTIFIER_ON);
-    SESSION_SetChargingState(u8DockNo, CH_STATE_CHARGING);
-}
-
-/*==============================================================================
- * CH_STATE_CHARGING
- * - Apply full charge current / voltage from BMS profile
- * - Report live output voltage / current back to BMS (0x91)
- * - Monitor BMS_ErrorState, SOC, temperature
- * - Apply derating on charger over-temperature
- * - Advance to SHUTDOWN on SOC complete or BMS stop request
- *============================================================================*/
-static void vTVS_StartCharging(uint8_t u8DockNo)
-{
-    TVS_MsgFrameInfo_t sTVSFrame = {0};
-    (void)bGetSetTVSBMSData(u8DockNo, &sTVSFrame, GET_PARA);
-
-    /* --- GPIO relay control --- */
-    bGPIO_Operation(DO_AC_RELAY_ON, u8DockNo);
-    bGPIO_Operation(DO_DC_RELAY_ON, u8DockNo);
-
-    float fOutputVoltage = SESSION_GetPmOutputVoltage(u8DockNo);
-    float fOutputCurrent = SESSION_GetPmOutputCurrent(u8DockNo);
-    /* --- Apply demand to charger profile --- */
-    sTVSFrame.TVS_Tx91_ChargeProfile.u16ChargingCurrent = TVS_ENCODE_CHARGER_CURRENT(fOutputCurrent);
-    sTVSFrame.TVS_Tx91_ChargeProfile.u16ChargingVoltage = TVS_ENCODE_CHARGER_VOLTAGE(fOutputVoltage);
-
-    /* --- Rolling counter update --- */
-    sTVSFrame.TVS_Tx90_ChargerInfo.u8Counter++;
-
-    (void)bGetSetTVSBMSData(u8DockNo, &sTVSFrame, SET_PARA);
-
-    /* Stay in CHARGING */
-    SESSION_SetChargingState(u8DockNo, CH_STATE_CHARGING);
-}
-
-/*==============================================================================
- * CH_STATE_SHUTDOWN
- * - Ramp down charger output to zero
- * - Turn off relays and rectifier
- * - Clear live frame after delay
- *============================================================================*/
-static void vTVS_Shutdown(uint8_t u8DockNo)
-{
-    /* Relays off first */
-    bGPIO_Operation(DO_AC_RELAY_OFF, u8DockNo);
-    bGPIO_Operation(DO_DC_RELAY_OFF, u8DockNo);
-    SESSION_SetPMState(u8DockNo, RECTIFIER_OFF);
-
-    TVS_MsgFrameInfo_t sTVSFrame = {0};
-    (void)bGetSetTVSBMSData(u8DockNo, &sTVSFrame, GET_PARA);
-
-    /* Zero out charge profile */
-    sTVSFrame.TVS_Tx91_ChargeProfile.u16ChargingCurrent = 0U;
-    sTVSFrame.TVS_Tx91_ChargeProfile.u16ChargingVoltage = 0U;
-
-    /* Safe charger info state */
-    sTVSFrame.TVS_Tx90_ChargerInfo.u8Output   = TVS_OUTPUT_OFF;
-    sTVSFrame.TVS_Tx90_ChargerInfo.u8Fan      = TVS_FAN_OFF;
-    sTVSFrame.TVS_Tx90_ChargerInfo.u8Derating = TVS_DERATING_NONE;
-
-    (void)bGetSetTVSBMSData(u8DockNo, &sTVSFrame, SET_PARA);
-
-    /* Shutoff delay then clear all live data */
-    vTaskDelay(TVS_SHUTOFF_DELAY_MS);
-    SESSION_SetStartChargingComm(u8DockNo, false);
-
-    (void)memset(&sTVSFrame, 0, sizeof(sTVSFrame));
-    (void)bGetSetTVSBMSData(u8DockNo, &sTVSFrame, SET_PARA);
-
-    SESSION_SetChargingState(u8DockNo, CH_STATE_SESSION_COMPLETE);
-}
-
-/*==============================================================================
- * CH_STATE_SESSION_COMPLETE
- * - Check for lingering faults
- * - Go to ERROR if fault present, else back to INIT
- *============================================================================*/
-static void vTVS_SessionComplete(uint8_t u8DockNo)
-{
-    if (SESSION_GetSystemFaultBitmap(u8DockNo) != SYSTEM_FAULT_NONE)
-    {
-        SESSION_SetChargingState(u8DockNo, CH_STATE_ERROR);
-    }
-    else
-    {
-        SESSION_SetChargingState(u8DockNo, CH_STATE_INIT);
-    }
-}
-
-/*==============================================================================
- * CH_STATE_ERROR
- * - Clear fault and return to INIT once system fault is resolved
- *============================================================================*/
-static void vTVS_SessionError(uint8_t u8DockNo)
-{
-    if (SESSION_GetSystemFaultBitmap(u8DockNo) == SYSTEM_FAULT_NONE)
-    {
-        SESSION_SetChargingState(u8DockNo, CH_STATE_INIT);
-    }
+    return bStatus;
 }
