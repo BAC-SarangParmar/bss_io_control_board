@@ -542,7 +542,7 @@ TCPIP_HTTP_NET_IO_RESULT TCPIP_HTTP_NET_ConnectionPostExecute(TCPIP_HTTP_NET_CON
         }
     }
 
-    saveOutputsToFlash(digitalOutputs, relayOutputs,serialnum);
+    saveOutputsToFlash(doStatus, relayStatus,serialnum);
     SYS_CONSOLE_MESSAGE("UART configuration saved to flash\r\n");
 
     cJSON_Delete(json);

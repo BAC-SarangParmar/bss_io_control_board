@@ -3,7 +3,7 @@
  * @brief   UART Handler Application Header File
  * @details This file provides function prototypes and macros for UART handling.
  * 
- * @company Bacancy - SunMobility
+ * @company BACANCY SYSTEMS PVT. LTD. 
  *******************************************************************************/
 
 #ifndef APP_UART_HANDLER_H
