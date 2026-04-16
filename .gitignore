@@ -1,7 +1,0 @@
-**/build/
-**/.generated_files/
-**/dist/
-*.bak*
-*.vscode/
-*LST
-*.obj
