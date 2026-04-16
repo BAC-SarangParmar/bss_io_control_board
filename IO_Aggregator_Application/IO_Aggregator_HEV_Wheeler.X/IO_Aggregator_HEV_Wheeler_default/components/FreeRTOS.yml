@@ -1,0 +1,75 @@
+configVersion: 1.0.0
+componentName: FreeRTOS
+coreVersion: 5.8.4
+device: PIC32CZ4010CA80208
+library: []
+dependency:
+- dependencyPackage: class com.microchip.mcc.harmony.HarmonyModule
+  name: FreeRTOS
+  type: module
+  version: ''
+- dependencyPackage: ''
+  name: FreeRTOS-Kernel
+  type: package
+  version: V11.2.0
+- dependencyPackage: ''
+  name: core
+  type: package
+  version: v3.15.1
+customDataClassName: com.microchip.utils_mh3.utils.persistence.CustomModuleData
+data:
+  attachments: {}
+  elementPosition:
+    attributes:
+      id: __ROOTVIEW
+    children:
+    - children:
+      - attributes:
+          id: FreeRTOS
+          x: '170'
+          y: '60'
+        type: ElementPosition
+      type: ElementPositions
+    type: ComponentGraph
+  symbols:
+    FREERTOS_ENABLE_HEAP_PROTECTOR:
+      attributes:
+        id: FREERTOS_ENABLE_HEAP_PROTECTOR
+      children:
+      - children:
+        - attributes:
+            value: 'false'
+          type: User
+        type: Values
+      type: Boolean
+    FREERTOS_HEAP_CLEAR_MEMORY_ON_FREE:
+      attributes:
+        id: FREERTOS_HEAP_CLEAR_MEMORY_ON_FREE
+      children:
+      - children:
+        - attributes:
+            value: 'false'
+          type: User
+        type: Values
+      type: Boolean
+    FREERTOS_MEMORY_MANAGEMENT_CHOICE:
+      attributes:
+        id: FREERTOS_MEMORY_MANAGEMENT_CHOICE
+      children:
+      - children:
+        - attributes:
+            value: Heap_3
+          type: User
+        type: Values
+      type: Combo
+    FREERTOS_TOTAL_HEAP_SIZE:
+      attributes:
+        id: FREERTOS_TOTAL_HEAP_SIZE
+      children:
+      - children:
+        - attributes:
+            value: '50960'
+          type: User
+        type: Values
+      type: Integer
+  userData: {}
