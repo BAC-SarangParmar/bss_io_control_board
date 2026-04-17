@@ -66,8 +66,8 @@ void SESSION_ResetPMData(uint8_t idx)
     SESSION_SetPMFaultBitmap(idx,   0UL);
     SESSION_SetPmOutputVoltage(idx, 0.0f);
     SESSION_SetPmOutputCurrent(idx, 0.0f);
-    SESSION_SetPmSetVoltage(idx,    0.0f);
-    SESSION_SetPmSetCurrent(idx,    0.0f);
+    SESSION_SetPmVoltageSetpoint(idx,    0.0f);
+    SESSION_SetPmCurrentSetpoint(idx,    0.0f);
     SESSION_SetOutputPower(idx,     0.0f);
 }
 

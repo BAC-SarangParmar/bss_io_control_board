@@ -100,6 +100,9 @@ typedef enum
     DOCK_1      = 1,   /**< Dock 1 → CAN0                       */
     DOCK_2      = 2,   /**< Dock 2 → CAN1                       */
     DOCK_3      = 3,   /**< Dock 3 → CAN2                       */
+    // DOCK_4      = 4,   /**< Dock 4 → CAN3                       */
+    // DOCK_5      = 5,   /**< Dock 5 → CAN4                       */
+    // DOCK_6      = 6,   /**< Dock 6 → CAN5                       */
     MAX_DOCKS          /**< Total array size (do not use as index)*/
 } Dock_e;
 
@@ -315,8 +318,8 @@ typedef struct
     float            fOutputPower_W;          /**< Instantaneous output power (W) ← FIXED type */
     float            fPmOutputVoltage;        /**< PM output voltage (V)             */
     float            fPmOutputCurrent;        /**< PM output current (A)             */
-    float            fPmSetVoltage;           /**< PM set-point voltage (V)          */
-    float            fPmSetCurrent;           /**< PM set-point current (A)          */
+    float            fPmSetPointVoltage;           /**< PM set-point voltage (V)          */
+    float            fPmSetPointCurrent;           /**< PM set-point current (A)          */
     float            fBMSDemandVoltage;       /**< BMS demanded voltage (V)          */
     float            fBMSDemandCurrent;       /**< BMS demanded current (A)          */
     float            fEnergyDelivered_kWh;    /**< Cumulative session energy (kWh) ← FIXED type */
@@ -413,11 +416,11 @@ extern SESSION_Data_t sessionDB[MAX_DOCKS];
 #define SESSION_SetBMSDemandCurrent(idx, val)   (sessionDB[(idx)].fBMSDemandCurrent = (float)(val))
 #define SESSION_GetBMSDemandCurrent(idx)        (sessionDB[(idx)].fBMSDemandCurrent)
 
-#define SESSION_SetPmSetVoltage(idx, val)       (sessionDB[(idx)].fPmSetVoltage = (float)(val))
-#define SESSION_GetPmSetVoltage(idx)            (sessionDB[(idx)].fPmSetVoltage)
+#define SESSION_SetPmVoltageSetpoint(idx, val)       (sessionDB[(idx)].fPmSetPointVoltage = (float)(val))
+#define SESSION_GetPmVoltageSetpoint(idx)            (sessionDB[(idx)].fPmSetPointVoltage)
 
-#define SESSION_SetPmSetCurrent(idx, val)       (sessionDB[(idx)].fPmSetCurrent = (float)(val))
-#define SESSION_GetPmSetCurrent(idx)            (sessionDB[(idx)].fPmSetCurrent)
+#define SESSION_SetPmCurrentSetpoint(idx, val)       (sessionDB[(idx)].fPmSetPointCurrent = (float)(val))
+#define SESSION_GetPmCurrentSetpoint(idx)            (sessionDB[(idx)].fPmSetPointCurrent)
 
 /* BUG FIX: was uint32_t u32EnergyDelivered — now float fEnergyDelivered_kWh */
 #define SESSION_SetEnergyDelivered(idx, val)    (sessionDB[(idx)].fEnergyDelivered_kWh = (float)(val))

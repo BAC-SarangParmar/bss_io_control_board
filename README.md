@@ -1,6 +1,6 @@
 # EV DC Charging Station Firmware
 
-A production-grade embedded firmware for a **3-dock DC EV charging station**, built on the Microchip SAMA5D2 / PIC32C platform using MPLAB Harmony 3, FreeRTOS, and Microchip's TCP/IP stack.
+A production-grade embedded firmware for a **3-dock DC EV charging station**, built on the Microchip PIC32C platform using MPLAB Harmony 3, FreeRTOS, and Microchip's TCP/IP stack.
 
 ---
 

@@ -152,8 +152,8 @@ static void TonhePmExecuteCommand(uint8_t u8DockNo)
     tonhe_pm_Tx_t tx = {0};
 
     /* Read configured PM set-points from session DB */
-    uint16_t u16Voltage = (uint16_t)SESSION_GetPmSetVoltage(u8DockNo);
-    uint16_t u16Current = (uint16_t)SESSION_GetPmSetCurrent(u8DockNo);
+    uint16_t u16Voltage = (uint16_t)SESSION_GetPmVoltageSetpoint(u8DockNo);
+    uint16_t u16Current = (uint16_t)SESSION_GetPmCurrentSetpoint(u8DockNo);
 
     /* Clamp voltage and current to TONHE hardware limits */
     u16Voltage = (u16Voltage > TONHE_MAX_VOLTAGE) ? TONHE_MAX_VOLTAGE : u16Voltage;

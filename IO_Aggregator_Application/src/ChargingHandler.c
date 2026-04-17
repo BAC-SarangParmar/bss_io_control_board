@@ -925,13 +925,15 @@ static void vUpdateVehiclePMInfo(uint8_t u8DockNo)
     float    fDemandCurrent  = (sFrame.LevdcRX_500ID_Info.u16ReqDcCurrent      * FACTOR_0_1);
     uint16_t u16EstChrgTime  = sFrame.LevdcRX_501ID_Info.u16EstimatedChargingTime;
     uint16_t u16CurrentSoc   = sFrame.LevdcRX_501ID_Info.u8ChargingRate;
+    int16_t s16BMSTemp   = 0U; // LEVDC profile doesn't include temperature, could be added if needed
 
     SESSION_SetBMSDemandVoltage(u8DockNo, fDemandVoltage);
     SESSION_SetBMSDemandCurrent(u8DockNo, fDemandCurrent);
-    SESSION_SetPmSetVoltage(u8DockNo, fDemandVoltage);
-    SESSION_SetPmSetCurrent(u8DockNo, fDemandCurrent);
+    SESSION_SetPmVoltageSetpoint(u8DockNo, fDemandVoltage);
+    SESSION_SetPmCurrentSetpoint(u8DockNo, fDemandCurrent);
     SESSION_SetEstimatedChargingTime(u8DockNo, u16EstChrgTime);
     SESSION_SetCurrentSoc(u8DockNo, u16CurrentSoc);
+    SESSION_SetBMSTemperature(u8DockNo, (uint8_t)s16BMSTemp);
 
     if ((SESSION_GetInitialSoc(u8DockNo) == 0U) && (u16CurrentSoc != 0U))
     {
@@ -946,14 +948,16 @@ static void vUpdateVehiclePMInfo(uint8_t u8DockNo)
     /* Decode physical values from BMS profile & status */
     float    fDemandVoltage = TVS_DECODE_BMS_PROFILE_VOLTAGE(sFrame.TVS_Rx101_BMSProfile.u16MaxChargeVoltage);
     float    fDemandCurrent = TVS_DECODE_BMS_PROFILE_CURRENT(sFrame.TVS_Rx101_BMSProfile.u16MaxChargeCurrent);
+    uint16_t u16EstChrgTime  = 0U; // TVS profile doesn't include estimated time
     uint16_t u16CurrentSoc  = sFrame.TVS_Rx100_BMSStatus.u8SOC;
     int16_t s16BMSTemp   = TVS_DECODE_BMS_TEMPERATURE(sFrame.TVS_Rx100_BMSStatus.u8Temperature);
 
     SESSION_SetBMSDemandVoltage(u8DockNo, fDemandVoltage);
     SESSION_SetBMSDemandCurrent(u8DockNo, fDemandCurrent);
+    SESSION_SetPmVoltageSetpoint(u8DockNo, fDemandVoltage);
+    SESSION_SetPmCurrentSetpoint(u8DockNo, fDemandCurrent);
+    SESSION_SetEstimatedChargingTime(u8DockNo, u16EstChrgTime);
     SESSION_SetCurrentSoc(u8DockNo, u16CurrentSoc);
-    SESSION_SetPmSetVoltage(u8DockNo, fDemandVoltage);
-    SESSION_SetPmSetCurrent(u8DockNo, fDemandCurrent);
     SESSION_SetBMSTemperature(u8DockNo, (uint8_t)s16BMSTemp);
 
     if ((SESSION_GetInitialSoc(u8DockNo) == 0U) && (u16CurrentSoc != 0U))
