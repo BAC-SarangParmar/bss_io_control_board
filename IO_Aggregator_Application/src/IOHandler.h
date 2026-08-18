@@ -101,6 +101,7 @@ extern "C" {
  * ========================================================================== */
 #define ADC_VREF                    (3.3f)    /**< ADC reference voltage (V)   */
 #define ADC_MAX_VALUE               (4095U)   /**< 12-bit ADC full-scale count */
+#define THRESHOLD_IGNITION          (2.7F)   /**< Ignition threshold value    */
 
 /**
  * @brief Convert raw ADC count to voltage.

@@ -33,10 +33,15 @@ extern "C" {
  *============================================================================*/
 /* #define CHARGING_PROTOCOL   PROTOCOL_17017_25 */
 #define CHARGING_PROTOCOL      PROTOCOL_TVS_PROP
+#define RECTIFIER_SELECTION    TONHE_RECTIFIER
 
 /* Protocol identifier tokens — do NOT modify these */
 #define PROTOCOL_17017_25      (1U)
 #define PROTOCOL_TVS_PROP      (2U)
+
+/*Rectifier identifier*/
+#define TONHE_RECTIFIER         (1U)
+#define DELTA_RECTIFIER         (2U)
 
 /* Compile-time guard: ensure exactly one protocol is chosen */
 #if !defined(CHARGING_PROTOCOL)
@@ -44,6 +49,14 @@ extern "C" {
 #endif
 #if (CHARGING_PROTOCOL != PROTOCOL_17017_25) && (CHARGING_PROTOCOL != PROTOCOL_TVS_PROP)
     #error "CHARGING_PROTOCOL must be PROTOCOL_17017_25 or PROTOCOL_TVS_PROP"
+#endif
+
+/* Compile-time guard: ensure exactly one rectifier is chosen */
+#if !defined(RECTIFIER_SELECTION)
+    #error "RECTIFIER_SELECTION must be defined as TONHE_RECTIFIER or DELTA_RECTIFIER"
+#endif
+#if (RECTIFIER_SELECTION != TONHE_RECTIFIER) && (RECTIFIER_SELECTION != DELTA_RECTIFIER)
+    #error "RECTIFIER_SELECTION must be TONHE_RECTIFIER or DELTA_RECTIFIER"
 #endif
 
 /*==============================================================================

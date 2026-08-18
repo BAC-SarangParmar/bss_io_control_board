@@ -63,6 +63,37 @@
 /** Handle for the 100 ms CAN TX software timer */
 static TimerHandle_t xTimerCanCommunicationTx = NULL;
 
+typedef enum
+{
+    DELTA3KW_PENDING_NONE = 0,
+    DELTA3KW_PENDING_VOLTAGE,
+    DELTA3KW_PENDING_CURRENT
+} delta3kw_pending_e;
+
+static delta3kw_pending_e s_eDelta3kwPending[NUM_RECTIFIERS + 1U] = {DELTA3KW_PENDING_NONE};
+
+static inline bool bDelta3kwIndexValid(uint8_t u8RectifierIndex)
+{
+    return (u8RectifierIndex < (NUM_RECTIFIERS + 1U));
+}
+
+static inline uint32_t u32Delta3kwExtractResultValue(const uint8_t *pu8Data)
+{
+    return ((uint32_t)pu8Data[0] << 24) |
+           ((uint32_t)pu8Data[1] << 16) |
+           ((uint32_t)pu8Data[2] << 8)  |
+            (uint32_t)pu8Data[3];
+}
+
+static bool s_bDelta3kwModuleOn[MAX_DOCKS] = {false};
+static power_module_msg_st delta3kwMsgDb[DB_DELTA3KW_MSG_MAX] = {
+    POWER_MODULE_DB_MSG_ENTRY(DB_DELTA3KW_SET_VOLTAGE, DELTA3KW_MOD_WRITE_ID, DELTA3KW_SET_VOLTAGE, NOT_BUSY),
+    POWER_MODULE_DB_MSG_ENTRY(DB_DELTA3KW_SET_CURRENT, DELTA3KW_MOD_WRITE_ID, DELTA3KW_SET_CURR_LIMIT, NOT_BUSY),
+    POWER_MODULE_DB_MSG_ENTRY(DB_DELTA3KW_TURN_ON, DELTA3KW_MOD_ON_OFF_ID, DELTA3KW_POWER_MOD_ON, NOT_BUSY),
+    POWER_MODULE_DB_MSG_ENTRY(DB_DELTA3KW_TURN_OFF, DELTA3KW_MOD_ON_OFF_ID, DELTA3KW_POWER_MOD_OFF, NOT_BUSY),
+    POWER_MODULE_DB_MSG_ENTRY(DB_DELTA3KW_GET_VOLTAGE, DELTA3KW_MOD_READ_ID, DELTA3KW_GET_VOLTAGE, NOT_BUSY),
+    POWER_MODULE_DB_MSG_ENTRY(DB_DELTA3KW_GET_CURRENT, DELTA3KW_MOD_READ_ID, DELTA3KW_GET_CURRENT, NOT_BUSY)};
+
 #if (CHARGING_PROTOCOL == PROTOCOL_TVS_PROP)
 /**
  * Rolling tick counter used to sub-divide the 100 ms timer to produce the
@@ -91,6 +122,9 @@ static bool bResolveDockFromCanBus(uint8_t canBus, uint8_t *pDockNo);
  * @param  u8DockNo    Dock number (DOCK_1 … MAX_DOCKS-1).
  */
 static void TonhePmExecuteCommand(uint8_t u8DockNo);
+static void Delta3KwSendCurrentRead(uint8_t u8DockNo);
+static void Delta3KwPmExecuteCommand(uint8_t u8DockNo);
+static void Delta3KwPmPollStatus(uint8_t u8DockNo);
 
 /* Protocol-specific private TX helpers */
 #if (CHARGING_PROTOCOL == PROTOCOL_17017_25)
@@ -189,6 +223,127 @@ static void TonhePmExecuteCommand(uint8_t u8DockNo)
 
     memcpy(canTx.data, &tx, sizeof(tonhe_pm_Tx_t));
     vSendCanTxMsgToQueue(&canTx, u8DockNo);
+}
+
+static void Delta3KwPmExecuteCommand(uint8_t u8DockNo)
+{
+    if (u8DockNo == 0U)
+    {
+        return;
+    }
+
+    /* Read configured PM set-points from session DB */
+    float fVoltage = SESSION_GetPmVoltageSetpoint(u8DockNo);
+    float fCurrent = SESSION_GetPmCurrentSetpoint(u8DockNo);
+
+    /* Clamp voltage and current to DELTA hardware limits */
+    fVoltage = (fVoltage > DELTA_MAX_VOLTAGE) ? DELTA_MAX_VOLTAGE : fVoltage;
+    fCurrent = (fCurrent > DELTA_MAX_CURRENT) ? DELTA_MAX_CURRENT : fCurrent;
+    fCurrent = (fCurrent < DELTA_MIN_CURRENT) ? DELTA_MIN_CURRENT : fCurrent;
+
+    /* Scale to raw CAN units */
+    uint32_t u32VoltageRaw = (uint32_t)(fVoltage * FACTOR_10);
+    uint32_t u32CurrentRaw = (uint32_t)(fCurrent * FACTOR_10);
+
+    /* Determine module start/stop from PM enable flag */
+    bool bModuleStart = SESSION_GetPMState(u8DockNo);
+
+    /* ---- SET_VOLTAGE frame ---- */
+    CAN_TX_BUFFER txV = {0};
+    power_module_msg_st *pCmdV = &delta3kwMsgDb[DB_DELTA3KW_SET_VOLTAGE];
+    txV.id  = pCmdV->u32MsgId;
+    txV.dlc = CAN_PAYLOAD_BYTE_SIZE;
+    txV.xtd = CAN_FRAME_EXTENDED;
+    memcpy(txV.data, pCmdV->u8MsgData, sizeof(pCmdV->u8MsgData));
+    txV.data[5] = (u32VoltageRaw >> 8) & 0xFF;
+    txV.data[6] = u32VoltageRaw & 0xFF;
+    txV.data[7] = VOLTAGE_CHECKSUM_CAL(u32VoltageRaw);
+    vSendCanTxMsgToQueue(&txV, u8DockNo);
+    vTaskDelay(5);
+
+    /* ---- SET_CURRENT frame ---- */
+    CAN_TX_BUFFER txC = {0};
+    power_module_msg_st *pCmdC = &delta3kwMsgDb[DB_DELTA3KW_SET_CURRENT];
+    txC.id  = pCmdC->u32MsgId;
+    txC.dlc = CAN_PAYLOAD_BYTE_SIZE;
+    txC.xtd = CAN_FRAME_EXTENDED;
+    memcpy(txC.data, pCmdC->u8MsgData, sizeof(pCmdC->u8MsgData));
+    txC.data[5] = (u32CurrentRaw >> 8) & 0xFF;
+    txC.data[6] = u32CurrentRaw & 0xFF;
+    txC.data[7] = CURRENT_CHECKSUM_CAL(u32CurrentRaw);
+    vSendCanTxMsgToQueue(&txC, u8DockNo);
+    vTaskDelay(5);
+
+    /* ---- START/STOP frame ---- */
+    CAN_TX_BUFFER txS = {0};
+    power_module_msg_st *pCmdS = &delta3kwMsgDb[bModuleStart ? DB_DELTA3KW_TURN_ON : DB_DELTA3KW_TURN_OFF];
+    txS.id  = pCmdS->u32MsgId;
+    txS.dlc = CAN_PAYLOAD_BYTE_SIZE;
+    txS.xtd = CAN_FRAME_EXTENDED;
+    memcpy(txS.data, pCmdS->u8MsgData, sizeof(pCmdS->u8MsgData));
+    vSendCanTxMsgToQueue(&txS, u8DockNo);
+    vTaskDelay(5);
+
+    if (bModuleStart)
+    {
+        s_bDelta3kwModuleOn[u8DockNo] = true;
+        s_eDelta3kwPending[u8DockNo]  = DELTA3KW_PENDING_NONE; /* clean start */
+    }
+    else
+    {
+        s_bDelta3kwModuleOn[u8DockNo] = false;
+        s_eDelta3kwPending[u8DockNo]  = DELTA3KW_PENDING_NONE; /* clear any stale wait */
+    }
+}
+
+static void Delta3KwPmPollStatus(uint8_t u8DockNo)
+{
+    if (u8DockNo == 0U)
+    {
+        return;
+    }
+
+    if (!s_bDelta3kwModuleOn[u8DockNo])
+    {
+        return;
+    }
+
+    if (s_eDelta3kwPending[u8DockNo] != DELTA3KW_PENDING_NONE)
+    {
+        return;
+    }
+
+    CAN_TX_BUFFER txGV = {0};
+    power_module_msg_st *pCmdGV = &delta3kwMsgDb[DB_DELTA3KW_GET_VOLTAGE];
+
+    txGV.id  = pCmdGV->u32MsgId;
+    txGV.dlc = CAN_PAYLOAD_BYTE_SIZE;
+    txGV.xtd = CAN_FRAME_EXTENDED;
+    memcpy(txGV.data, pCmdGV->u8MsgData, sizeof(pCmdGV->u8MsgData));
+
+    s_eDelta3kwPending[u8DockNo] = DELTA3KW_PENDING_VOLTAGE;
+
+    vSendCanTxMsgToQueue(&txGV, u8DockNo);
+}
+
+static void Delta3KwSendCurrentRead(uint8_t u8DockNo)
+{
+    CAN_TX_BUFFER txGC = {0};
+
+    power_module_msg_st *pCmdGC =
+        &delta3kwMsgDb[DB_DELTA3KW_GET_CURRENT];
+
+    txGC.id  = pCmdGC->u32MsgId;
+    txGC.dlc = CAN_PAYLOAD_BYTE_SIZE;
+    txGC.xtd = CAN_FRAME_EXTENDED;
+
+    memcpy(txGC.data,
+           pCmdGC->u8MsgData,
+           sizeof(pCmdGC->u8MsgData));
+
+    s_eDelta3kwPending[u8DockNo] = DELTA3KW_PENDING_CURRENT;
+
+    vSendCanTxMsgToQueue(&txGC, u8DockNo);
 }
 
 /* --------------------------------------------------------------------------
@@ -338,7 +493,12 @@ bool bIsValidBMSCanID(uint32_t canId)
 
 void vProcessPMMessage(uint8_t u8DockNo)
 {
+    #if (RECTIFIER_SELECTION == DELTA_RECTIFIER)
+        Delta3KwPmExecuteCommand(u8DockNo);
+        Delta3KwPmPollStatus(u8DockNo);
+    #else               
     TonhePmExecuteCommand(u8DockNo);
+    #endif
 }
 
 /* --------------------------------------------------------------------------
@@ -455,6 +615,65 @@ void vProcessPMCanMessage(CAN_RX_BUFFER *rxBuf, uint8_t canBus)
     SESSION_SetPmOutputVoltage(u8DockNo, fVoltage);
     SESSION_SetPmOutputCurrent(u8DockNo, fCurrent);
     SESSION_SetPMFaultCode(u8DockNo, u16FaultInfo);
+}
+
+void vProcessDelta3KwPMCanMessage(CAN_RX_BUFFER *rxBuf, uint8_t canBus)
+{
+    if (rxBuf == NULL)
+    {
+        return;
+    }
+    
+    uint8_t u8DockNo = 0U;
+    if (!bResolveDockFromCanBus(canBus, &u8DockNo))
+    {
+        return;
+    }
+
+    if (!bDelta3kwIndexValid(u8DockNo))
+    {
+        return;
+    }
+
+    /* Record the time of the last valid PM frame (for timeout detection) */
+    SESSION_SetPMLastRxTime(u8DockNo, xTaskGetTickCount());
+
+    uint32_t canId     = rxBuf->id;
+    uint8_t  u8DataLen = rxBuf->dlc;
+
+    /* Validate CAN ID before decoding payload */
+    if (!(canId == DELTA3KW_READ_ID_1))
+    {
+        return;
+    }
+
+    if (u8DataLen < 4U)
+    {
+        // SYS_CONSOLE_PRINT("Dock %u: result frame too short (dlc=%u)\r\n", u8DockNo, u8DataLen);
+        return;
+    }
+
+    uint32_t u32RawValue = u32Delta3kwExtractResultValue(rxBuf->data);
+    delta3kw_pending_e ePending = s_eDelta3kwPending[u8DockNo];
+
+    if (ePending == DELTA3KW_PENDING_VOLTAGE)
+    {
+        float fVoltage = (float)u32RawValue / FACTOR_100;
+        SESSION_SetPmOutputVoltage(u8DockNo, fVoltage);
+        Delta3KwSendCurrentRead(u8DockNo);
+    }
+    else if (ePending == DELTA3KW_PENDING_CURRENT)
+    {
+        float fCurrent = (float)u32RawValue / FACTOR_100;
+        SESSION_SetPmOutputCurrent(u8DockNo, fCurrent);
+        s_eDelta3kwPending[u8DockNo] = DELTA3KW_PENDING_NONE;
+    }
+    else
+    {
+        // SYS_CONSOLE_PRINT("Dock %u: unsolicited/unmatched result, dropped\r\n", u8DockNo);
+    }
+
+    SYS_CONSOLE_PRINT("Dock %u: Voltage=%.2f, Current=%.2f\r\n", u8DockNo, SESSION_GetPmOutputVoltage(u8DockNo), SESSION_GetPmOutputCurrent(u8DockNo));
 }
 
 /* --------------------------------------------------------------------------

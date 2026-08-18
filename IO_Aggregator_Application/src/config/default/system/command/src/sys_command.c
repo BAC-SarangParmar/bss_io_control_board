@@ -241,6 +241,8 @@ static void SendCommandCharacter(const void* cmdIoParam, char c);
 static int IsCommandReady(const void* cmdIoParam);
 static char GetCommandCharacter(const void* cmdIoParam);
 static void RunCmdTask(SYS_CMD_IO_DCPT* pCmdIO);
+static void CommandChargingTest(SYS_CMD_DEVICE_NODE* pCmdIO, int argc, char *argv[]);
+extern uint8_t  prv_ChargingControl(uint8_t u8DockNo, uint8_t u8Action);
 
 static const SYS_CMD_API sysConsoleApi =
 {
@@ -271,7 +273,8 @@ static const SYS_CMD_DESCRIPTOR    builtinCmdTbl[]=
     {"T",       CommandTCPIPTest,          ": Perform TCP/IP Communication Test"},
     {"U",       CommandRS485Test,          ": Send Data via RS485 Communication"},
     {"F",       CommandFullLoadTest,       ": Run Full Load Test (Usage: F <1-10> Minutes)"},
-    {"I",       CommandIdealLoadTest,      ": Run Ideal Load Test (No Load Condition)"},   
+    {"I",       CommandIdealLoadTest,      ": Run Ideal Load Test (No Load Condition)"},
+    {"CH",      CommandChargingTest,       ": Force Charging Auth (Usage: CH <dock> <0-1>)"},   
 };
 
 // *****************************************************************************
@@ -1488,6 +1491,39 @@ static void CommandFullLoadTest(SYS_CMD_DEVICE_NODE* pCmdIO, int argc, char** ar
 static void CommandIdealLoadTest(SYS_CMD_DEVICE_NODE* pCmdIO, int argc, char** argv)
 {
     SYS_CONSOLE_MESSAGE("Ideal Load Test Command Received\r\n");  
+}
+
+static void CommandChargingTest(SYS_CMD_DEVICE_NODE* pCmdIO, int argc, char *argv[])
+{
+    const void* cmdIoParam = pCmdIO->cmdIoParam;
+
+    if (argc != 3)
+    {
+        (*SYS_CMD_PRINT)(cmdIoParam,
+                         "Usage: CH <dock> <0|1>\r\n");
+        return;
+    }
+
+    uint8_t u8Dock   = (uint8_t)atoi(argv[1]);
+    uint8_t u8Action = (uint8_t)atoi(argv[2]);
+
+    /* Dock numbers are 1-based: 1 ... MAX_DOCKS */
+    if ((u8Dock == 0U) ||
+        (u8Dock > (uint8_t)SESSION_GetMaxDocks()))
+    {
+        (*SYS_CMD_PRINT)(cmdIoParam,
+                         "Invalid dock %u\r\n",
+                         (unsigned)u8Dock);
+        return;
+    }
+
+    uint8_t u8Status = prv_ChargingControl(u8Dock, u8Action);
+
+    (*SYS_CMD_PRINT)(cmdIoParam,
+                     "[TEST] Dock %u -> %s, status=%u\r\n",
+                     (unsigned)u8Dock,
+                     (u8Action != 0U) ? "START" : "STOP",
+                     (unsigned)u8Status);
 }
 
 static void CommandHelp(SYS_CMD_DEVICE_NODE* pCmdIO, int argc, char** argv)

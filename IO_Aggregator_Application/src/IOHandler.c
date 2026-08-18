@@ -362,7 +362,7 @@ static void     prv_PrepareDispatchOutbPacket(void);
 static void     prv_ResetFrameState(void);
 static uint8_t  prv_GPIO_Read(uint16_t u16PortNo, uint8_t *pu8ErrorCode);
 static void     prv_GPIO_Write(uint16_t u16PortNo, bool bVal, uint8_t *pu8ErrorCode);
-static uint8_t  prv_ChargingControl(uint8_t u8DockNo, uint8_t u8Action);
+uint8_t  prv_ChargingControl(uint8_t u8DockNo, uint8_t u8Action);
 static uint32_t prv_AnalogInputGet(uint8_t u8Channel);
 static void     prv_vConfigureIOexpanders(void);
 static void     prv_SetStoredStaticIP(void);
@@ -895,6 +895,7 @@ void ReadAllAnalogInputPins(void)
         {
             au32AdcData[i] = ADC_ResultGet(k_AdcCores[i], k_AdcChannels[i]);
             uint16_t u16Avg = MovingAverage_Update(i, (uint16_t)au32AdcData[i]);
+            float u16Vol = (uint16_t)au32AdcData[i] * k_Vref / 4095U;
 
 #if PT100_Sensor
             float fVoltage = (float)u16Avg * k_Vref * k_InvAdcMax;
@@ -904,21 +905,41 @@ void ReadAllAnalogInputPins(void)
 
             if (i < (uint8_t)NUM_TEMPERATURE_ANALOG_PINS)
             {
-                float fTemp;
-#if defined(PT100_Sensor) && (PT100_Sensor == 1)
-                fTemp = prv_TempCalcPT100(fVoltage);
-#elif defined(NTC_Sensor) && (NTC_Sensor == 1)
-                fTemp = prv_TempCalcNTC(fVoltage);
-#else
-                fTemp = (float)u16Avg;
-#endif
-                /* Store as fixed-point (0.01 °C units) */
-                float fFixed = fTemp * 100.0F;
-                if (fFixed < 0.0F)
+                uint16_t u16FixedResult = 0U; /* declare at outer scope */
+
+                if ((i != 12U) && (i != 13U) && (i != 14U))
                 {
-                    fFixed = 0.0F;
+                    float fTemp;
+#if defined(PT100_Sensor) && (PT100_Sensor == 1)
+                    fTemp = prv_TempCalcPT100(fVoltage);
+#elif defined(NTC_Sensor) && (NTC_Sensor == 1)
+                    fTemp = prv_TempCalcNTC(fVoltage);
+#else
+                    fTemp = (float)u16Avg;
+#endif
+                    /* Store as fixed-point (0.01 °C units) */
+                    float fFixed = fTemp * 100.0F;
+                    if (fFixed < 0.0F)
+                    {
+                        fFixed = 0.0F;
+                    }
+                    u16FixedResult = (uint16_t)fFixed;
                 }
-                currentTempAIQueueBuffer[i] = (uint16_t)fFixed;
+                else
+                {
+                    /* u16Vol is uint16_t (integer volts*Vref/4095), compare correctly */
+                    if (u16Vol > THRESHOLD_IGNITION) /* adjust threshold to match your scaling */
+                    {
+                        u16FixedResult = 1U;
+                    }
+                    else
+                    {
+                        u16FixedResult = 0U;
+                    }
+                }
+
+                currentTempAIQueueBuffer[i] = u16FixedResult;
+                // SYS_CONSOLE_PRINT("Current status -> AI%d: %u ", (unsigned)i, (unsigned)u16FixedResult);
             }
             else
             {
@@ -932,9 +953,10 @@ void ReadAllAnalogInputPins(void)
         }
 
         /* Update session DB temperatures — convert back to °C */
-        uint8_t u8Temp = (uint8_t)(currentTempAIQueueBuffer[6U] / 100U); /* Convert back to °C */
-        SESSION_SetDockTemperature((uint8_t)COMPARTMENT, u8Temp);
-        SYS_CONSOLE_PRINT("Temps -> Comp:%d", u8Temp);
+        uint8_t u8CompTemp  = (uint8_t)(currentTempAIQueueBuffer[6U] / 100U); /* Convert back to °C */
+        SESSION_SetDockTemperature((uint8_t)COMPARTMENT, u8CompTemp );
+        // SYS_CONSOLE_PRINT("Temps -> Comp:%d", u8Temp);
+        SYS_CONSOLE_PRINT("Temps -> Comp:%d Temp:%d°C",(uint8_t)COMPARTMENT, u8CompTemp);
         for (uint8_t u8DockNo = DOCK_1; u8DockNo <= SESSION_GetMaxDocks(); u8DockNo++)
         {
             uint8_t u8DockId = (uint8_t)(u8DockNo);
@@ -1552,7 +1574,7 @@ static uint32_t prv_AnalogInputGet(uint8_t u8Channel)
  * @param  u8Action  1 = start, 0 = stop
  * @return uint8_t   1 on success
  */
-static uint8_t prv_ChargingControl(uint8_t u8DockNo, uint8_t u8Action)
+uint8_t prv_ChargingControl(uint8_t u8DockNo, uint8_t u8Action)
 {
     static uint8_t au8PrevState[MAX_DOCKS] = {0};
 

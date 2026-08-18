@@ -56,6 +56,7 @@
 #include <string.h>
 #include "definitions.h"
 #include "AppCanHandler.h"
+#include "ChargingHandler.h"
 
 /* ============================================================================
  * Debug Control
@@ -230,6 +231,7 @@ static const CAN_HwOps_t s_canHwOps[CAN_MAX_HW_CHANNELS] =
  * ========================================================================== */
 extern void vProcessBMSCanMessage(CAN_RX_BUFFER *pRxBuf, uint8_t u8CanBus);
 extern void vProcessPMCanMessage(CAN_RX_BUFFER  *pRxBuf, uint8_t u8CanBus);
+extern void vProcessDelta3KwPMCanMessage(CAN_RX_BUFFER *pRxBuf, uint8_t u8CanBus);
 
 /* ============================================================================
  * Private Function Declarations
@@ -409,7 +411,11 @@ static void vProcessCanRxMessage(CAN_RX_BUFFER *pRxBuf, uint8_t u8CanBus)
     {
         CAN_DEBUG(SYS_CONSOLE_PRINT("[RxDispatch] CAN%u → PM  ID=0x%08lX\r\n",
                                     (unsigned)u8CanBus, (unsigned long)u32Id));
+        #if (RECTIFIER_SELECTION == DELTA_RECTIFIER)
+        vProcessDelta3KwPMCanMessage(pRxBuf, u8CanBus);
+        #else               
         vProcessPMCanMessage(pRxBuf, u8CanBus);
+        #endif     
     }
     else
     {

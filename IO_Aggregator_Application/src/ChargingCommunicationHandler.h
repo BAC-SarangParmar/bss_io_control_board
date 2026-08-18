@@ -55,6 +55,37 @@ extern "C" {
 #define TONHE_MAX_VOLTAGE       (58U)         /**< Max allowable set voltage (V)       */
 #define TONHE_MAX_CURRENT       (55U)         /**< Max allowable set current (A)       */
 #define TONHE_MIN_CURRENT       (1U)          /**< Min allowable set current (A)       */
+
+#define DELTA_MAX_VOLTAGE        (58U)         /**< Max allowable set voltage (V)       */
+#define DELTA_MAX_CURRENT        (55U)         /**< Max allowable set current (A)       */
+#define DELTA_MIN_CURRENT        (1U)          /**< Min allowable set current (A)       */
+#define NUM_RECTIFIERS           (1U)
+
+#define DELTA3KW_MOD_ON_OFF_ID (0x10092001U)
+#define DELTA3KW_MOD_READ_ID (0x10095001U)
+#define DELTA3KW_MOD_WRITE_ID (0x10096001U)
+
+#define DELTA3KW_POWER_MOD_ON {0x15, 0x64, 0x00, 0x00, 0x84, 0x00, 0x00, 0x7B}
+#define DELTA3KW_POWER_MOD_OFF {0x15, 0x64, 0x00, 0x00, 0x84, 0xA5, 0x00, 0xD6}
+#define DELTA3KW_SET_CURR_LIMIT {0x15, 0x64, 0x00, 0x00, 0x82, 0x00, 0x00, 0x00}
+#define DELTA3KW_SET_VOLTAGE {0x15, 0x64, 0x00, 0x00, 0x81, 0x00, 0x00, 0x00}
+#define DELTA3KW_GET_VOLTAGE {0x15, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+#define DELTA3KW_GET_CURRENT {0x15, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+
+#define DELTA3KW_VOLTAGE_DATA (0x05)
+#define DELTA3KW_CURRENT_DATA (0x06)
+
+#define DELTA3KW_READ_ID_1 (0x10085101U)
+
+#define NOT_BUSY false
+#define BUSY true
+
+#define CS_VAL1 (0xff)
+#define CS_VOL_VAL (0x81)
+#define CS_CUR_VAL (0x82)
+#define VOLTAGE_CHECKSUM_CAL(val) ((CS_VAL1) - (CS_VOL_VAL) - (val & 0xFF) - ((val & 0xFF00) >> 8U))
+#define CURRENT_CHECKSUM_CAL(val) ((CS_VAL1) - (CS_CUR_VAL) - (val & 0xFF) - ((val & 0xFF00) >> 8U))
+
 /** @} */
 
 /**
@@ -95,6 +126,33 @@ typedef struct __attribute__((packed))
     uint8_t  u8PFCFaultInfo;         /**< PFC fault register                   */
 } tonhe_pm_Rx_t;
 
+ typedef enum
+    {
+        DB_DELTA3KW_SET_VOLTAGE = 0,
+        DB_DELTA3KW_SET_CURRENT,
+        DB_DELTA3KW_TURN_ON,
+        DB_DELTA3KW_TURN_OFF,
+        DB_DELTA3KW_GET_VOLTAGE,
+        DB_DELTA3KW_GET_CURRENT,
+        DB_DELTA3KW_MSG_MAX
+    } delta3kw_msg_e;
+
+ typedef struct __attribute__((__packed__)) power_module_msg_struct
+    {
+        uint32_t eMsgName;           // Enum value identifying the command
+        uint32_t u32MsgId;           // CAN ID or similar
+        uint8_t u8MsgData[CAN_PAYLOAD_BYTE_SIZE]; // Data bytes
+        bool bIsBusy;
+    } power_module_msg_st;
+
+
+#define POWER_MODULE_DB_MSG_ENTRY(name, id, data, flag) \
+    {                                                   \
+        .eMsgName = (name),                             \
+        .u32MsgId = (id),                               \
+        .u8MsgData = data,                              \
+        .bIsBusy = (flag),                              \
+    }
 
 /* ============================================================================
  * SECTION 2: CAN ID VALIDATION HELPERS
@@ -137,6 +195,7 @@ bool bIsValidBMSCanID(uint32_t canId);
  * @param  canBus CAN bus index (CANBUS_0 = DOCK_1, CANBUS_1 = DOCK_2, ...).
  */
 void vProcessPMCanMessage(CAN_RX_BUFFER *rxBuf, uint8_t canBus);
+void vProcessDelta3KwPMCanMessage(CAN_RX_BUFFER *rxBuf, uint8_t canBus);
 
 /**
  * @brief  Dispatch an incoming CAN frame to the BMS processing path.
